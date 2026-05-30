@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>48模拟器</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Microsoft YaHei', sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 480px;
+            width: 100%;
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 { font-size: 28px; margin-bottom: 10px; }
+        .content { padding: 30px; }
+        .info-box {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .info-box h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        .info-box p {
+            color: #666;
+            line-height: 1.6;
+            margin-bottom: 10px;
+        }
+        .demo-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 10px;
+            font-size: 16px;
+            cursor: pointer;
+            width: 100%;
+            transition: transform 0.2s;
+        }
+        .demo-btn:hover { transform: scale(1.02); }
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #999;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎭 48模拟器</h1>
+            <p>AI智能NPC对话体验</p>
+        </div>
+        <div class="content">
+            <div class="info-box">
+                <h3>✨ 功能特色</h3>
+                <p>🎮 模拟偶像养成游戏</p>
+                <p>💬 AI智能NPC实时对话</p>
+                <p>🎭 多种角色性格设定</p>
+                <p>📱 支持手机和电脑</p>
+            </div>
+            <div class="info-box">
+                <h3>📌 使用说明</h3>
+                <p>这是一个AI NPC对话演示页面。完整版包含完整的游戏功能。</p>
+            </div>
+            <button class="demo-btn" onclick="testAI()">
+                🧪 测试AI对话
+            </button>
+        </div>
+        <div class="footer">
+            <p>Powered by DeepSeek AI</p>
+        </div>
+    </div>
+
+    <script>
+        // 简单的AI测试
+        const API_URL = 'https://your-backend-url.railway.app/api/chat';
+        
+        async function testAI() {
+            const message = prompt('请输入你想对NPC说的话：');
+            if (!message) return;
+            
+            const response = await fetch(API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    npcId: '测试NPC',
+                    context: { npcType: 'sweet' },
+                    message: message
+                })
+            });
+            
+            const data = await response.json();
+            alert('NPC回复：' + data.reply);
+        }
+    </script>
+</body>
+</html>
