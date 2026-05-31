@@ -308,7 +308,10 @@ async def list_invite_codes(password: str, limit: int = 100):
             if len(unused_codes) >= limit:
                 break
 
+    # 计算剩余总数量
+    total_unused = len([data for data in invite_data["codes"].values() if not data["used"]])
+    
     return {
         "codes": unused_codes,
-        "total_remaining": len(unused_codes)
+        "total_remaining": total_unused
     }
