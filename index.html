@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿<!DOCTYPE html>
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿<!DOCTYPE html>
 ﻿﻿﻿﻿﻿﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -384,7 +384,7 @@ App.Invite = {
     async validate() {
         const input = document.getElementById('inviteInput');
         const errorDiv = document.getElementById('inviteError');
-        const code = input.value.trim();
+        const code = input.value.trim().toUpperCase();
         
         if (!code) {
             errorDiv.textContent = '请输入邀请码';

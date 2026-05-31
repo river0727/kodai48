@@ -316,3 +316,57 @@ async def list_invite_codes(password: str, limit: int = 100):
         "codes": unused_codes,
         "total_remaining": total_unused
     }
+
+# 获取已使用的邀请码列表（仅管理员）
+@app.get("/api/invite/used-list")
+async def list_used_invite_codes(password: str, limit: int = 100):
+    """获取已使用的邀请码列表（仅管理员）"""
+    if password != ADMIN_PASSWORD:
+        return {"error": "密码错误"}
+
+    used_codes = []
+    for code, data in invite_data["codes"].items():
+        if data["used"]:
+            used_codes.append({
+                "code": code,
+                "user_id": data["user_id"],
+                "used_at": data["used_at"],
+                "created_at": data["created_at"]
+            })
+            if len(used_codes) >= limit:
+                break
+
+    total_used = sum(1 for data in invite_data["codes"].values() if data["used"])
+    
+    return {
+        "codes": used_codes,
+        "total_used": total_used
+    }
+
+# 获取所有邀请码列表（仅管理员）
+@app.get("/api/invite/all-list")
+async def list_all_invite_codes(password: str, limit: int = 100):
+    """获取所有邀请码列表（仅管理员）"""
+    if password != ADMIN_PASSWORD:
+        return {"error": "密码错误"}
+
+    all_codes = []
+    for code, data in invite_data["codes"].items():
+        all_codes.append({
+            "code": code,
+            "used": data["used"],
+            "user_id": data["user_id"],
+            "used_at": data["used_at"],
+            "created_at": data["created_at"]
+        })
+        if len(all_codes) >= limit:
+            break
+
+    stats = get_invite_stats()
+    
+    return {
+        "codes": all_codes,
+        "total": stats["total"],
+        "used": stats["used"],
+        "unused": stats["unused"]
+    }
