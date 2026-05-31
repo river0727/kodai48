@@ -181,7 +181,7 @@ def generate_invite_code():
     return f"PLAY48-{''.join([random.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(8)])}"
 
 def init_invite_codes(count: int = 2000):
-    """初始化邀请码系统"""
+    """初始化邀请码系统（如果已有文件，会补充到指定数量）"""
     if not os.path.exists(INVITE_CODE_FILE):
         invite_data = {
             "codes": {},
@@ -203,7 +203,28 @@ def init_invite_codes(count: int = 2000):
         return invite_data
     else:
         with open(INVITE_CODE_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            invite_data = json.load(f)
+        
+        # 检查是否需要补充邀请码
+        current_count = len(invite_data["codes"])
+        if current_count < count:
+            need_add = count - current_count
+            for i in range(need_add):
+                code = generate_invite_code()
+                while code in invite_data["codes"]:
+                    code = generate_invite_code()
+                invite_data["codes"][code] = {
+                    "used": False,
+                    "created_at": datetime.now().isoformat(),
+                    "used_at": None,
+                    "user_id": None
+                }
+            invite_data["total_count"] = count
+            with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(invite_data, f, ensure_ascii=False, indent=2)
+            print(f"[INIT] 补充了 {need_add} 个邀请码，现在共有 {count} 个！")
+        
+        return invite_data
 
 # 初始化邀请码
 invite_data = init_invite_codes(2000)
