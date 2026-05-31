@@ -164,3 +164,137 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+# ---------------------- 邀请码系统 ----------------------
+
+import json
+from datetime import datetime
+
+# 邀请码数据存储文件
+INVITE_CODE_FILE = "invite_codes.json"
+
+# 管理员密码
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin48")
+
+def generate_invite_code():
+    """生成一个邀请码"""
+    return f"PLAY48-{''.join([random.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(8)])}"
+
+def init_invite_codes(count: int = 2000):
+    """初始化邀请码系统"""
+    if not os.path.exists(INVITE_CODE_FILE):
+        invite_data = {
+            "codes": {},
+            "generated_at": datetime.now().isoformat(),
+            "total_count": count,
+            "used_count": 0
+        }
+        for i in range(count):
+            code = generate_invite_code()
+            invite_data["codes"][code] = {
+                "used": False,
+                "created_at": datetime.now().isoformat(),
+                "used_at": None,
+                "user_id": None
+            }
+        with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(invite_data, f, ensure_ascii=False, indent=2)
+        print(f"[INIT] 成功生成 {count} 个邀请码！")
+        return invite_data
+    else:
+        with open(INVITE_CODE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+# 初始化邀请码
+invite_data = init_invite_codes(2000)
+
+def save_invite_data():
+    """保存邀请码数据"""
+    with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(invite_data, f, ensure_ascii=False, indent=2)
+
+def validate_invite_code(code: str):
+    """验证邀请码是否有效"""
+    if code == ADMIN_PASSWORD:
+        return {"valid": True, "is_admin": True, "user_id": "admin"}
+
+    if code not in invite_data["codes"]:
+        return {"valid": False, "message": "邀请码不存在"}
+
+    if invite_data["codes"][code]["used"]:
+        return {"valid": False, "message": "这个邀请码已经被使用了"}
+
+    return {"valid": True, "is_admin": False, "code": code}
+
+def use_invite_code(code: str, userId: str):
+    """使用邀请码"""
+    if code in invite_data["codes"] and not invite_data["codes"][code]["used"]:
+        invite_data["codes"][code]["used"] = True
+        invite_data["codes"][code]["used_at"] = datetime.now().isoformat()
+        invite_data["codes"][code]["user_id"] = userId
+        invite_data["used_count"] = invite_data.get("used_count", 0) + 1
+        save_invite_data()
+        return True
+    return False
+
+def get_invite_stats():
+    """获取邀请码统计"""
+    total = len(invite_data["codes"])
+    used = sum(1 for code_data in invite_data["codes"].values() if code_data["used"])
+    return {
+        "total": total,
+        "used": used,
+        "unused": total - used
+    }
+
+# 请求模型
+class InviteValidateRequest(BaseModel):
+    code: str
+
+class InviteUseRequest(BaseModel):
+    code: str
+    userId: str
+
+# 邀请码验证接口
+@app.post("/api/invite/validate")
+async def validate_invite(data: InviteValidateRequest):
+    """验证邀请码是否有效"""
+    result = validate_invite_code(data.code)
+    return result
+
+# 邀请码使用接口
+@app.post("/api/invite/use")
+async def use_invite(data: InviteUseRequest):
+    """使用邀请码"""
+    success = use_invite_code(data.code, data.userId)
+    if success:
+        return {"success": True, "message": "邀请码使用成功！"}
+    else:
+        return {"success": False, "message": "邀请码无效或已被使用"}
+
+# 获取邀请码统计（仅管理员）
+@app.get("/api/invite/stats")
+async def get_stats(password: str):
+    """获取邀请码统计（仅管理员）"""
+    if password != ADMIN_PASSWORD:
+        return {"error": "密码错误"}
+    return get_invite_stats()
+
+# 获取未使用的邀请码列表（仅管理员）
+@app.get("/api/invite/list")
+async def list_invite_codes(password: str, limit: int = 100):
+    """获取未使用的邀请码列表（仅管理员）"""
+    if password != ADMIN_PASSWORD:
+        return {"error": "密码错误"}
+
+    unused_codes = []
+    for code, data in invite_data["codes"].items():
+        if not data["used"]:
+            unused_codes.append(code)
+            if len(unused_codes) >= limit:
+                break
+
+    return {
+        "codes": unused_codes,
+        "total_remaining": len(unused_codes)
+    }
