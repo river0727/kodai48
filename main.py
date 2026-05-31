@@ -243,6 +243,8 @@ def validate_invite_code(code: str):
 
 def use_invite_code(code: str, userId: str):
     """使用邀请码"""
+    if code == ADMIN_PASSWORD:
+        return True
     if code in invite_data["codes"] and not invite_data["codes"][code]["used"]:
         invite_data["codes"][code]["used"] = True
         invite_data["codes"][code]["used_at"] = datetime.now().isoformat()
