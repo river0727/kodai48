@@ -235,25 +235,40 @@ def save_invite_data():
 
 def validate_invite_code(code: str):
     """验证邀请码是否有效"""
-    if code == ADMIN_PASSWORD:
+    if code.upper() == ADMIN_PASSWORD.upper():
         return {"valid": True, "is_admin": True, "user_id": "admin"}
 
-    if code not in invite_data["codes"]:
+    # 不区分大小写查找验证码
+    found_code = None
+    for invite_code in invite_data["codes"]:
+        if invite_code.upper() == code.upper():
+            found_code = invite_code
+            break
+    
+    if found_code is None:
         return {"valid": False, "message": "邀请码不存在"}
 
-    if invite_data["codes"][code]["used"]:
+    if invite_data["codes"][found_code]["used"]:
         return {"valid": False, "message": "这个邀请码已经被使用了"}
 
-    return {"valid": True, "is_admin": False, "code": code}
+    return {"valid": True, "is_admin": False, "code": found_code}
 
 def use_invite_code(code: str, userId: str):
     """使用邀请码"""
-    if code == ADMIN_PASSWORD:
+    if code.upper() == ADMIN_PASSWORD.upper():
         return True
-    if code in invite_data["codes"] and not invite_data["codes"][code]["used"]:
-        invite_data["codes"][code]["used"] = True
-        invite_data["codes"][code]["used_at"] = datetime.now().isoformat()
-        invite_data["codes"][code]["user_id"] = userId
+    
+    # 不区分大小写查找验证码
+    found_code = None
+    for invite_code in invite_data["codes"]:
+        if invite_code.upper() == code.upper():
+            found_code = invite_code
+            break
+    
+    if found_code is not None and not invite_data["codes"][found_code]["used"]:
+        invite_data["codes"][found_code]["used"] = True
+        invite_data["codes"][found_code]["used_at"] = datetime.now().isoformat()
+        invite_data["codes"][found_code]["user_id"] = userId
         invite_data["used_count"] = invite_data.get("used_count", 0) + 1
         save_invite_data()
         return True
