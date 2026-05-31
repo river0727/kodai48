@@ -4,6 +4,8 @@
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
 import random
@@ -15,6 +17,9 @@ BASE_URL = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1")
 MODEL = os.getenv("AI_MODEL", "deepseek-chat")
 
 app = FastAPI()
+
+# 挂载静态文件
+app.mount("/static", StaticFiles(directory="."), name="static")
 
 # 允许跨域
 app.add_middleware(
@@ -114,8 +119,8 @@ def get_local_reply(npc_id: str, context: dict = None) -> str:
 # ---------------------- API 端点 ----------------------
 
 @app.get("/")
-def read_root():
-    return {"status": "ok", "message": "AI 聊天后端运行中！"}
+async def read_root():
+    return FileResponse("index.html")
 
 @app.get("/health")
 def health_check():
