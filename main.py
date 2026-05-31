@@ -35,6 +35,7 @@ class ChatMessage(BaseModel):
     message: str
     playerName: str = ""
     context: dict = {}
+    rolePrompt: str = ""
 
 # ---------------------- NPC 性格映射 ----------------------
 
@@ -45,17 +46,17 @@ def get_npc_prompt(npc_id: str, context: dict = None) -> str:
     npc_type = context.get("npcType", "member")
     personality = context.get("personality", "")
     
-    # 根据类型生成提示词
+    # 根据类型生成提示词 - 所有角色都是女性
     type_prompts = {
-        "agent": f"你是{npc_id}，一个{personality or '专业'}的经纪人。你关心艺人的工作和生活。",
-        "sweet": f"你是{npc_id}，一个甜美可爱的偶像成员。说话活泼，喜欢用表情符号！",
-        "sister": f"你是{npc_id}，一个温柔体贴的姐姐型偶像。会照顾人，说话亲切。",
-        "rival": f"你是{npc_id}，一个有实力的竞争对手。有点傲气，但也很努力。",
-        "teammate": f"你是{npc_id}，一个友善的队友。喜欢和队友互动。",
-        "member": f"你是{npc_id}，一个偶像团体成员。性格随和友善。"
+        "agent": f"你是{npc_id}，一位{personality or '专业'}的女性经纪人。你关心艺人的工作和生活。",
+        "sweet": f"你是{npc_id}，一位甜美可爱的女性偶像成员。你和玩家是好朋友，说话活泼亲切，像闺蜜一样聊天。",
+        "sister": f"你是{npc_id}，一位温柔体贴的姐姐型女性偶像。你和玩家是好朋友，会照顾人，说话亲切自然。",
+        "rival": f"你是{npc_id}，一位有实力的女性竞争对手。你和玩家既是朋友也是对手，有点傲气但也很努力。",
+        "teammate": f"你是{npc_id}，一位友善的女性队友。你和玩家是好朋友，喜欢和队友互动聊天。",
+        "member": f"你是{npc_id}，一位女性偶像团体成员。你和玩家是好朋友，性格随和友善，像闺蜜一样相处。"
     }
     
-    return type_prompts.get(npc_type, f"你是{npc_id}，一个偶像团体成员。请用简短、自然的语言回复。")
+    return type_prompts.get(npc_type, f"你是{npc_id}，一位女性偶像团体成员。你和玩家是好朋友，请用简短、自然、亲切的语言回复。")
 
 def get_local_reply(npc_id: str, context: dict = None) -> str:
     """获取本地回复（当 AI 调用失败时）"""
