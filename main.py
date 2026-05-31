@@ -181,50 +181,43 @@ def generate_invite_code():
     return f"PLAY48-{''.join([random.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(8)])}"
 
 def init_invite_codes(count: int = 2000):
-    """初始化邀请码系统（如果已有文件，会补充到指定数量）"""
-    if not os.path.exists(INVITE_CODE_FILE):
-        invite_data = {
-            "codes": {},
-            "generated_at": datetime.now().isoformat(),
-            "total_count": count,
-            "used_count": 0
-        }
-        for i in range(count):
+    """初始化邀请码系统，强制生成2000个邀请码"""
+    invite_data = {
+        "codes": {},
+        "generated_at": datetime.now().isoformat(),
+        "total_count": count,
+        "used_count": 0
+    }
+    
+    # 如果有旧文件，保留已使用的邀请码记录
+    if os.path.exists(INVITE_CODE_FILE):
+        try:
+            with open(INVITE_CODE_FILE, 'r', encoding='utf-8') as f:
+                old_data = json.load(f)
+            # 复制已使用的邀请码
+            for code, info in old_data["codes"].items():
+                if info["used"]:
+                    invite_data["codes"][code] = info
+                    invite_data["used_count"] += 1
+        except:
+            pass
+    
+    # 生成新邀请码，直到达到count个
+    while len(invite_data["codes"]) < count:
+        code = generate_invite_code()
+        while code in invite_data["codes"]:
             code = generate_invite_code()
-            invite_data["codes"][code] = {
-                "used": False,
-                "created_at": datetime.now().isoformat(),
-                "used_at": None,
-                "user_id": None
-            }
-        with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(invite_data, f, ensure_ascii=False, indent=2)
-        print(f"[INIT] 成功生成 {count} 个邀请码！")
-        return invite_data
-    else:
-        with open(INVITE_CODE_FILE, 'r', encoding='utf-8') as f:
-            invite_data = json.load(f)
-        
-        # 检查是否需要补充邀请码
-        current_count = len(invite_data["codes"])
-        if current_count < count:
-            need_add = count - current_count
-            for i in range(need_add):
-                code = generate_invite_code()
-                while code in invite_data["codes"]:
-                    code = generate_invite_code()
-                invite_data["codes"][code] = {
-                    "used": False,
-                    "created_at": datetime.now().isoformat(),
-                    "used_at": None,
-                    "user_id": None
-                }
-            invite_data["total_count"] = count
-            with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(invite_data, f, ensure_ascii=False, indent=2)
-            print(f"[INIT] 补充了 {need_add} 个邀请码，现在共有 {count} 个！")
-        
-        return invite_data
+        invite_data["codes"][code] = {
+            "used": False,
+            "created_at": datetime.now().isoformat(),
+            "used_at": None,
+            "user_id": None
+        }
+    
+    with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(invite_data, f, ensure_ascii=False, indent=2)
+    print(f"[INIT] 成功生成/更新 {count} 个邀请码，其中已使用 {invite_data['used_count']} 个！")
+    return invite_data
 
 # 初始化邀请码
 invite_data = init_invite_codes(2000)
