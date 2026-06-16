@@ -19,6 +19,11 @@ App.Config = (() => {
     if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
         return { API_URL: `http://${window.location.host}` };
     }
+    // GitHub Pages / 其他纯静态托管：origin 不会有后端 API，必须指向 Railway
+    const isStaticHost = /(?:^|\.)github\.io$|(?:^|\.)netlify\.app$|(?:^|\.)vercel\.app$|(?:^|\.)gitbook\.io$|(?:^|\.)codepen\.io$|(?:^|\.)jsbin\.com$|(?:^|\.)jsfiddle\.net$|(?:^|\.)pages\.dev$/i.test(window.location.hostname);
+    if (isStaticHost) {
+        return { API_URL: 'https://kodai48-production.up.railway.app' };
+    }
     return { API_URL: window.location.origin };
 })();
 
@@ -3959,29 +3964,54 @@ App.UI = {
             this.renderAffection();
         }
     },
+    _getGiftDef(id) {
+        // 与 buyGift 里的 giftItems 保持单一事实来源，避免遗漏导致 undefined
+        const giftItems = [
+            {id:'chocolate', name:'🍫 巧克力', price:50, desc:'甜蜜小礼物', effect:{affection:3}},
+            {id:'flower', name:'🌸 鲜花', price:80, desc:'浪漫之选', effect:{affection:5}},
+            {id:'perfume', name:'🌷 香水', price:300, desc:'优雅芬芳', effect:{affection:8}},
+            {id:'cake', name:'🎂 蛋糕', price:200, desc:'甜蜜惊喜', effect:{affection:6,mood:3}},
+            {id:'bear', name:'🧸 玩偶', price:150, desc:'可爱陪伴', effect:{affection:5}},
+            {id:'jewelry', name:'💎 首饰', price:800, desc:'璀璨夺目', effect:{affection:12}},
+            {id:'watch', name:'⌚ 手表', price:1200, desc:'珍惜时间', effect:{affection:15}},
+            {id:'bag', name:'👜 名牌包', price:1500, desc:'奢华之选', effect:{affection:18}},
+            {id:'concert_ticket', name:'🎫 演唱会门票', price:500, desc:'专属邀请', effect:{affection:10,mood:5}},
+            {id:'dinner', name:'🍽️ 豪华晚餐', price:800, desc:'共进美食', effect:{affection:12,mood:8}},
+            {id:'phone', name:'📱 最新手机', price:3000, desc:'科技潮品', effect:{affection:25}},
+            {id:'photobook', name:'📖 定制写真集', price:600, desc:'珍藏回忆', effect:{affection:10,popularity:5}},
+            {id:'stuffed_animal', name:'🐰 巨型公仔', price:400, desc:'少女心爆棚', effect:{affection:8}},
+            {id:'scarf', name:'🧣 品牌围巾', price:350, desc:'温暖呵护', effect:{affection:7}},
+            {id:'lipstick', name:'💄 限定口红', price:280, desc:'美妆必备', effect:{affection:6}},
+            {id:'tea_set', name:'🍵 精致茶具', price:450, desc:'文雅之礼', effect:{affection:8}},
+            {id:'leather_jacket', name:'🧥 皮衣', price:2500, desc:'帅气有型', effect:{affection:22}},
+        ];
+        return giftItems.find(g => g.id === id) || null;
+    },
     showGiftModal() {
         const backpack = G.stats.backpack || {};
         const items = Object.entries(backpack).filter(([_, count]) => count > 0);
-        const giftNames = {flower:'🌸 鲜花', perfume:'🌷 香水', bag:'👜 名牌包'};
-        const giftAff = {flower:8, perfume:20, bag:50};
-        
+
         if (items.length === 0) {
             this.showNotification('背包里没有礼物，请先购买');
             return;
         }
-        
+
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
         modal.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5)';
-        
-        let itemsHtml = items.map(([id, count]) => 
-            `<button onclick="App.UI.sendGiftInChat('${id}')" style="padding:12px;background:#fff;border:1px solid #ddd;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:8px">
-                <span style="font-size:24px">${giftNames[id]?.split(' ')[0] || '🎁'}</span>
-                <span>${giftNames[id]?.split(' ')[1] || id}</span>
+
+        let itemsHtml = items.map(([id, count]) => {
+            const def = this._getGiftDef(id);
+            const emoji = def ? def.name.split(' ')[0] : '🎁';
+            const name = def ? def.name.split(' ').slice(1).join(' ') || def.name : id;
+            const affGain = def ? (def.effect?.affection || 0) : 0;
+            return `<button onclick="App.UI.sendGiftInChat('${id}')" style="padding:12px;background:#fff;border:1px solid #ddd;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:8px">
+                <span style="font-size:24px">${emoji}</span>
+                <span>${name}</span>
                 <span style="color:#999;font-size:12px">x${count}</span>
-                <span style="margin-left:auto;color:#27ae60;font-size:12px">好感+${giftAff[id]||0}</span>
-            </button>`
-        ).join('');
+                <span style="margin-left:auto;color:#27ae60;font-size:12px">好感+${affGain}</span>
+            </button>`;
+        }).join('');
         
         modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
             <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">🎁 赠送礼物</div>
@@ -3994,18 +4024,19 @@ App.UI = {
         const member = this.currentChatId;
         const backpack = G.stats.backpack || {};
         if (!backpack[type] || backpack[type] < 1) { this.showNotification('礼物不足'); return; }
-        
+
         backpack[type]--;
         if (backpack[type] <= 0) delete backpack[type];
-        
-        const giftNames = {flower:'🌸 鲜花', perfume:'🌷 香水', bag:'👜 名牌包'};
-        const affGain = {flower:8, perfume:20, bag:50};
-        G.memberAffection[member] = (G.memberAffection[member]||50) + affGain[type];
+
+        const def = this._getGiftDef(type);
+        const giftName = def ? def.name : '礼物';
+        const affGain = def ? (def.effect?.affection || 0) : 0;
+        G.memberAffection[member] = (G.memberAffection[member]||50) + affGain;
         App.MemberMemory.record(member, 'gift', type);
         App.MemberMemory.adjustMood(member, 10);
         App.Store.updateStats({mood:2});
-        
-        const msg = {from:'player',text:`🎁 送给${member}一份${giftNames[type]}`,gift:type,time:getTimeStr()};
+
+        const msg = {from:'player',text:`🎁 送给${member}一份${giftName}`,gift:type,time:getTimeStr()};
         if (!G.chatHistory[member]) G.chatHistory[member] = {type:'member',avatar:'👤',messages:[]};
         G.chatHistory[member].messages.push(msg);
         document.querySelector('.modal-overlay')?.remove();
@@ -4015,7 +4046,7 @@ App.UI = {
             G.chatHistory[member].messages.push({from:'npc',text:pick(replies),time:getTimeStr()});
             this.renderWechatMessages();
         }, 800);
-        this.showNotification(`送给${member}一份礼物，好感+${affGain[type]}`);
+        this.showNotification(`送给${member}一份${giftName}，好感+${affGain}`);
         // 刷新好感度页面
         const affectionPage = document.getElementById('affectionPage');
         if (affectionPage && affectionPage.classList.contains('active')) {
