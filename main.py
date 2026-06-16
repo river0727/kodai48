@@ -1,57 +1,148 @@
-
 """
-极简版 AI 聊天后端（部署版）
+星光48·爱豆模拟器 - 后端服务
+提供 AI 聊天 API、邀请码管理、静态文件托管
 """
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+import json
+import logging
 import os
 import random
-from openai import AsyncOpenAI
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
-# 加载配置
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+
+from invite import (
+    ADMIN_PASSWORD,
+    get_all_codes,
+    get_invite_stats,
+    get_unused_codes,
+    get_used_codes,
+    init_invite_codes,
+    use_invite_code,
+    validate_invite_code,
+    verify_admin,
+)
+
+# ======================== 日志配置 ========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+logger = logging.getLogger("starlight48")
+
+# ======================== 配置加载 ========================
 API_KEY = os.getenv("AI_API_KEY", "")
 BASE_URL = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1")
 MODEL = os.getenv("AI_MODEL", "deepseek-chat")
 
-app = FastAPI()
+# CORS 白名单（可通过环境变量扩展，逗号分隔）
+CORS_ORIGINS_STR = os.getenv("CORS_ORIGINS", "*")
+if CORS_ORIGINS_STR == "*":
+    CORS_ORIGINS = ["*"]
+else:
+    CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS_STR.split(",") if o.strip()]
 
-# 挂载静态文件
-app.mount("/static", StaticFiles(directory="."), name="static")
+# API Token 验证（可选，通过环境变量启用）
+API_TOKEN = os.getenv("API_TOKEN", "")
 
-# 允许跨域
+# 速率限制：每个 IP 每分钟最大请求数
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
+
+# ======================== 应用初始化 ========================
+app = FastAPI(title="星光48 API", version="2.0")
+
+# CORS 中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-# 初始化 OpenAI 客户端
-client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
+# 静态文件
+app.mount("/static", StaticFiles(directory="."), name="static")
 
-# ---------------------- 数据模型 ----------------------
+# AI 客户端
+client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL) if API_KEY else None
 
+# 初始化邀请码系统
+invite_data = init_invite_codes(2000)
+
+# ======================== 速率限制 ========================
+# 简单的内存速率限制器
+_rate_limit_store: dict[str, list[float]] = {}
+
+import time
+
+
+def check_rate_limit(ip: str) -> bool:
+    """检查 IP 是否超过速率限制，返回 True 表示未超限"""
+    now = time.time()
+    if ip not in _rate_limit_store:
+        _rate_limit_store[ip] = []
+    # 清理过期记录
+    _rate_limit_store[ip] = [t for t in _rate_limit_store[ip] if now - t < 60]
+    if len(_rate_limit_store[ip]) >= RATE_LIMIT_PER_MINUTE:
+        return False
+    _rate_limit_store[ip].append(now)
+    return True
+
+
+# ======================== 鉴权依赖 ========================
+def verify_api_token(request: Request) -> None:
+    """验证 API Token（如果配置了的话）"""
+    if not API_TOKEN:
+        return  # 未配置 Token，跳过验证
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid API token")
+
+
+# ======================== 数据模型 ========================
 class ChatMessage(BaseModel):
     npcId: str
     message: str
     playerName: str = ""
     context: dict = {}
     rolePrompt: str = ""
+    inviteCode: str = ""
 
-# ---------------------- NPC 性格映射 ----------------------
 
-def get_npc_prompt(npc_id: str, context: dict = None) -> str:
+class InviteValidateRequest(BaseModel):
+    code: str
+
+
+class InviteUseRequest(BaseModel):
+    code: str
+    userId: str
+
+
+class CloudSaveRequest(BaseModel):
+    userId: str
+    saveData: dict
+    playerName: str = ""
+    gameDay: int = 1
+
+# 云存档存储目录
+CLOUD_SAVE_DIR = Path("cloud_saves")
+CLOUD_SAVE_DIR.mkdir(exist_ok=True)
+MAX_SAVE_SIZE = 500 * 1024  # 500KB 上限
+
+
+# ======================== NPC 性格映射 ========================
+def get_npc_prompt(npc_id: str, context: Optional[dict] = None) -> str:
     """根据 NPC 名字和类型生成系统提示词"""
-    
     context = context or {}
     npc_type = context.get("npcType", "member")
     personality = context.get("personality", "")
-    
-    # 根据类型生成提示词 - 所有角色都是女性
+
     type_prompts = {
         "agent": f"你是{npc_id}，一位{personality or '专业'}的女性经纪人。你关心艺人的工作和生活。",
         "sweet": f"你是{npc_id}，一位甜美可爱的女性偶像成员。你和玩家是好朋友，说话活泼亲切，像闺蜜一样聊天。",
@@ -60,81 +151,105 @@ def get_npc_prompt(npc_id: str, context: dict = None) -> str:
         "teammate": f"你是{npc_id}，一位友善的女性队友。你和玩家是好朋友，喜欢和队友互动聊天。",
         "member": f"你是{npc_id}，一位女性偶像团体成员。你和玩家是好朋友，性格随和友善，像闺蜜一样相处。"
     }
-    
-    return type_prompts.get(npc_type, f"你是{npc_id}，一位女性偶像团体成员。你和玩家是好朋友，请用简短、自然、亲切的语言回复。")
 
-def get_local_reply(npc_id: str, context: dict = None) -> str:
+    return type_prompts.get(
+        npc_type,
+        f"你是{npc_id}，一位女性偶像团体成员。你和玩家是好朋友，请用简短、自然、亲切的语言回复。"
+    )
+
+
+def get_local_reply(npc_id: str, context: Optional[dict] = None) -> str:
     """获取本地回复（当 AI 调用失败时）"""
-    
     context = context or {}
     npc_type = context.get("npcType", "member")
-    
+
     replies_by_type = {
         "agent": [
-            "明天有通告，早点休息。",
-            "行程已经安排好了。",
-            "最近状态不错，继续保持。",
-            "有事随时找我。",
-            "身体要紧，别太拼了。"
+            "明天有通告，早点休息。", "行程已经安排好了。",
+            "最近状态不错，继续保持。", "有事随时找我。", "身体要紧，别太拼了。",
+            "今天的排练效果不错。", "记得保持微笑。", "台风还需要再练练。",
+            "明天的服装已经准备好了。", "粉丝们的反馈很好，继续加油。"
         ],
         "sweet": [
-            "哇！太棒了！加油加油！",
-            "你今天也好厉害呀！",
-            "支持你！永远支持你！",
-            "嘿嘿，看到你就开心！",
-            "今天也要元气满满哦！"
+            "哇！太棒了！加油加油！", "你今天也好厉害呀！",
+            "支持你！永远支持你！", "嘿嘿，看到你就开心！", "今天也要元气满满哦！",
+            "姐姐最棒啦~", "一起努力变得更好吧！", "好开心能和你聊天！",
+            "你的笑容最治愈了~", "最喜欢看你表演了！"
         ],
         "sister": [
-            "做得不错，继续加油！",
-            "有什么不懂的尽管问我。",
-            "你今天辛苦了！",
-            "休息一下，别太累。",
-            "我相信你可以的！"
+            "做得不错，继续加油！", "有什么不懂的尽管问我。",
+            "你今天辛苦了！", "休息一下，别太累。", "我相信你可以的！",
+            "需要帮忙的话随时开口。", "你最近进步很大呢。", "记得按时吃饭。",
+            "不要给自己太大压力。", "你已经做得很好了。"
         ],
         "rival": [
-            "哼，这次还算凑合吧...",
-            "你行不行啊？算了，加油吧。",
-            "别得意，下次我不会输的。",
-            "虽然不想承认...但你今天还行。",
-            "继续努力吧。"
+            "哼，这次还算凑合吧...", "你行不行啊？算了，加油吧。",
+            "别得意，下次我不会输的。", "虽然不想承认...但你今天还行。", "继续努力吧。",
+            "我今天状态不好而已。", "别以为这样就赢了。", "下次一定是我的表现更好。",
+            "你也没那么差啦...", "我会追上你的，等着吧。"
         ],
         "teammate": [
-            "明天一起练舞吧！",
-            "今天表现好帅！",
-            "一起去吃饭吗？",
-            "加油加油！",
-            "我们一定可以的！"
+            "明天一起练舞吧！", "今天表现好帅！",
+            "一起去吃饭吗？", "加油加油！", "我们一定可以的！",
+            "今天的排练辛苦了！", "团队配合越来越默契了。",
+            "你那个动作可以再酷一点。", "一起加油拿第一！", "演出大成功！"
         ],
         "member": [
-            "好的，我知道了！",
-            "加油！一起努力！",
-            "今天也辛苦了！",
-            "嗯嗯，没问题！",
-            "谢谢你的消息！"
+            "好的，我知道了！", "加油！一起努力！",
+            "今天也辛苦了！", "嗯嗯，没问题！", "谢谢你的消息！",
+            "有什么我能帮忙的吗？", "你也是我最喜欢的队友！",
+            "下次公演一起加油吧。", "今天的舞蹈练得怎么样？", "好期待下次演出啊。"
         ]
     }
-    
+
     return random.choice(replies_by_type.get(npc_type, replies_by_type["member"]))
 
-# ---------------------- API 端点 ----------------------
+
+# ======================== API 端点 ========================
 
 @app.get("/")
 async def read_root():
     return FileResponse("index.html")
 
+
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "ai_configured": bool(API_KEY),
+        "model": MODEL if API_KEY else None,
+        "cloud_saves_count": len(list(CLOUD_SAVE_DIR.glob("*.json"))) if CLOUD_SAVE_DIR.exists() else 0,
+        "server_time": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@app.get("/api/network-test")
+def network_test():
+    """网络连通性测试端点，返回延迟和状态信息"""
+    return {
+        "status": "ok",
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "message": "API server is reachable"
+    }
+
 
 @app.post("/api/chat")
-async def chat(data: ChatMessage):
-    # 获取系统提示词
+async def chat(data: ChatMessage, request: Request):
+    """AI 聊天接口"""
+    # API Token 验证（如果配置了的话）
+    verify_api_token(request)
+    # 速率限制
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
     system_prompt = get_npc_prompt(data.npcId, data.context)
-    
+    logger.info("Chat request: npcId=%s, message=%.30s...", data.npcId, data.message)
+
     try:
-        # 尝试调用 AI
-        print(f"[REQUEST] npcId={data.npcId}, message={data.message[:30]}...")
-        
+        if client is None:
+            raise ValueError("AI API Key 未配置")
+
         response = await client.chat.completions.create(
             model=MODEL,
             messages=[
@@ -144,251 +259,219 @@ async def chat(data: ChatMessage):
             temperature=0.8,
             max_tokens=500
         )
-        
+
         ai_reply = response.choices[0].message.content
-        print(f"[SUCCESS] AI reply: {ai_reply[:50]}...")
-        
-        return {
-            "status": "success",
-            "reply": ai_reply
-        }
+        logger.info("AI reply: %.50s...", ai_reply)
+
+        return {"status": "success", "reply": ai_reply}
+
     except Exception as e:
-        # AI 调用失败，使用本地回复
-        print(f"[ERROR] AI call failed: {type(e).__name__}: {e}")
-        
-        # 获取本地回复
+        logger.warning("AI call failed: %s: %s", type(e).__name__, e)
         local_reply = get_local_reply(data.npcId, data.context)
-        
-        print(f"[FALLBACK] Using local reply: {local_reply}")
-        
-        return {
-            "status": "success",
-            "reply": local_reply
-        }
+        logger.info("Fallback to local reply: %s", local_reply)
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        return {"status": "success", "reply": local_reply}
 
-# ---------------------- 邀请码系统 ----------------------
 
-import json
-from datetime import datetime
+# ======================== 邀请码 API ========================
 
-# 邀请码数据存储文件
-INVITE_CODE_FILE = "invite_codes.json"
-
-# 管理员密码
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin48")
-
-def generate_invite_code():
-    """生成一个邀请码"""
-    return f"PLAY48-{''.join([random.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(8)])}"
-
-def init_invite_codes(count: int = 2000):
-    """初始化邀请码系统，强制生成2000个邀请码"""
-    invite_data = {
-        "codes": {},
-        "generated_at": datetime.now().isoformat(),
-        "total_count": count,
-        "used_count": 0
-    }
-    
-    # 如果有旧文件，保留已使用的邀请码记录
-    if os.path.exists(INVITE_CODE_FILE):
-        try:
-            with open(INVITE_CODE_FILE, 'r', encoding='utf-8') as f:
-                old_data = json.load(f)
-            # 复制已使用的邀请码
-            for code, info in old_data["codes"].items():
-                if info["used"]:
-                    invite_data["codes"][code] = info
-                    invite_data["used_count"] += 1
-        except:
-            pass
-    
-    # 生成新邀请码，直到达到count个
-    while len(invite_data["codes"]) < count:
-        code = generate_invite_code()
-        while code in invite_data["codes"]:
-            code = generate_invite_code()
-        invite_data["codes"][code] = {
-            "used": False,
-            "created_at": datetime.now().isoformat(),
-            "used_at": None,
-            "user_id": None
-        }
-    
-    with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(invite_data, f, ensure_ascii=False, indent=2)
-    print(f"[INIT] 成功生成/更新 {count} 个邀请码，其中已使用 {invite_data['used_count']} 个！")
-    return invite_data
-
-# 初始化邀请码
-invite_data = init_invite_codes(2000)
-
-def save_invite_data():
-    """保存邀请码数据"""
-    with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(invite_data, f, ensure_ascii=False, indent=2)
-
-def validate_invite_code(code: str):
-    """验证邀请码是否有效"""
-    if code.upper() == ADMIN_PASSWORD.upper():
-        return {"valid": True, "is_admin": True, "user_id": "admin"}
-
-    # 不区分大小写查找验证码
-    found_code = None
-    for invite_code in invite_data["codes"]:
-        if invite_code.upper() == code.upper():
-            found_code = invite_code
-            break
-    
-    if found_code is None:
-        return {"valid": False, "message": "邀请码不存在"}
-
-    if invite_data["codes"][found_code]["used"]:
-        return {"valid": False, "message": "这个邀请码已经被使用了"}
-
-    return {"valid": True, "is_admin": False, "code": found_code}
-
-def use_invite_code(code: str, userId: str):
-    """使用邀请码"""
-    if code.upper() == ADMIN_PASSWORD.upper():
-        return True
-    
-    # 不区分大小写查找验证码
-    found_code = None
-    for invite_code in invite_data["codes"]:
-        if invite_code.upper() == code.upper():
-            found_code = invite_code
-            break
-    
-    if found_code is not None and not invite_data["codes"][found_code]["used"]:
-        invite_data["codes"][found_code]["used"] = True
-        invite_data["codes"][found_code]["used_at"] = datetime.now().isoformat()
-        invite_data["codes"][found_code]["user_id"] = userId
-        invite_data["used_count"] = invite_data.get("used_count", 0) + 1
-        save_invite_data()
-        return True
-    return False
-
-def get_invite_stats():
-    """获取邀请码统计"""
-    total = len(invite_data["codes"])
-    used = sum(1 for code_data in invite_data["codes"].values() if code_data["used"])
-    return {
-        "total": total,
-        "used": used,
-        "unused": total - used
-    }
-
-# 请求模型
-class InviteValidateRequest(BaseModel):
-    code: str
-
-class InviteUseRequest(BaseModel):
-    code: str
-    userId: str
-
-# 邀请码验证接口
 @app.post("/api/invite/validate")
-async def validate_invite(data: InviteValidateRequest):
+async def api_validate_invite(data: InviteValidateRequest):
     """验证邀请码是否有效"""
-    result = validate_invite_code(data.code)
+    result = validate_invite_code(invite_data, data.code)
     return result
 
-# 邀请码使用接口
+
 @app.post("/api/invite/use")
-async def use_invite(data: InviteUseRequest):
+async def api_use_invite(data: InviteUseRequest):
     """使用邀请码"""
-    success = use_invite_code(data.code, data.userId)
+    success = use_invite_code(invite_data, data.code, data.userId)
     if success:
+        logger.info("Invite code used: user=%s", data.userId)
         return {"success": True, "message": "邀请码使用成功！"}
     else:
         return {"success": False, "message": "邀请码无效或已被使用"}
 
-# 获取邀请码统计（仅管理员）
+
 @app.get("/api/invite/stats")
-async def get_stats(password: str):
-    """获取邀请码统计（仅管理员）"""
-    if password != ADMIN_PASSWORD:
-        return {"error": "密码错误"}
-    return get_invite_stats()
+async def api_get_stats(password: str):
+    """获取邀请码统计（需要管理员密码）"""
+    if not verify_admin(password):
+        raise HTTPException(status_code=403, detail="密码错误")
+    return get_invite_stats(invite_data)
 
-# 获取未使用的邀请码列表（仅管理员）
+
 @app.get("/api/invite/list")
-async def list_invite_codes(password: str, limit: int = 100):
-    """获取未使用的邀请码列表（仅管理员）"""
-    if password != ADMIN_PASSWORD:
-        return {"error": "密码错误"}
+async def api_list_unused(password: str, limit: int = 100):
+    """获取未使用的邀请码列表（需要管理员密码）"""
+    if not verify_admin(password):
+        raise HTTPException(status_code=403, detail="密码错误")
 
-    unused_codes = []
-    for code, data in invite_data["codes"].items():
-        if not data["used"]:
-            unused_codes.append(code)
-            if len(unused_codes) >= limit:
-                break
+    codes = get_unused_codes(invite_data, limit)
+    total_unused = sum(1 for cd in invite_data.get("codes", {}).values() if not cd.get("used"))
 
-    # 计算剩余总数量
-    total_unused = len([data for data in invite_data["codes"].values() if not data["used"]])
-    
-    return {
-        "codes": unused_codes,
-        "total_remaining": total_unused
-    }
+    return {"codes": codes, "total_remaining": total_unused}
 
-# 获取已使用的邀请码列表（仅管理员）
+
 @app.get("/api/invite/used-list")
-async def list_used_invite_codes(password: str, limit: int = 100):
-    """获取已使用的邀请码列表（仅管理员）"""
-    if password != ADMIN_PASSWORD:
-        return {"error": "密码错误"}
+async def api_list_used(password: str, limit: int = 100):
+    """获取已使用的邀请码列表（需要管理员密码）"""
+    if not verify_admin(password):
+        raise HTTPException(status_code=403, detail="密码错误")
 
-    used_codes = []
-    for code, data in invite_data["codes"].items():
-        if data["used"]:
-            used_codes.append({
-                "code": code,
-                "user_id": data["user_id"],
-                "used_at": data["used_at"],
-                "created_at": data["created_at"]
-            })
-            if len(used_codes) >= limit:
-                break
+    codes = get_used_codes(invite_data, limit)
+    total_used = sum(1 for cd in invite_data.get("codes", {}).values() if cd.get("used"))
 
-    total_used = sum(1 for data in invite_data["codes"].values() if data["used"])
-    
-    return {
-        "codes": used_codes,
-        "total_used": total_used
-    }
+    return {"codes": codes, "total_used": total_used}
 
-# 获取所有邀请码列表（仅管理员）
+
 @app.get("/api/invite/all-list")
-async def list_all_invite_codes(password: str, limit: int = 100):
-    """获取所有邀请码列表（仅管理员）"""
-    if password != ADMIN_PASSWORD:
-        return {"error": "密码错误"}
+async def api_list_all(password: str, limit: int = 100):
+    """获取所有邀请码列表（需要管理员密码）"""
+    if not verify_admin(password):
+        raise HTTPException(status_code=403, detail="密码错误")
 
-    all_codes = []
-    for code, data in invite_data["codes"].items():
-        all_codes.append({
-            "code": code,
-            "used": data["used"],
-            "user_id": data["user_id"],
-            "used_at": data["used_at"],
-            "created_at": data["created_at"]
-        })
-        if len(all_codes) >= limit:
-            break
+    codes = get_all_codes(invite_data, limit)
+    stats = get_invite_stats(invite_data)
 
-    stats = get_invite_stats()
-    
     return {
-        "codes": all_codes,
+        "codes": codes,
         "total": stats["total"],
         "used": stats["used"],
         "unused": stats["unused"]
     }
+
+
+# ======================== 云存档 API ========================
+
+def _get_save_path(user_id: str) -> Path:
+    """获取用户存档文件路径（防止路径遍历）"""
+    safe_name = "".join(c for c in user_id if c.isalnum() or c in "_-")
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="无效的用户 ID")
+    return CLOUD_SAVE_DIR / f"{safe_name}.json"
+
+
+@app.post("/api/save/upload")
+async def cloud_save_upload(data: CloudSaveRequest, request: Request):
+    """上传存档到云端"""
+    # 速率限制
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
+    # 大小检查
+    save_json = json.dumps(data.saveData, ensure_ascii=False)
+    if len(save_json.encode('utf-8')) > MAX_SAVE_SIZE:
+        raise HTTPException(status_code=400, detail="存档过大，请清理后重试")
+
+    save_path = _get_save_path(data.userId)
+    save_entry = {
+        "user_id": data.userId,
+        "player_name": data.playerName,
+        "game_day": data.gameDay,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "save_data": data.saveData
+    }
+
+    try:
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(save_entry, f, ensure_ascii=False, indent=2)
+    except IOError as e:
+        logger.error("Cloud save write error: user=%s, error=%s", data.userId, e)
+        raise HTTPException(status_code=500, detail=f"存档写入失败: {e}")
+
+    logger.info("Cloud save: user=%s, day=%d, size=%d bytes",
+                data.userId, data.gameDay, len(save_json.encode('utf-8')))
+
+    return {
+        "success": True,
+        "message": "存档已上传至云端",
+        "saved_at": save_entry["saved_at"],
+        "game_day": data.gameDay
+    }
+
+
+@app.get("/api/save/download")
+async def cloud_save_download(userId: str):
+    """从云端下载存档"""
+    save_path = _get_save_path(userId)
+
+    if not save_path.exists():
+        raise HTTPException(status_code=404, detail="未找到云端存档")
+
+    try:
+        with open(save_path, 'r', encoding='utf-8') as f:
+            save_entry = json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error("Cloud save JSON corrupt: user=%s, error=%s", userId, e)
+        raise HTTPException(status_code=500, detail="云端存档数据损坏")
+    except IOError as e:
+        logger.error("Cloud save read error: user=%s, error=%s", userId, e)
+        raise HTTPException(status_code=500, detail=f"存档读取失败: {e}")
+
+    logger.info("Cloud download: user=%s, day=%d", userId, save_entry.get("game_day", 0))
+
+    return {
+        "success": True,
+        "player_name": save_entry.get("player_name", ""),
+        "game_day": save_entry.get("game_day", 1),
+        "saved_at": save_entry.get("saved_at", ""),
+        "save_data": save_entry.get("save_data", {})
+    }
+
+
+@app.get("/api/save/info")
+async def cloud_save_info(userId: str):
+    """获取云端存档信息（不含完整数据）"""
+    save_path = _get_save_path(userId)
+
+    if not save_path.exists():
+        return {"exists": False, "message": "暂无云端存档"}
+
+    try:
+        with open(save_path, 'r', encoding='utf-8') as f:
+            save_entry = json.load(f)
+    except json.JSONDecodeError:
+        logger.warning("Cloud save info: corrupt file for user=%s", userId)
+        return {"exists": False, "message": "云端存档损坏"}
+    except IOError as e:
+        logger.warning("Cloud save info: read error for user=%s: %s", userId, e)
+        return {"exists": False, "message": "无法读取云端存档"}
+
+    return {
+        "exists": True,
+        "player_name": save_entry.get("player_name", ""),
+        "game_day": save_entry.get("game_day", 1),
+        "saved_at": save_entry.get("saved_at", ""),
+        "size": save_path.stat().st_size
+    }
+
+
+@app.delete("/api/save/delete")
+async def cloud_save_delete(userId: str, request: Request):
+    """删除云端存档"""
+    # 速率限制
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
+    save_path = _get_save_path(userId)
+    if save_path.exists():
+        try:
+            save_path.unlink()
+            logger.info("Cloud save deleted: user=%s", userId)
+            return {"success": True, "message": "云端存档已删除"}
+        except IOError as e:
+            logger.error("Cloud save delete error: user=%s, error=%s", userId, e)
+            raise HTTPException(status_code=500, detail=f"删除失败: {e}")
+    return {"success": True, "message": "没有找到云端存档"}
+
+
+# ======================== 启动入口 ========================
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    logger.info("Starting server on port %d...", port)
+    uvicorn.run(app, host="0.0.0.0", port=port)

@@ -1,0 +1,3941 @@
+/* ============ 星光48·爱豆模拟器 V2 - 主脚本 ============ */
+
+// ============ 全局命名空间 ============
+const App = window.App = {};
+
+// ============ 配置 ============
+// API 地址自动检测：优先使用当前服务器地址，file:// 协议下回退到部署地址
+// 可通过在 URL 后加 ?api=https://xxx 临时覆盖
+App.Config = (() => {
+    const params = new URLSearchParams(window.location.search);
+    const customApi = params.get('api');
+    if (customApi) return { API_URL: customApi };
+
+    const proto = window.location.protocol;
+    if (proto === 'file:') {
+        // 直接打开 HTML 文件时，使用默认部署地址
+        return { API_URL: 'https://kodai48-production.up.railway.app' };
+    }
+    if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+        return { API_URL: `http://${window.location.host}` };
+    }
+    return { API_URL: window.location.origin };
+})();
+
+// ============ 网络诊断与连接管理 ============
+App.Network = {
+    _status: 'unknown', // unknown | online | offline | degraded
+    _lastCheck: 0,
+    _checkInterval: null,
+    _listeners: [],
+
+    /** 初始化网络监控 */
+    init() {
+        window.addEventListener('online', () => {
+            console.log('🌐 浏览器报告网络恢复');
+            this._setStatus('unknown');
+            this.checkNow();
+        });
+        window.addEventListener('offline', () => {
+            console.warn('🔴 浏览器报告网络断开');
+            this._setStatus('offline');
+        });
+        // 每60秒定期检测
+        this._checkInterval = setInterval(() => this.checkNow(), 60000);
+        // 首检延迟2秒（等页面就绪）
+        setTimeout(() => this.checkNow(), 2000);
+    },
+
+    /** 获取当前网络状态 */
+    get status() { return this._status; },
+
+    /** 监听状态变化 */
+    onChange(fn) { this._listeners.push(fn); },
+
+    _setStatus(s) {
+        if (this._status !== s) {
+            const prev = this._status;
+            this._status = s;
+            this._listeners.forEach(fn => fn(s, prev));
+        }
+    },
+
+    /**
+     * 立即检测网络与 API 连通性
+     * @returns {Promise<{online:boolean, apiReachable:boolean, latency:number|null, detail:string}>}
+     */
+    async checkNow() {
+        const now = Date.now();
+        // 至少间隔5秒
+        if (now - this._lastCheck < 5000) return this._lastResult;
+        this._lastCheck = now;
+
+        const result = {
+            online: navigator.onLine,
+            apiReachable: false,
+            latency: null,
+            detail: '',
+            timestamp: new Date().toISOString()
+        };
+
+        if (!result.online) {
+            result.detail = '设备未连接网络';
+            this._setStatus('offline');
+            this._lastResult = result;
+            return result;
+        }
+
+        // 尝试连接 API
+        const apiUrl = App.Config.API_URL;
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 8000);
+            const t0 = performance.now();
+            const res = await fetch(`${apiUrl}/health`, {
+                method: 'GET',
+                signal: controller.signal,
+                cache: 'no-store'
+            });
+            clearTimeout(timeout);
+            result.latency = Math.round(performance.now() - t0);
+
+            if (res.ok) {
+                const data = await res.json().catch(() => ({}));
+                result.apiReachable = true;
+                result.detail = `API 正常 (${result.latency}ms)`;
+                result.serverInfo = data;
+                this._setStatus('online');
+            } else {
+                result.apiReachable = false;
+                result.detail = `服务器返回 HTTP ${res.status}`;
+                this._setStatus('degraded');
+            }
+        } catch (e) {
+            if (e.name === 'AbortError') {
+                result.detail = `连接超时 (>8s)`;
+            } else if (e.name === 'TypeError' && (e.message.includes('fetch') || e.message.includes('NetworkError'))) {
+                result.detail = `无法连接 API 服务器 (${apiUrl})`;
+            } else {
+                result.detail = `连接错误: ${e.message}`;
+            }
+            result.apiReachable = false;
+            this._setStatus('degraded');
+        }
+
+        console.log('🔍 网络诊断:', result);
+        this._lastResult = result;
+        return result;
+    },
+
+    /**
+     * 详细诊断（用于用户手动触发）
+     * @returns {Promise<object>} 完整诊断报告
+     */
+    async diagnose() {
+        const report = {
+            time: new Date().toISOString(),
+            browserOnline: navigator.onLine,
+            apiUrl: App.Config.API_URL,
+            health: null,
+            healthError: null,
+            chatTest: null,
+            chatError: null,
+            overall: 'pending'
+        };
+
+        // 1. 基础连通性
+        const netCheck = await this.checkNow();
+        report.netCheck = netCheck;
+
+        // 2. Health 端点
+        try {
+            const ctrl = new AbortController();
+            setTimeout(() => ctrl.abort(), 5000);
+            const res = await fetch(`${App.Config.API_URL}/health`, { signal: ctrl.signal, cache: 'no-store' });
+            report.health = res.ok ? await res.json().catch(() => 'parse_error') : `HTTP ${res.status}`;
+        } catch (e) {
+            report.healthError = e.name === 'AbortError' ? '超时' : e.message;
+        }
+
+        // 3. 聊天端点连通性（只测连通，不发真实消息）
+        try {
+            const ctrl = new AbortController();
+            setTimeout(() => ctrl.abort(), 5000);
+            const t0 = performance.now();
+            const res = await fetch(`${App.Config.API_URL}/api/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ npcId: '_diag_', message: 'ping', playerName: 'diag', context: { npcType: 'member' }, rolePrompt: '', inviteCode: '' }),
+                signal: ctrl.signal
+            });
+            report.chatTest = { status: res.status, latency: Math.round(performance.now() - t0) + 'ms' };
+        } catch (e) {
+            report.chatError = e.name === 'AbortError' ? '超时' : e.message;
+        }
+
+        // 综合判断
+        if (report.health && report.chatTest?.status === 200) {
+            report.overall = 'healthy';
+        } else if (report.health || report.chatTest) {
+            report.overall = 'partial';
+        } else if (!report.browserOnline) {
+            report.overall = 'offline';
+        } else {
+            report.overall = 'unreachable';
+        }
+
+        console.log('🩺 完整诊断报告:', report);
+        return report;
+    },
+
+    /**
+     * 带超时和重试的 fetch 封装
+     * @param {string} url
+     * @param {object} options - fetch options + retries, timeoutMs
+     * @returns {Promise<Response>}
+     */
+    async fetchWithRetry(url, options = {}) {
+        const maxRetries = options.retries ?? 0;
+        const timeoutMs = options.timeoutMs ?? 10000;
+        const backoffBase = options.backoffMs ?? 1000;
+        delete options.retries;
+        delete options.timeoutMs;
+        delete options.backoffMs;
+
+        let lastError = null;
+
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            if (attempt > 0) {
+                const delay = backoffBase * Math.pow(2, attempt - 1) + Math.random() * 500;
+                console.log(`🔄 第 ${attempt} 次重试，等待 ${Math.round(delay)}ms...`);
+                await new Promise(r => setTimeout(r, delay));
+            }
+
+            try {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), timeoutMs);
+                const res = await fetch(url, { ...options, signal: controller.signal });
+                clearTimeout(timer);
+                return res;
+            } catch (e) {
+                lastError = e;
+                console.warn(`⚠️ fetch 尝试 ${attempt + 1}/${maxRetries + 1} 失败:`, e.message || e.name);
+                // AbortError(超时)可重试，真正的网络错误也可重试
+                if (e.name === 'AbortError' && attempt < maxRetries) continue;
+                if (e.name === 'TypeError' && attempt < maxRetries) continue;
+                if (attempt < maxRetries) continue;
+            }
+        }
+
+        throw lastError || new Error('所有重试均失败');
+    },
+
+    /** 销毁监控 */
+    destroy() {
+        if (this._checkInterval) {
+            clearInterval(this._checkInterval);
+            this._checkInterval = null;
+        }
+    }
+};
+
+// ============ 邀请码验证模块 ============
+App.Invite = {
+    get API_URL() { return App.Config.API_URL; },
+    inviteCode: null,
+    userId: null,
+    
+    async validate() {
+        const input = document.getElementById('inviteInput');
+        const errorDiv = document.getElementById('inviteError');
+        const code = input.value.trim().toUpperCase();
+        
+        if (!code) {
+            errorDiv.textContent = '请输入邀请码';
+            return;
+        }
+        
+        try {
+            // 先验证邀请码
+            const validateRes = await fetch(`${this.API_URL}/api/invite/validate`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code: code })
+            });
+            
+            const validateData = await validateRes.json();
+            
+            if (!validateData.valid) {
+                errorDiv.textContent = validateData.message || '邀请码无效';
+                return;
+            }
+            
+            // 如果是管理员密码，直接进入
+            if (validateData.is_admin) {
+                this.inviteCode = code;
+                this.userId = 'admin_' + Date.now();
+                this.success();
+                return;
+            }
+            
+            // 普通邀请码，先使用它 - 用后端返回的正确验证码！
+            const realCode = validateData.code || code;
+            const userId = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            const useRes = await fetch(`${this.API_URL}/api/invite/use`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code: realCode, userId: userId })
+            });
+            
+            const useData = await useRes.json();
+            
+            if (useData.success) {
+                this.inviteCode = code;
+                this.userId = userId;
+                this.success();
+            } else {
+                errorDiv.textContent = useData.message || '邀请码使用失败';
+            }
+        } catch (e) {
+            console.error('邀请码验证错误:', e);
+            errorDiv.textContent = '网络错误，请稍后再试';
+        }
+    },
+    
+    success() {
+        // 保存到本地存储
+        localStorage.setItem('inviteCode', this.inviteCode);
+        localStorage.setItem('inviteUserId', this.userId);
+        
+        // 隐藏邀请码页面，显示锁屏页面
+        document.getElementById('inviteScreen').classList.remove('active');
+        document.getElementById('lockScreen').classList.add('active');
+        
+        // 清空输入框和错误提示
+        document.getElementById('inviteInput').value = '';
+        document.getElementById('inviteError').textContent = '';
+        
+        console.log('🎉 邀请码验证成功！');
+    },
+    
+    checkAlreadyValidated() {
+        const savedCode = localStorage.getItem('inviteCode');
+        const savedUserId = localStorage.getItem('inviteUserId');
+        
+        if (savedCode && savedUserId) {
+            this.inviteCode = savedCode;
+            this.userId = savedUserId;
+            return true;
+        }
+        return false;
+    },
+    
+    getInviteCode() {
+        return this.inviteCode || localStorage.getItem('inviteCode');
+    }
+};
+
+// ============ 工具函数 ============
+const $ = id => document.getElementById(id);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const randInt = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const getTimeStr = () => {
+    const n = new Date();
+    return n.getHours().toString().padStart(2,'0') + ':' + n.getMinutes().toString().padStart(2,'0');
+};
+const evaluateReply = text => {
+    if (!text || !text.trim()) return 'perfunctory';
+    const t = text.trim();
+    const perf = ['哦','嗯','好','行','随便','不知道','哈','呵','额','啊'];
+    if (t.length <= 2 || perf.includes(t)) return 'perfunctory';
+    if (t.length >= 8 && !perf.some(w => t === w)) return 'heartfelt';
+    return 'normal';
+};
+const getPersonalityStage = () => {
+    const p = G.stats.popularity;
+    if (p<20) return {emoji:'🌱', name:'练习生'};
+    if (p<40) return {emoji:'🌿', name:'初登舞台'};
+    if (p<60) return {emoji:'🌳', name:'上升期'};
+    if (p<80) return {emoji:'🔥', name:'人气爆发'};
+    return {emoji:'👑', name:'顶流'};
+};
+const getAffectionLevel = (val) => {
+    if (val>=96) return {level:'生死之交',emoji:'💗'};
+    if (val>=81) return {level:'爱人',emoji:'💕'};
+    if (val>=61) return {level:'挚友',emoji:'💖'};
+    if (val>=41) return {level:'亲密',emoji:'💝'};
+    if (val>=21) return {level:'友好',emoji:'💛'};
+    return {level:'普通',emoji:'🤍'};
+};
+
+// ============ 音效模块 ============
+App.Sound = {
+    enabled: true,
+    init() {
+        const silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+        ['Msg','Call','Notif','Success','Error','Click','Cheer'].forEach(name => {
+            const audio = document.getElementById('sound'+name);
+            if (audio) { audio.src = silentWav; audio.load(); }
+        });
+    },
+    play(name) {
+        if (!this.enabled) return;
+        const audio = document.getElementById('sound'+name);
+        if (audio) { audio.currentTime = 0; audio.play().catch(()=>{}); }
+    },
+    toggle() { this.enabled = !this.enabled; return this.enabled; }
+};
+
+// ============ 状态管理模块 (含压力值、移籍) ============
+App.Store = {
+    G: {
+        player: { name:'', appearance:'', personality:'', personalityEmoji:'', group:'', team:'', stage:'练习生' },
+        stats: { popularity:10, skill:10, mood:70, affection:50, starlight:10, stress:10, scandal:0, drumstick:0, wechatBalance:0, backpack:{}, agent_satisfaction:50, training:0 },
+        game: { day:1, phase:'morning', interaction_count:0, rank:150, weibo_followers:100, pocket_fans:50, handshake_this_month:false, fan_letters_this_week:0, electionInProgress:false, electionPhase:null, firstReportVotes:0, secondReportVotes:0, firstReportPulls:0, secondReportPulls:0 },
+        flags: { hasFirstShow:false, hasFirstElection:false, hasStalker:false, hasCenterBattle:false, hasCrisis:false, hasEmo:false, hasZeroStress:false, hasMoved:false },
+        achievements: [],
+        chatHistory: {},
+        weiboPosts: [],
+        moments: [],
+        smsMessages: [],
+        callHistory: [],
+        fanLetters: [],
+        electionResults: [],
+        memberAffection: {},
+        blockedContacts: [],
+        pocketRoomMessages: [],
+        bestPartner: null,
+        partnerStageUsed: false
+    },
+    listeners: {},
+    updateStats(changes) {
+        const labels = {
+            popularity:'⭐人气', skill:'💪实力', mood:'😊心情', affection:'💕好感',
+            starlight:'💎星光', stress:'😰压力', scandal:'📸绯闻', drumstick:'🍗鸡腿', 
+            wechatBalance:'💰微信余额', agent_satisfaction:'👔经纪人满意度'
+        };
+        let text = '';
+        for (let [k, v] of Object.entries(changes)) {
+            if (!(k in this.G.stats)) continue;
+            const old = this.G.stats[k];
+            const maxV = (k === 'stress' || k === 'scandal') ? 200 : (k === 'drumstick' ? 99999 : (k === 'wechatBalance' ? 999999 : 100));
+            this.G.stats[k] = clamp(old + v, 0, maxV);
+            const sign = v > 0 ? '+' : '';
+            text += `${labels[k]||k} ${sign}${v}\n`;
+        }
+        if (this.G.stats.stress <= 0 && !this.G.flags.hasZeroStress) {
+            this.G.flags.hasZeroStress = true;
+            this.G.stats.mood = clamp(this.G.stats.mood + 5, 0, 100);
+            text += '压力清零！心情+5\n';
+        }
+        this.G.player.stage = getPersonalityStage().name;
+        this.emit('statsChanged', this.G.stats);
+        this.emit('phaseChanged');
+        App.Achievements.checkAll();
+        App.Events.checkEvents();
+        App.Save.autoSave();
+        if (text) App.UI.showStatChange(text.trim());
+    },
+    applyChatStress(quality) {
+        if (quality === 'heartfelt') this.updateStats({ stress: -5, mood: 2 });
+        else if (quality === 'normal') this.updateStats({ stress: -2 });
+        else if (quality === 'perfunctory') this.updateStats({ stress: 3, mood: -1 });
+    },
+    moveGroup(targetGroup, targetTeam) {
+        this.G.player.group = targetGroup;
+        this.G.player.team = targetTeam;
+        this.G.flags.hasMoved = true;
+        this.updateStats({ popularity: 2, starlight: 3 });
+        this.G.game.rank = Math.min(this.G.game.rank, 150);
+        this.emit('groupChanged');
+        App.UI.showNotification(`🚄 已移籍至 ${targetGroup} Team ${targetTeam}！`);
+        App.Save.autoSave();
+    },
+    on(key, callback) {
+        if (!this.listeners[key]) this.listeners[key] = [];
+        this.listeners[key].push(callback);
+    },
+    emit(key, data) {
+        (this.listeners[key] || []).forEach(cb => cb(data));
+    }
+};
+
+const G = App.Store.G;
+
+// ============ NPC数据库 (完整成员+毕业生) ============
+App.NPCData = {
+    SNH48: {
+        agent: { name:'李姐', avatar:'👩‍💼', personality:'严厉专业', habits:['加班狂','喝美式不加糖','口头禅：专业一点'] },
+        core: [
+            { name:'杨心渝', avatar:'👧', type:'sweet', habits:['爱叫人昵称','随身带零食','口头禅：嘿嘿～'] },
+            { name:'闫明筠', avatar:'👩', type:'sister', habits:['喝枸杞茶','写日记','口头禅：听姐的'] },
+            { name:'宋昕冉', avatar:'💃', type:'rival', habits:['深夜加练','看对手直拍','口头禅：等着瞧'] }
+        ],
+        teams: {
+            'SII': ['闫明筠','刘增艳','田姝丽','由淼','芦馨怡','杨心渝','周童玥','张倩','张雷雷','蒋夏羽','盛乐','武博涵','曹可甜','刘诗彤','柳雨呈','李婷','刘婧阳','宁轲'],
+            'NII': ['胡晓慧','潘瑛琪','青钰雯','金莹玥','卢天惠','柏欣妤','唐程成','叶凡','黄紫怡','钟亚男','李继醇','沈馨','徐佳琳','雷宇霄','杨秋野','杨宇馨','周湘','朱怡欣','郑照暄'],
+            'HII': ['蒋舒婷','李佳恩','温若其','尤可莹','梁怀方','陈俞希','龚晨美','康楚翊','阙佳慧','覃柯蒙','应籽言','刘思雨','陈嘉仪','郑柯炜','谭思慧','郭晓盈','林舒晴','王奕','沈梦瑶','费沁源'],
+            'X': ['陈琳','宋昕冉','杨冰怡','闫娜','林佳怡','禹佳蔚','熊紫轶','刘小涵','金泓言','李子忻','曾昕妍','钟郭菲杨','蒋欣洳','杨晔','张琼予','王睿琦','朱虹蓉','马欣宇'],
+            '预备生': ['黄子欣','曾雪婷','韩云伊','丁小凡','何绮多','黄子珊','吉雅楠','李沁洁','刘钇霏','秦箐忆','杨宝君','臧文萱']
+        },
+        graduates: ['鞠婧祎','李艺彤','孙芮','袁一琦','陈观慧','陈思','戴萌','孔肖吟','李宇琪','莫寒','钱蓓婷','邱欣怡','吴哲晗','徐晨辰','许佳琪','张语格','陆婷','林思意','赵粤','蒋芸','许杨玉琢','张昕','王晓佳','姜杉','段艺璇','农燕萍','龙亦瑞','张笑盈','韩家乐','赵天杨','沈小爱']
+    },
+    GNZ48: {
+        agent: { name:'陈哥', avatar:'👨‍💼', personality:'随和幽默', habits:['爱讲冷笑话','穿花衬衫','口头禅：放轻松啦'] },
+        core: [
+            { name:'朱怡欣', avatar:'👧', type:'sweet', habits:['说粤语','口袋永远有糖','口头禅：好靓啊～'] },
+            { name:'王秭歆', avatar:'👩', type:'sister', habits:['记手帐','组织团建','口头禅：注意纪律'] },
+            { name:'叶舒淇', avatar:'💃', type:'rival', habits:['比所有人早到','贴便利贴','口头禅：我还能练'] }
+        ],
+        teams: {
+            'G': ['王秭歆','杨可璐','黄楚茵','陈淑钰','刘欣媛','林奕希','林家谊','鲍雨欣','雷瑞妍','唐果','朱丽娜','张琼予','黄宣绮','方琪'],
+            'NIII': ['石竹君','吕思琪','项宇婧','王语晨','王珺','谢晓倩','李咏薇','许涵婧','赵文凤','白佳媛','徐郑子滢','张佳仪','曾雨思','王思予'],
+            'Z': ['杨媛媛','朱怡欣','叶舒淇','马昕玥','叶溁语','陈珊玲','丁嘉欣','焦玥','许泳怡','徐楚雯'],
+            'CII': ['郭兆媛','何林燕','秦露丹','宋筱璐','申雨鑫','夏莹','许雅兰','周是汝','黄逸','梅思华','黄蔚','谭思慧'],
+            '预备生': ['万芳源','谢林容','丁甄奥果','韩梓轩','李家敏','刘柳茜','王紫萱','王紫媛','魏诗绮','冯玉雯','韩鑫缘','孔美迪','李想','张臻','赵子涵']
+        },
+        graduates: ['谢蕾蕾','郑丹妮','陈珂','刘力菲','左婧媛','肖文铃','卢静','唐莉佳','洪静雯','符冰冰','李姗姗','吴羽霏','张润','曾佳','农燕萍','罗寒月','梁娇']
+    },
+    BEJ48: {
+        agent: { name:'王姐', avatar:'👩‍💼', personality:'精明干练', habits:['永远穿西装','秒回消息','口头禅：效率！'] },
+        core: [
+            { name:'周湘', avatar:'👧', type:'sweet', habits:['说京腔','撸串达人','口头禅：害！'] },
+            { name:'张梦慧', avatar:'👩', type:'sister', habits:['双城通勤','帮人改走位','口头禅：我当年...'] },
+            { name:'朱虹蓉', avatar:'💃', type:'rival', habits:['研究流量数据','经营个人账号','口头禅：我值得更好的'] }
+        ],
+        teams: {
+            'B': ['黄宣绮','聂渝景','朱一柠','张梦慧','包楹','金宛莹','单子涵','王佳琪','张雅童','朱语凝','郑照暄'],
+            'E': ['周湘','郭晓盈','朱虹蓉','马欣宇','刁昕妤','孙嘉馥','袁涵','丁子钦','朱玥彤','郭依晨','乔诗然','张婷婷','马明萱'],
+            '预备生': ['阿丽米热','郭庆恩','温舒涵','王天娇','应立婷','张宸','郑依依']
+        },
+        graduates: ['段艺璇','苏杉杉','胡晓慧','刘胜男','陈倩楠','张笑盈','李梓','冯思佳','李想','顼凘炀','孙晓艳']
+    },
+    CKG48: {
+        agent: { name:'张姐', avatar:'👩‍💼', personality:'泼辣护短', habits:['说话声大','爱请客吃火锅','口头禅：哪个瓜娃子！'] },
+        core: [
+            { name:'郝茹馨', avatar:'👧', type:'sweet', habits:['吃辣狂魔','重庆话','口头禅：要得！'] },
+            { name:'雷宇霄', avatar:'👩', type:'sister', habits:['两地跑','教人Vocal','口头禅：稳住'] },
+            { name:'朱瑞缘', avatar:'💃', type:'rival', habits:['练到最晚','跟前辈较劲','口头禅：我也能行！'] }
+        ],
+        teams: {
+            'C': ['雷宇霄','梁晶金','朱瑞缘','谭景文','王思予','陈萧扬','林丹蕾','姚锦杰','郝茹馨','朱文露','刘莹莹','黄孟浠','王嘉瑜'],
+            'K': ['何馨曼','胡丹','刘星雨','卢美廷','马星月','吴志越','张莉莉','张思妍','张伟依','张咏烨','胡思颖','袁希璨','陈子悦','葛俊言'],
+            '预备生': ['郝冰圆','余茜果','何诗雨','廖雨涵','王振楠']
+        },
+        graduates: ['李慧','刘炅然','王露皎','田倩兰','林舒晴','谯玉珍','徐慧玲','刘萤萤','徐沁楠']
+    },
+    CGT48: {
+        agent: { name:'林哥', avatar:'👨‍💼', personality:'温柔耐心', habits:['温声细语','泡功夫茶','养猫','口头禅：慢慢来不着急'] },
+        core: [
+            { name:'程妤涵', avatar:'👧', type:'sweet', habits:['随时能睡着','奶茶续命','口头禅：再睡五分钟...'] },
+            { name:'王艺霖', avatar:'👩', type:'sister', habits:['自律到可怕','帮人编舞','口头禅：再来一遍'] },
+            { name:'程宝玉', avatar:'💃', type:'rival', habits:['模仿达人','即兴编段子','口头禅：你看看你～'] }
+        ],
+        teams: {
+            'GII': ['程妤涵','何蔡娴','雷相菊','林海盈','齐灵泉','谭勇航','王依','王艺霖','徐钰涵','袁艺洁','李秋月'],
+            'CII': ['郭兆媛','何林燕','秦露丹','宋筱璐','申雨鑫','夏莹','许雅兰','周是汝','黄逸','梅思华','黄蔚'],
+            '预备生': ['耿钰嘉','张伶','李嘉琪','王靖雨','王艺淇','熊玊清','张于馨','郑佳男','吴曦芮','张雁婷','赵汇妤']
+        },
+        graduates: []
+    }
+};
+
+App.getAllMembers = function() {
+    const members = [];
+    Object.entries(App.NPCData).forEach(([groupKey, groupData]) => {
+        if (groupData.teams) {
+            Object.entries(groupData.teams).forEach(([teamName, memberList]) => {
+                memberList.forEach(name => {
+                    if (!members.find(m => m.name === name && m.group === groupKey && !m.graduate)) {
+                        members.push({ name, group: groupKey, team: teamName, graduate: false });
+                    }
+                });
+            });
+        }
+        (groupData.graduates || []).forEach(name => {
+            if (!members.find(m => m.name === name && m.group === groupKey && m.graduate)) {
+                members.push({ name, group: groupKey, team: '毕业', graduate: true });
+            }
+        });
+    });
+    return members;
+};
+
+const GROUP_TEAMS = {};
+Object.entries(App.NPCData).forEach(([group, data]) => {
+    if (data.teams) GROUP_TEAMS[group] = Object.keys(data.teams);
+});
+
+// ============ 回复库 ============
+App.ReplyLib = {
+    agent: {
+        '严厉专业': ['明天排练不要迟到。','舞台表现需加强。','好好休息，明天有通告。'],
+        '随和幽默': ['哈哈，今天状态不错！','别紧张，有我罩着你！'],
+        '精明干练': ['行程已安排好。','效率要高一点。'],
+        '泼辣护短': ['谁敢欺负你我跟谁急！','放心吧有姐在！'],
+        '温柔耐心': ['慢慢来不着急。','你做得很好。']
+    },
+    sweet: ['姐姐好厉害！','一起加油呀~','你今天真好看！'],
+    sister: ['加油小妹妹！','有不懂的来问我。'],
+    rival: ['下次一定会超过你的。','别以为你比我强。'],
+    teammate: ['明天一起练舞？','你今天动作好帅！'],
+    member: ['你好呀！','以后多关照~'],
+    fan_positive: ['姐姐好棒！','永远支持你！'],
+    fan_negative: ['这也太...','就这水平？'],
+    fan_neutral: ['期待下次演出','加油哦']
+};
+
+// ============ 成就系统 ============
+App.Achievements = {
+    defs: [
+        // 人气类
+        { id:'pop10', name:'崭露头角', icon:'🌱', cond:()=>G.stats.popularity>=10, desc:'人气达到10' },
+        { id:'pop30', name:'小有名气', icon:'⭐', cond:()=>G.stats.popularity>=30, desc:'人气达到30' },
+        { id:'pop60', name:'人气新星', icon:'🌟', cond:()=>G.stats.popularity>=60, desc:'人气达到60' },
+        { id:'pop80', name:'人气偶像', icon:'✨', cond:()=>G.stats.popularity>=80, desc:'人气达到80' },
+        { id:'pop100', name:'顶流明星', icon:'💫', cond:()=>G.stats.popularity>=100, desc:'人气达到100' },
+        // 社交类
+        { id:'friend5', name:'广交朋友', icon:'🤝', cond:()=>Object.values(G.memberAffection||{}).filter(v=>v>=30).length>=5, desc:'与5位成员好感度达30' },
+        { id:'friend10', name:'人脉王', icon:'👥', cond:()=>Object.values(G.memberAffection||{}).filter(v=>v>=50).length>=10, desc:'与10位成员好感度达50' },
+        { id:'socialStar', name:'社交达人', icon:'🌈', cond:()=>Object.values(G.memberAffection||{}).filter(v=>v>=80).length>=5, desc:'与5位成员好感度达80' },
+        // 排名类
+        { id:'top48', name:'TOP48', icon:'🎗️', cond:()=>G.game.rank<=48, desc:'总选排名进入前48' },
+        { id:'top32', name:'TOP32', icon:'🎖️', cond:()=>G.game.rank<=32, desc:'总选排名进入前32' },
+        { id:'top16', name:'TOP16', icon:'🏅', cond:()=>G.game.rank<=16, desc:'总选排名进入前16' },
+        { id:'top7', name:'TOP7', icon:'🥈', cond:()=>G.game.rank<=7, desc:'总选排名进入前7' },
+        { id:'top3', name:'TOP3', icon:'🥇', cond:()=>G.game.rank<=3, desc:'总选排名进入前3' },
+        { id:'top1', name:'TOP1', icon:'👑', cond:()=>G.game.rank===1, desc:'总选排名第一' },
+        // 互动类
+        { id:'firstGift', name:'送礼达人', icon:'🎁', cond:()=>(G.stats.giftSent||0)>=1, desc:'送出第一份礼物' },
+        { id:'gift10', name:'慷慨大方', icon:'💝', cond:()=>(G.stats.giftSent||0)>=10, desc:'送出10份礼物' },
+        { id:'firstTransfer', name:'转账新手', icon:'💸', cond:()=>(G.stats.transferTotal||0)>=1, desc:'完成第一次转账' },
+        { id:'firstMeal', name:'请客吃饭', icon:'🍽️', cond:()=>(G.stats.mealCount||0)>=1, desc:'请成员吃饭' },
+        // 鸡腿类
+        { id:'drumstick100', name:'小有积蓄', icon:'🍗', cond:()=>(G.stats.drumstick||0)>=100, desc:'拥有100鸡腿' },
+        { id:'drumstick1000', name:'鸡腿大户', icon:'🦴', cond:()=>(G.stats.drumstick||0)>=1000, desc:'拥有1000鸡腿' },
+        { id:'drumstick5000', name:'鸡腿之王', icon:'👑', cond:()=>(G.stats.drumstick||0)>=5000, desc:'拥有5000鸡腿' },
+        // 星光类
+        { id:'starlight50', name:'星光初现', icon:'💎', cond:()=>(G.stats.starlight||0)>=50, desc:'累计50星光' },
+        { id:'starlight200', name:'星光璀璨', icon:'💠', cond:()=>(G.stats.starlight||0)>=200, desc:'累计200星光' },
+        { id:'starlight500', name:'星光闪耀', icon:'🔹', cond:()=>(G.stats.starlight||0)>=500, desc:'累计500星光' },
+        // 游戏天数类
+        { id:'day30', name:'月度艺人', icon:'📅', cond:()=>G.game.day>=30, desc:'游戏进行30天' },
+        { id:'day100', name:'季度艺人', icon:'🗓️', cond:()=>G.game.day>=100, desc:'游戏进行100天' },
+        { id:'day365', name:'年度艺人', icon:'📆', cond:()=>G.game.day>=365, desc:'游戏进行365天' },
+        // 绯闻类
+        { id:'noScandal', name:'清白艺人', icon:'🛡️', cond:()=>G.stats.scandal===0&&G.game.day>=30, desc:'30天无绯闻' },
+        { id:'scandal5', name:'话题女王', icon:'📰', cond:()=>G.stats.scandal>=5, desc:'绯闻值达到5' },
+        // 特殊类
+        { id:'stressRelief', name:'放松大师', icon:'🧘', cond:()=>G.flags.stressReliefCount>=5, desc:'使用5次减压活动' },
+        { id:'rehearsal50', name:'努力练习', icon:'📚', cond:()=>(G.stats.training||0)>=50, desc:'训练值累计达50' },
+    ],
+    checkAll() {
+        this.defs.forEach(def => {
+            if (!G.achievements.includes(def.id) && def.cond && def.cond()) {
+                G.achievements.push(def.id);
+                App.UI.showNotification(`${def.icon} 解锁成就：${def.name}`);
+                App.Sound.play('Success');
+            }
+        });
+    }
+};
+
+// ============ AI桥接 ============
+App.AI = {
+    get apiEndpoint() { return `${App.Invite.API_URL}/api/chat`; },
+    _lastError: null,
+    _consecutiveFailures: 0,
+
+    async reply(npcId, ctx, msg) {
+        console.log('🤖 AI 回复请求:', { npcId, msg: msg.substring(0, 30), endpoint: this.apiEndpoint });
+        if (this.apiEndpoint) {
+            try {
+                const inviteCode = App.Invite.getInviteCode();
+                
+                let rolePrompt = '';
+                if (ctx.npcType === 'agent') {
+                    rolePrompt = `你是${npcId}，一位专业的女性经纪人。你关心艺人的工作和生活，说话直接但关心下属。`;
+                } else if (['sweet', 'sister', 'rival', 'teammate', 'member'].includes(ctx.npcType)) {
+                    rolePrompt = `你是${npcId}，是SNH48的女性成员。你和玩家是亲密无间的女性好朋友，说话自然亲切，像闺蜜一样聊天谈心。使用日常口语化的表达方式，不要使用粉丝对偶像的语气，就像现实生活中女生之间闲聊一样。`;
+                } else {
+                    rolePrompt = `你是${npcId}，是${npcId === '私生粉' ? '一个有些疯狂的女粉丝' : '一个普通女粉丝'}。你很崇拜玩家，说话热情激动，使用粉丝常用的表达方式，称呼玩家为偶像。`;
+                }
+                
+                // 使用带超时和重试的 fetch（AI 对话：8s 超时，最多1次重试）
+                const res = await App.Network.fetchWithRetry(this.apiEndpoint, {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({npcId, context:ctx, message:msg, inviteCode: inviteCode, rolePrompt: rolePrompt}),
+                    timeoutMs: 8000,
+                    retries: 1,
+                    backoffMs: 1500
+                });
+                console.log('📡 AI 响应状态:', res.status);
+
+                if (!res.ok) {
+                    const errorText = await res.text().catch(() => '无法读取错误详情');
+                    console.error('❌ AI API 返回错误:', res.status, errorText.substring(0, 200));
+                    this._lastError = { type: 'http', status: res.status, detail: errorText.substring(0, 200), time: Date.now() };
+                    this._consecutiveFailures++;
+                    throw new Error(`AI API HTTP ${res.status}: ${errorText.substring(0, 100)}`);
+                }
+
+                const data = await res.json();
+                console.log('💬 AI 响应:', data.reply?.substring(0, 50));
+                this._consecutiveFailures = 0;
+                return data.reply;
+            } catch(e) {
+                // 详细错误分类
+                let errType = 'unknown';
+                let errDetail = e.message || '未知错误';
+                
+                if (e.name === 'AbortError' || errDetail.includes('timeout') || errDetail.includes('超时')) {
+                    errType = 'timeout';
+                    errDetail = 'AI 服务响应超时 (>8s)';
+                } else if (errDetail.includes('Failed to fetch') || errDetail.includes('NetworkError')) {
+                    errType = 'network';
+                    errDetail = '无法连接 AI 服务器';
+                } else if (errDetail.includes('HTTP 401')) {
+                    errType = 'auth';
+                    errDetail = 'AI 服务认证失败 (API Key)';
+                } else if (errDetail.includes('HTTP 429')) {
+                    errType = 'rate_limit';
+                    errDetail = '请求过于频繁，请稍候';
+                } else if (errDetail.includes('HTTP 5')) {
+                    errType = 'server';
+                    errDetail = 'AI 服务端异常，请稍后重试';
+                } else if (errDetail.includes('HTTP')) {
+                    errType = 'http';
+                }
+
+                console.error(`❌ AI 请求失败 [${errType}]:`, errDetail);
+                this._lastError = { type: errType, detail: errDetail, time: Date.now() };
+                this._consecutiveFailures++;
+
+                // 根据错误类型给出不同提示
+                const notices = {
+                    timeout: '⏱️ AI 响应超时，切换至本地回复',
+                    network: '🔌 网络未连接，使用本地回复',
+                    auth: '🔑 服务认证异常，使用本地回复',
+                    rate_limit: '⏳ 操作太频繁，使用本地回复',
+                    server: '⚠️ AI 服务繁忙，使用本地回复',
+                    http: '⚠️ AI 连接异常，使用本地回复',
+                    unknown: '💬 AI 暂不可用，使用本地回复'
+                };
+                App.UI.showNotification(notices[errType] || notices.unknown, 3500);
+            }
+        }
+        console.log('📝 使用本地回复');
+        return this.localReply(npcId, ctx, msg);
+    },
+    localReply(npcId, ctx, msg) {
+        const q = evaluateReply(msg);
+        let pool;
+        if (ctx.npcType === 'agent') pool = App.ReplyLib.agent[ctx.personality] || App.ReplyLib.agent['严厉专业'];
+        else if (ctx.npcType === 'sweet') pool = App.ReplyLib.sweet;
+        else if (ctx.npcType === 'sister') pool = App.ReplyLib.sister;
+        else if (ctx.npcType === 'rival') pool = App.ReplyLib.rival;
+        else if (ctx.npcType === 'teammate') pool = App.ReplyLib.teammate;
+        else if (ctx.npcType === 'member') pool = App.ReplyLib.member;
+        else pool = App.ReplyLib.fan_positive;
+        let r = pick(pool);
+        const grp = App.NPCData[G.player.group];
+        if (grp) {
+            const coreMember = grp.core.find(c => c.name === npcId);
+            if (coreMember && coreMember.habits && Math.random() < 0.4) {
+                const habit = pick(coreMember.habits);
+                if (habit.includes('口头禅')) r = habit.replace('口头禅：','') + ' ' + r;
+            }
+        }
+        if (q === 'heartfelt') r += ' ' + pick(['好感动❤️','被你暖到了💕']);
+        else if (q === 'perfunctory') r = pick(['...嗯，','好吧，']) + r;
+        return r;
+    },
+    async image(prompt) {
+        if (this.apiEndpoint) { /* 预留 */ }
+        const seed = prompt.split('').reduce((a,c)=>a+c.charCodeAt(0),0);
+        return `https://picsum.photos/seed/${seed}/400/300`;
+    }
+};
+
+// ============ 存档管理 ============
+App.Save = {
+    autoSave() { localStorage.setItem('starlight48_save', JSON.stringify(G)); },
+    load() {
+        try {
+            const d = localStorage.getItem('starlight48_save');
+            if (d) Object.assign(G, JSON.parse(d));
+        } catch(e) {}
+    },
+    exportJSON() {
+        const blob = new Blob([JSON.stringify(G,null,2)], {type:'application/json'});
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `starlight48_backup_${Date.now()}.json`;
+        a.click();
+        App.UI.showNotification('💾 存档已导出');
+    },
+    importJSON(file) {
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = e => {
+            try {
+                const data = JSON.parse(e.target.result);
+                Object.assign(G, data);
+                this.autoSave();
+                App.UI.showNotification('✅ 导入成功，即将刷新');
+                setTimeout(() => location.reload(), 1000);
+            } catch(ex) { App.UI.showNotification('❌ 无效文件'); }
+        };
+        reader.readAsText(file);
+    },
+
+    // ===== 云存档（增强版：超时、重试、详细错误） =====
+    _cloudLastError: null,
+
+    /** 上传存档到云端 */
+    async cloudUpload() {
+        const userId = App.Invite.getInviteCode() || 'anonymous';
+        App.UI.showNotification('☁️ 正在上传存档...');
+        try {
+            const res = await App.Network.fetchWithRetry(`${App.Config.API_URL}/api/save/upload`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    userId: userId,
+                    saveData: G,
+                    playerName: G.player?.name || '',
+                    gameDay: G.game?.day || 1
+                }),
+                timeoutMs: 15000,
+                retries: 2,
+                backoffMs: 2000
+            });
+
+            if (!res.ok) {
+                const errText = await res.text().catch(() => '');
+                console.error('Cloud upload HTTP error:', res.status, errText.substring(0, 200));
+                if (res.status === 429) {
+                    App.UI.showNotification('⏳ 操作太频繁，请60秒后再试', 4000);
+                } else if (res.status >= 500) {
+                    App.UI.showNotification('⚠️ 云端服务异常，请稍后重试', 4000);
+                } else {
+                    App.UI.showNotification(`❌ 上传失败 (HTTP ${res.status})`, 3500);
+                }
+                return;
+            }
+
+            const data = await res.json();
+            if (data.success) {
+                localStorage.setItem('starlight48_cloud_time', data.saved_at);
+                localStorage.setItem('starlight48_cloud_day', data.game_day || G.game.day);
+                App.UI.showNotification('☁️ 存档已上传至云端');
+                console.log('✅ 云存档上传成功: day', data.game_day);
+            } else {
+                App.UI.showNotification('❌ 上传失败: ' + (data.detail || data.message), 3500);
+            }
+        } catch (e) {
+            const detail = this._classifyCloudError(e, '上传');
+            console.error('Cloud upload failed:', detail, e);
+            App.UI.showNotification(detail.userMsg, 4000);
+        }
+    },
+
+    /** 从云端恢复存档 */
+    async cloudDownload() {
+        const userId = App.Invite.getInviteCode() || 'anonymous';
+        App.UI.showNotification('☁️ 正在下载存档...');
+        try {
+            const res = await App.Network.fetchWithRetry(`${App.Config.API_URL}/api/save/download?userId=${encodeURIComponent(userId)}`, {
+                timeoutMs: 15000,
+                retries: 2,
+                backoffMs: 2000
+            });
+
+            if (!res.ok) {
+                if (res.status === 404) {
+                    App.UI.showNotification('❌ 未找到云端存档', 3500);
+                } else if (res.status === 429) {
+                    App.UI.showNotification('⏳ 操作太频繁，请60秒后再试', 4000);
+                } else {
+                    App.UI.showNotification(`❌ 下载失败 (HTTP ${res.status})`, 3500);
+                }
+                return;
+            }
+
+            const data = await res.json();
+            if (data.success && data.save_data) {
+                Object.assign(G, data.save_data);
+                this.autoSave();
+                localStorage.setItem('starlight48_cloud_time', data.saved_at || new Date().toISOString());
+                localStorage.setItem('starlight48_cloud_day', data.game_day || 1);
+                App.UI.showNotification(`☁️ 云端存档已恢复 (第${data.game_day}天)`, 3000);
+                setTimeout(() => location.reload(), 1200);
+            } else {
+                App.UI.showNotification('❌ 云端存档数据无效', 3500);
+            }
+        } catch (e) {
+            const detail = this._classifyCloudError(e, '下载');
+            console.error('Cloud download failed:', detail, e);
+            App.UI.showNotification(detail.userMsg, 4000);
+        }
+    },
+
+    /** 强制同步：多次重试，适合网络波动场景 */
+    async cloudForceSync() {
+        const userId = App.Invite.getInviteCode() || 'anonymous';
+        App.UI.showNotification('⚡ 强制同步中...', 5000);
+
+        let lastError = null;
+        const maxAttempts = 5;
+        const baseDelay = 1500;
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            if (attempt > 0) {
+                const delay = baseDelay * Math.pow(1.5, attempt);
+                App.UI.showNotification(`⚡ 同步重试 ${attempt}/${maxAttempts - 1}...`, 3000);
+                await new Promise(r => setTimeout(r, delay));
+            }
+
+            try {
+                const res = await App.Network.fetchWithRetry(`${App.Config.API_URL}/api/save/download?userId=${encodeURIComponent(userId)}`, {
+                    timeoutMs: 20000,
+                    retries: 0  // fetchWithRetry 内部不重试，由外层控制
+                });
+
+                if (!res.ok) {
+                    if (res.status === 404) {
+                        App.UI.showNotification('❌ 云端暂无存档，请先上传', 3500);
+                        return { success: false, reason: 'no_save' };
+                    }
+                    lastError = `HTTP ${res.status}`;
+                    continue;
+                }
+
+                const data = await res.json();
+                if (data.success && data.save_data) {
+                    Object.assign(G, data.save_data);
+                    this.autoSave();
+                    localStorage.setItem('starlight48_cloud_time', data.saved_at || new Date().toISOString());
+                    localStorage.setItem('starlight48_cloud_day', data.game_day || 1);
+                    App.UI.showNotification(`⚡ 强制同步成功！已恢复至第${data.game_day}天`, 3500);
+                    setTimeout(() => location.reload(), 1200);
+                    return { success: true, gameDay: data.game_day };
+                }
+                lastError = '数据无效';
+                continue;
+            } catch (e) {
+                lastError = e.message || '网络错误';
+                console.warn(`Force sync attempt ${attempt + 1}/${maxAttempts} failed:`, lastError);
+            }
+        }
+
+        // 所有尝试均失败
+        const detail = this._classifyCloudError(new Error(lastError || '未知'), '强制同步');
+        App.UI.showNotification(`❌ 同步失败 (已重试${maxAttempts}次): ${detail.userMsg}`, 5000);
+        return { success: false, reason: detail.tech };
+    },
+
+    /** 获取云端存档信息（含超时） */
+    async cloudInfo() {
+        const userId = App.Invite.getInviteCode() || 'anonymous';
+        try {
+            const res = await App.Network.fetchWithRetry(`${App.Config.API_URL}/api/save/info?userId=${encodeURIComponent(userId)}`, {
+                timeoutMs: 8000,
+                retries: 1,
+                backoffMs: 1000
+            });
+            if (!res.ok) return { exists: false, message: `服务器错误 (${res.status})` };
+            return await res.json();
+        } catch (e) {
+            console.warn('Cloud info fetch failed:', e.message);
+            if (e.name === 'AbortError') {
+                return { exists: false, message: '连接超时，云端不可达' };
+            }
+            return { exists: false, message: '网络未连接' };
+        }
+    },
+
+    /** 删除云端存档 */
+    async cloudDelete() {
+        if (!confirm('确定删除云端存档？此操作不可恢复！')) return;
+        const userId = App.Invite.getInviteCode() || 'anonymous';
+        try {
+            const res = await App.Network.fetchWithRetry(`${App.Config.API_URL}/api/save/delete?userId=${encodeURIComponent(userId)}`, {
+                method: 'DELETE',
+                timeoutMs: 10000,
+                retries: 1,
+                backoffMs: 1000
+            });
+            const data = await res.json();
+            localStorage.removeItem('starlight48_cloud_time');
+            localStorage.removeItem('starlight48_cloud_day');
+            App.UI.showNotification(data.success ? '☁️ 云端存档已删除' : 'ℹ️ ' + data.message, 3000);
+        } catch (e) {
+            const detail = this._classifyCloudError(e, '删除');
+            console.error('Cloud delete failed:', detail, e);
+            App.UI.showNotification(detail.userMsg, 4000);
+        }
+    },
+
+    /** 获取云端同步状态摘要 */
+    getCloudStatus() {
+        const cloudTime = localStorage.getItem('starlight48_cloud_time');
+        const cloudDay = localStorage.getItem('starlight48_cloud_day');
+        if (!cloudTime) return { synced: false, message: '从未同步' };
+        const since = Date.now() - new Date(cloudTime).getTime();
+        const hours = Math.floor(since / 3600000);
+        const mins = Math.floor((since % 3600000) / 60000);
+        let ago = hours > 0 ? `${hours}小时${mins}分钟前` : `${mins}分钟前`;
+        if (hours > 72) ago = `${Math.floor(hours/24)}天前`;
+        return {
+            synced: true,
+            lastSync: cloudTime,
+            gameDay: parseInt(cloudDay) || 1,
+            ago: ago
+        };
+    },
+
+    /** 错误分类辅助方法 */
+    _classifyCloudError(e, operation) {
+        const msg = e.message || '';
+        let tech = msg;
+        let userMsg = `${operation}失败，请检查网络`;
+
+        if (e.name === 'AbortError' || msg.includes('timeout') || msg.includes('超时')) {
+            tech = '连接超时';
+            userMsg = `⏱️ ${operation}超时，服务器响应过慢`;
+        } else if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('fetch')) {
+            tech = '网络不可达';
+            userMsg = `🔌 无法连接服务器，请检查网络`;
+        } else if (msg.includes('429')) {
+            tech = '速率限制';
+            userMsg = '⏳ 操作太频繁，请60秒后再试';
+        } else if (msg.includes('500') || msg.includes('502') || msg.includes('503')) {
+            tech = '服务端错误';
+            userMsg = `⚠️ 云端服务异常，请稍后重试`;
+        } else if (msg.includes('400')) {
+            tech = '请求错误';
+            userMsg = `❌ ${operation}失败：存档数据异常`;
+        } else if (msg.includes('所有重试均失败')) {
+            tech = '所有重试耗尽';
+            userMsg = `🔁 ${operation}失败：已自动重试但仍无法连接`;
+        }
+
+        this._cloudLastError = { operation, tech, userMsg, time: Date.now(), raw: msg };
+        return { tech, userMsg };
+    },
+};
+
+// ============ 事件系统 ============
+App.Events = {
+    checkEvents() {
+        const s = G.stats;
+        if (s.popularity>=15 && !G.flags.hasFirstShow) { G.flags.hasFirstShow=true; this.showStory('firstShow'); }
+        if (s.popularity>=40 && !G.flags.hasFirstElection) { G.flags.hasFirstElection=true; this.showStory('election'); }
+        if (s.popularity>=60 && !G.flags.hasStalker) { G.flags.hasStalker=true; this.showStory('paparazzi'); }
+        if (s.popularity>=70 && !G.flags.hasCenterBattle) { G.flags.hasCenterBattle=true; this.showStory('centerBattle'); }
+        if (s.stress>=100 && !G.flags.hasCrisis) { G.flags.hasCrisis=true; this.showStory('crisis'); }
+        if (s.mood<20 && !G.flags.hasEmo) { G.flags.hasEmo=true; this.showStory('emo'); }
+    },
+    showStory(type) {
+        const ev = App.EventPool.story[type];
+        if (ev) { ev.type = type; App.UI.showEventModal(ev); }
+    },
+    resolveStory(type, choiceIdx) {
+        const ev = App.EventPool.story[type];
+        if (ev && ev.effects[choiceIdx]) App.Store.updateStats(ev.effects[choiceIdx]);
+        App.UI.closeEventModal();
+    },
+    showRandom() {
+        const ev = pick(App.EventPool.random);
+        App.UI.showEventModal({ icon:'🎯', title:ev.name, desc:ev.desc, choices:ev.choices, effects:ev.effects });
+    },
+    resolveRandom(choiceIdx, effects) {
+        if (effects && effects[choiceIdx]) App.Store.updateStats(effects[choiceIdx]);
+        App.UI.closeEventModal();
+    },
+    triggerTeamEvent() {
+        if (Math.random() > 0.3) return;
+        const grp = App.NPCData[G.player.group];
+        if (!grp) return;
+        const teammate = pick(grp.core);
+        const ev = pick(App.EventPool.team);
+        const desc = ev.desc.replace('{name}', teammate.name);
+        if (G.chatHistory[teammate.name]) {
+            G.chatHistory[teammate.name].messages.push({from:'npc', text:desc, time:getTimeStr()});
+        }
+    }
+};
+
+App.EventPool = {
+    random: [
+        { name:'练习室抢位置', desc:'练习室位置被占了', choices:['等一等再练','找别的地方练'], effects:[{stress:2},{stress:1,skill:1}] },
+        { name:'粉丝塞信', desc:'下班路上被塞了一封信', choices:['开心收下','礼貌拒绝'], effects:[{mood:3,drumstick:5},{affection:1}] },
+        { name:'路人认出你', desc:'便利店有人认出你了！', choices:['热情打招呼','微笑点头'], effects:[{popularity:2,mood:3},{popularity:1}] }
+    ],
+    story: {
+        firstShow: { icon:'🎤', title:'第一次公演！', desc:'你的第一次公演就要来了！', choices:['全力以赴！','默默祈祷...'], effects:[{skill:5,popularity:3},{mood:3}] },
+        election: { icon:'🏆', title:'总选举速报', desc:'你的排名出来了！', choices:['查看排名'], effects:[{popularity:5}] },
+        paparazzi: { icon:'📸', title:'被狗仔跟拍了！', desc:'有狗仔拍到了私生活照！', choices:['发博澄清','让公司处理'], effects:[{scandal:10},{agent_satisfaction:3}] },
+        centerBattle: { icon:'⭐', title:'C位争夺！', desc:'队伍要选C位了', choices:['积极争取','低调等待'], effects:[{popularity:5,stress:5},{popularity:1}] },
+        crisis: { icon:'⚠️', title:'退团危机', desc:'压力太大...', choices:['坚持留下','休息一段时间'], effects:[{stress:-20,mood:10},{stress:-30,mood:5}] },
+        emo: { icon:'🌙', title:'深夜emo...', desc:'夜深了', choices:['发条口袋房间','给挚友打电话'], effects:[{mood:5},{mood:15,affection:5}] }
+    },
+    team: [
+        { type:'约饭', desc:'{name}约你去吃火锅', choices:['去！','不去'], effects:[{affection:5,mood:3},{affection:-2}] },
+        { type:'倾诉', desc:'{name}向你吐槽经纪人', choices:['安慰她','敷衍'], effects:[{affection:5},{affection:-3}] }
+    ]
+};
+
+// ============ UI 渲染模块 ============
+App.UI = {
+    currentPage: 'lockScreen',
+    pwdInput: '',
+    tempCreate: { name:'', appearance:'', personality:'', personalityEmoji:'', group:'', team:'', quizAnswers:[], quizScores:[] },
+    quizQuestions: [],
+    currentChatId: null,
+    currentCallNpc: null,
+    liveActive: false,
+    activeCommentIdx: -1,
+    roomReplyIdx: -1,
+    roomReplySender: '',
+    wechatTab: 'chat',
+    _currentEvent: null,
+
+    showPage(id) {
+        document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+        const el = document.getElementById(id);
+        if (el) el.classList.add('active');
+        this.currentPage = id;
+    },
+    goHome() {
+        this.showPage('homeScreen');
+        this.updateTimeBar();
+        App.Store.updateStats({});
+        if (Math.random() < 0.15) App.Events.showRandom();
+        if (G.player.name) App.Events.triggerTeamEvent();
+        if (G.player.name && Math.random() < 0.08) this.receiveRandomSms();
+        if (G.player.name && Math.random() < 0.05) this.receiveRandomCall();
+        App.Sound.play('Click');
+    },
+    openApp(app) {
+        App.Sound.play('Click');
+        switch(app) {
+            case 'wechat': this.showPage('wechatPage'); this.renderWechatList(); break;
+            case 'weibo': this.showPage('weiboPage'); this.renderWeibo(); break;
+            case 'sms': this.showPage('smsPage'); this.renderSms(); break;
+            case 'phone': this.showPage('callPage'); this.renderPhone(); break;
+            case 'pocket': this.showPage('pocketPage'); this.renderPocketHome(); break;
+            case 'profile': this.showPage('profilePage'); this.renderProfile(); break;
+            case 'election': this.showPage('electionPage'); this.renderElection(); break;
+            case 'affection': this.showPage('affectionPage'); this.renderAffection(); break;
+            case 'settings': this.showPage('settingsPage'); this.renderSettings(); break;
+            case 'handshake': this.showPage('handshakePage'); this.renderHandshake(); break;
+            case 'outdoor': this.showPage('outdoorPage'); this.renderOutdoor(); break;
+            case 'calendar': this.showPage('calendarPage'); this.renderCalendar(); break;
+            case 'backpack': this.showPage('backpackPage'); this.renderBackpack(); break;
+        }
+    },
+    updateTimeBar() {
+        const phaseNames = {morning:'🌅早晨',daytime:'☀️白天',evening:'🌆傍晚',night:'🌙夜晚'};
+        const season = G.game.day <= 90 ? '🌸春季' : G.game.day <= 180 ? '☀️夏季' : G.game.day <= 270 ? '🍂秋季' : '❄️冬季';
+        const el = document.getElementById('gameTimeBar');
+        if (el) el.innerHTML = `Day ${G.game.day} · ${season} | ${phaseNames[G.game.phase]} | ${G.player.group} Team ${G.player.team}`;
+    },
+    advanceDay() {
+        // 如果总选进行中但没有具体的选举阶段，重置状态以允许继续
+        if (G.game.electionInProgress && !G.game.electionPhase) {
+            G.game.electionInProgress = false;
+        }
+        
+        if (G.game.electionInProgress) {
+            this.showNotification('请先完成总选举相关活动！');
+            return;
+        }
+        
+        G.game.day += 1;
+        G.game.phase = 'morning';
+        G.game.handshake_this_month = false;
+        
+        this.updateTimeBar();
+        App.Save.autoSave();
+        this.showNotification(`⏰ 进入第${G.game.day}天`);
+        
+        const dayInMonth = G.game.day % 30 || 30;
+        
+        if (dayInMonth === 10 && !G.game.electionPhase) {
+            this.showElectionReportModal('first');
+        } else if (dayInMonth === 20 && G.game.electionPhase === 'first') {
+            this.showElectionReportModal('second');
+        } else if (dayInMonth === 30) {
+            this.showElectionModal();
+        }
+        
+        if (document.getElementById('calendarPage').classList.contains('active')) {
+            this.renderCalendar();
+        }
+    },
+    showElectionModal() {
+        G.game.electionInProgress = true;
+        
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = `
+            position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;
+            display:flex;align-items:center;justify-content:center;padding:20px
+        `;
+        modal.innerHTML = `
+            <div style="background:#fff;border-radius:20px;padding:30px;width:100%;max-width:320px;text-align:center">
+                <div style="font-size:64px;margin-bottom:16px">🏆</div>
+                <div style="font-size:24px;font-weight:bold;color:#333;margin-bottom:8px">总选举最终结果</div>
+                <div style="font-size:14px;color:#666;margin-bottom:24px">第 ${G.game.day} 天，总选举正式开始！</div>
+                <button onclick="App.UI.startFinalElection();this.closest('.modal-overlay').remove()" 
+                        style="width:100%;padding:16px;background:linear-gradient(135deg,#ffd700,#ff9500);color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:bold;cursor:pointer">
+                    📣 查看最终排名
+                </button>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        modal.addEventListener('click', (e) => { if(e.target === modal) this.showElectionModal(); });
+    },
+    showElectionReportModal(type) {
+        G.game.electionInProgress = true;
+        const isFirst = type === 'first';
+        const title = isFirst ? '📊 初报结果' : '📈 中报结果';
+        const subtitle = isFirst ? '第10天' : '第20天';
+        const pullsLeft = isFirst ? 3 - G.game.firstReportPulls : 3 - G.game.secondReportPulls;
+        
+        const votes = this.calculateVotes();
+        const allMembers = App.getAllMembers().filter(m => !m.graduate);
+        let rankings = allMembers.map(m => ({ name: m.name, votes: randInt(500, 30000) }));
+        rankings.push({ name: G.player.name, votes: votes });
+        rankings.sort((a, b) => b.votes - a.votes);
+        const rank = rankings.findIndex(r => r.name === G.player.name) + 1;
+        
+        if (isFirst) {
+            G.game.firstReportVotes = votes;
+        } else {
+            G.game.secondReportVotes = votes;
+        }
+        
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = `
+            position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;
+            display:flex;align-items:center;justify-content:center;padding:16px
+        `;
+        modal.innerHTML = `
+            <div style="background:#fff;border-radius:16px;padding:20px;width:calc(100% - 32px);max-width:340px;box-sizing:border-box">
+                <div style="text-align:center;margin-bottom:16px">
+                    <div style="font-size:40px;margin-bottom:8px">${isFirst ? '📊' : '📈'}</div>
+                    <div style="font-size:18px;font-weight:bold;color:#333">${title}</div>
+                    <div style="font-size:12px;color:#999">${subtitle}</div>
+                </div>
+                
+                <div style="background:linear-gradient(135deg,#ffd700,#ff9500);color:#fff;border-radius:10px;padding:12px;text-align:center;margin-bottom:12px">
+                    <div style="font-size:11px;opacity:0.9">当前排名</div>
+                    <div style="font-size:36px;font-weight:bold">#${rank}</div>
+                    <div style="font-size:12px;margin-top:2px">${votes.toLocaleString()} 票</div>
+                </div>
+                
+                <div style="padding:0 4px;margin-bottom:12px">
+                    <div style="font-size:11px;color:#999;margin-bottom:6px">📊 排名前5</div>
+                    ${rankings.slice(0,5).map((r, i) => `
+                        <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #f0f0f0">
+                            <span style="font-weight:600;font-size:12px">${i+1}. ${r.name}</span>
+                            <span style="color:#ff69b4;font-size:12px">${r.votes.toLocaleString()}</span>
+                        </div>
+                    `).join('')}
+                </div>
+                
+                <div style="text-align:center;margin-bottom:12px">
+                    <span style="font-size:12px;color:#666">剩余拉票次数：</span>
+                    <span style="font-size:18px;font-weight:bold;color:#ff69b4">${pullsLeft}</span>
+                </div>
+                
+                <div style="display:flex;gap:8px">
+                    <button onclick="App.UI.endElectionReport('${type}')" 
+                            style="flex:1;padding:10px;border:none;background:#f5f5f5;border-radius:8px;font-size:13px;cursor:pointer">
+                        关闭
+                    </button>
+                    ${pullsLeft > 0 ? `
+                        <button onclick="App.UI.pullVotes('${type}')" 
+                                style="flex:1;padding:10px;border:none;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">
+                            📣 拉票
+                        </button>
+                    ` : ''}
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+    },
+    calculateVotes() {
+        // 人气值决定票数：1人气 = 1000票
+        // 基础公式：票数 = 人气 * 1000
+        const baseVotes = Math.floor(G.stats.popularity * 1000);
+        
+        // 人气满100获得第一名加成
+        let championBonus = 0;
+        if (G.stats.popularity >= 100) {
+            championBonus = 50000;  // 满100人气获得额外加成，确保第一名
+        }
+        
+        // 鸡腿和星光作为额外加成
+        const drumstickBonus = Math.floor(G.stats.drumstick / 10);
+        const starlightBonus = Math.floor(G.stats.starlight * 50);
+        
+        return baseVotes + drumstickBonus + starlightBonus + championBonus;
+    },
+    pullVotes(type) {
+        const isFirst = type === 'first';
+        if (isFirst && G.game.firstReportPulls >= 3) return;
+        if (!isFirst && G.game.secondReportPulls >= 3) return;
+        
+        if (isFirst) {
+            G.game.firstReportPulls++;
+        } else {
+            G.game.secondReportPulls++;
+        }
+        
+        // 人气值越高，拉票效果越好
+        // 基础范围 5-12，根据人气值增加上限
+        const baseMin = 5;
+        const baseMax = 12;
+        
+        // 根据人气值提升拉票效果
+        let bonus = 0;
+        if (G.stats.popularity >= 80) bonus = 10;  // 顶流明星：拉票效果+10
+        else if (G.stats.popularity >= 60) bonus = 6;   // 人气偶像：拉票效果+6
+        else if (G.stats.popularity >= 40) bonus = 4;   // 小有名气：拉票效果+4
+        else if (G.stats.popularity >= 20) bonus = 2;   // 崭露头角：拉票效果+2
+        
+        const popularityGain = Math.floor(Math.random() * (baseMax + bonus - baseMin + 1)) + baseMin;
+        App.Store.updateStats({popularity: popularityGain});
+        
+        document.querySelector('.modal-overlay')?.remove();
+        this.showNotification(`📣 拉票成功！人气 +${popularityGain}`);
+        
+        setTimeout(() => {
+            this.showElectionReportModal(type);
+        }, 500);
+    },
+    endElectionReport(type) {
+        document.querySelector('.modal-overlay')?.remove();
+        G.game.electionInProgress = false;
+        if (type === 'first') {
+            G.game.electionPhase = 'first';
+        } else {
+            G.game.electionPhase = 'second';
+        }
+    },
+    startFinalElection() {
+        const votes = this.calculateVotes();  // 使用统一的计算方法
+        const allMembers = App.getAllMembers().filter(m => !m.graduate);
+        let rankings = allMembers.map(m => ({ name: m.name, votes: randInt(1000, 50000) }));
+        rankings.push({ name: G.player.name, votes: votes });
+        rankings.sort((a, b) => b.votes - a.votes);
+        G.electionResults = rankings;
+        G.game.rank = rankings.findIndex(r => r.name === G.player.name) + 1;
+        G.game.electionInProgress = false;
+        G.game.electionPhase = null;
+        G.game.firstReportPulls = 0;
+        G.game.secondReportPulls = 0;
+        
+        this.showNotification(`🎉 总选举完成！你获得 ${votes.toLocaleString()} 票，排名第 ${G.game.rank} 名`);
+        App.Store.updateStats({popularity: 5});
+        
+        setTimeout(() => {
+            this.openApp('election');
+        }, 500);
+    },
+    renderCalendar() {
+        const phaseNames = {morning:'🌅早晨',daytime:'☀️白天',evening:'🌆傍晚',night:'🌙夜晚'};
+        const season = G.game.day <= 90 ? '🌸春季' : G.game.day <= 180 ? '☀️夏季' : G.game.day <= 270 ? '🍂秋季' : '❄️冬季';
+        const month = Math.ceil(G.game.day / 30);
+        const daysInMonth = 30;
+        const firstDay = 1;
+        
+        let calendarHTML = `<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:4px;padding:8px">`;
+        const weekDays = ['日','一','二','三','四','五','六'];
+        weekDays.forEach(d => calendarHTML += `<div style="text-align:center;font-size:12px;color:#999;padding:6px">${d}</div>`);
+        
+        for (let i=0;i<firstDay;i++) calendarHTML += `<div></div>`;
+        for (let d=1;d<=daysInMonth;d++) {
+            const isToday = d === ((G.game.day - 1) % 30) + 1;
+            calendarHTML += `<div style="text-align:center;padding:8px;border-radius:8px;${isToday?'background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;font-weight:bold':''}">${d}</div>`;
+        }
+        calendarHTML += `</div>`;
+        
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">日程</span></div>
+        <div style="flex:1;overflow-y:auto;padding:16px">
+            <div style="background:linear-gradient(135deg,#ff69b4,#ff1493);border-radius:16px;padding:20px;color:#fff;margin-bottom:16px">
+                <div style="font-size:24px;font-weight:bold;margin-bottom:4px">第 ${G.game.day} 天</div>
+                <div style="font-size:16px">${season} | ${phaseNames[G.game.phase]}</div>
+                <div style="font-size:12px;opacity:0.8;margin-top:4px">${G.player.group} Team ${G.player.team}</div>
+            </div>
+            
+            <div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:8px;color:#333">📅 本月日历</div>
+                ${calendarHTML}
+            </div>
+            
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:12px;color:#333">⏰ 时间控制</div>
+                <button onclick="App.UI.advanceDay()" style="width:100%;padding:16px;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:bold;cursor:pointer">
+                    ▶ 进入下一天
+                </button>
+            </div>
+            
+            <div style="background:#fff;border-radius:12px;padding:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:12px;color:#333">📊 今日状态</div>
+                <div style="display:flex;gap:12px;font-size:13px">
+                    <div style="flex:1;text-align:center;padding:12px;background:#f5f5f5;border-radius:8px">
+                        <div style="font-size:20px;font-weight:bold;color:#3498db">${G.stats.stress}</div>
+                        <div style="color:#999">压力</div>
+                    </div>
+                    <div style="flex:1;text-align:center;padding:12px;background:#f5f5f5;border-radius:8px">
+                        <div style="font-size:20px;font-weight:bold;color:#27ae60">${G.stats.mood}</div>
+                        <div style="color:#999">心情</div>
+                    </div>
+                    <div style="flex:1;text-align:center;padding:12px;background:#f5f5f5;border-radius:8px">
+                        <div style="font-size:20px;font-weight:bold;color:#f39c12">${G.stats.popularity}</div>
+                        <div style="color:#999">人气</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-top:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:8px;color:#333">💡 提示</div>
+                <div style="font-size:13px;color:#666;line-height:1.6">
+                    • 每30天会进行一次总选举<br>
+                    • 每30天会有握手会活动<br>
+                    • 点击上方按钮可手动推进时间
+                </div>
+            </div>
+        </div>`;
+        
+        document.getElementById('calendarPage').innerHTML = h;
+    },
+    renderBackpack() {
+        const backpack = G.stats.backpack || {};
+        const items = Object.entries(backpack).filter(([_, count]) => count > 0);
+        const giftItems = [
+            {id:'chocolate', name:'🍫 巧克力', price:50, desc:'甜蜜小礼物', effect:{affection:3}},
+            {id:'flower', name:'🌸 鲜花', price:80, desc:'浪漫之选', effect:{affection:5}},
+            {id:'perfume', name:'🌷 香水', price:300, desc:'优雅芬芳', effect:{affection:8}},
+            {id:'cake', name:'🎂 蛋糕', price:200, desc:'甜蜜惊喜', effect:{affection:6,mood:3}},
+            {id:'bear', name:'🧸 玩偶', price:150, desc:'可爱陪伴', effect:{affection:5}},
+            {id:'jewelry', name:'💎 首饰', price:800, desc:'璀璨夺目', effect:{affection:12}},
+            {id:'watch', name:'⌚ 手表', price:1200, desc:'珍惜时间', effect:{affection:15}},
+            {id:'bag', name:'👜 名牌包', price:1500, desc:'奢华之选', effect:{affection:18}},
+            {id:'concert_ticket', name:'🎫 演唱会门票', price:500, desc:'专属邀请', effect:{affection:10,mood:5}},
+            {id:'dinner', name:'🍽️ 豪华晚餐', price:800, desc:'共进美食', effect:{affection:12,mood:8}},
+            {id:'phone', name:'📱 最新手机', price:3000, desc:'科技潮品', effect:{affection:25}},
+            {id:'photobook', name:'📖 定制写真集', price:600, desc:'珍藏回忆', effect:{affection:10,popularity:5}},
+            {id:'stuffed_animal', name:'🐰 巨型公仔', price:400, desc:'少女心爆棚', effect:{affection:8}},
+            {id:'scarf', name:'🧣 品牌围巾', price:350, desc:'温暖呵护', effect:{affection:7}},
+            {id:'lipstick', name:'💄 限定口红', price:280, desc:'美妆必备', effect:{affection:6}},
+            {id:'tea_set', name:'🍵 精致茶具', price:450, desc:'文雅之礼', effect:{affection:8}},
+            {id:'leather_jacket', name:'🧥 皮衣', price:2500, desc:'帅气有型', effect:{affection:22}},
+            {id:'purse', name:'👛 钱包', price:600, desc:'实用之选', effect:{affection:9}},
+            {id:'headphones', name:'🎧 耳机', price:450, desc:'音乐之享', effect:{affection:7}},
+            {id:'crown', name:'👑 王冠', price:5000, desc:'至高荣耀', effect:{affection:40,popularity:10}},
+        ];
+        
+        let itemsHtml = '';
+        if (items.length === 0) {
+            itemsHtml = '<div style="text-align:center;color:#999;padding:40px">背包空空如也</div>';
+        } else {
+            itemsHtml = '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:16px">';
+            items.forEach(([id, count]) => {
+                const gift = giftItems.find(g => g.id === id);
+                if (gift) {
+                    itemsHtml += `<div style="background:#fff;border-radius:12px;padding:16px;text-align:center">
+                        <div style="font-size:32px;margin-bottom:8px">${gift.name.split(' ')[0]}</div>
+                        <div style="font-size:13px;font-weight:600">${gift.name.split(' ')[1]}</div>
+                        <div style="font-size:12px;color:#999">x${count}</div>
+                    </div>`;
+                }
+            });
+            itemsHtml += '</div>';
+        }
+        
+        let shopHtml = `<div style="padding:16px"><div style="font-size:14px;font-weight:600;margin-bottom:12px">🛒 礼物商店</div><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px">`;
+        giftItems.forEach(gift => {
+            const effectText = [];
+            if (gift.effect?.affection) effectText.push(`💕+${gift.effect.affection}`);
+            if (gift.effect?.mood) effectText.push(`😊+${gift.effect.mood}`);
+            if (gift.effect?.popularity) effectText.push(`⭐+${gift.effect.popularity}`);
+            shopHtml += `<div style="background:#fff;padding:12px;border-radius:8px;display:flex;flex-direction:column">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                    <span style="font-size:24px">${gift.name.split(' ')[0]}</span>
+                    <div>
+                        <div style="font-size:13px;font-weight:600">${gift.name.split(' ')[1]}</div>
+                        <div style="font-size:10px;color:#999">${gift.desc}</div>
+                    </div>
+                </div>
+                <div style="display:flex;align-items:center;justify-content:space-between">
+                    <div>
+                        <span style="font-size:12px;color:#e74c3c;font-weight:600">¥${gift.price}</span>
+                        <span style="font-size:10px;color:#07c160;margin-left:4px">${effectText.join(' ')}</span>
+                    </div>
+                    <button onclick="App.UI.buyGift('${gift.id}')" style="padding:4px 12px;background:#e74c3c;color:#fff;border:none;border-radius:6px;font-size:11px;cursor:pointer">购买</button>
+                </div>
+            </div>`;
+        });
+        shopHtml += '</div></div>';
+        
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🎒 背包</span></div>
+        <div style="flex:1;overflow-y:auto">
+            <div style="background:linear-gradient(135deg,#8b4513,#a0522d);color:#fff;padding:20px;border-radius:16px;margin:16px;text-align:center">
+                <div style="font-size:14px;margin-bottom:8px">💰 微信支付余额</div>
+                <div style="font-size:28px;font-weight:700">¥${(G.stats.wechatBalance||0).toLocaleString()}</div>
+            </div>
+            
+            <div style="background:#fff;margin:0 16px;border-radius:12px;padding:12px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:8px">📦 我的物品</div>
+                ${itemsHtml}
+            </div>
+            
+            ${shopHtml}
+        </div>`;
+        
+        document.getElementById('backpackPage').innerHTML = h;
+    },
+    buyGift(type) {
+        const giftItems = [
+            {id:'chocolate', name:'🍫 巧克力', price:50, desc:'甜蜜小礼物', effect:{affection:3}},
+            {id:'flower', name:'🌸 鲜花', price:80, desc:'浪漫之选', effect:{affection:5}},
+            {id:'perfume', name:'🌷 香水', price:300, desc:'优雅芬芳', effect:{affection:8}},
+            {id:'cake', name:'🎂 蛋糕', price:200, desc:'甜蜜惊喜', effect:{affection:6,mood:3}},
+            {id:'bear', name:'🧸 玩偶', price:150, desc:'可爱陪伴', effect:{affection:5}},
+            {id:'jewelry', name:'💎 首饰', price:800, desc:'璀璨夺目', effect:{affection:12}},
+            {id:'watch', name:'⌚ 手表', price:1200, desc:'珍惜时间', effect:{affection:15}},
+            {id:'bag', name:'👜 名牌包', price:1500, desc:'奢华之选', effect:{affection:18}},
+            {id:'concert_ticket', name:'🎫 演唱会门票', price:500, desc:'专属邀请', effect:{affection:10,mood:5}},
+            {id:'dinner', name:'🍽️ 豪华晚餐', price:800, desc:'共进美食', effect:{affection:12,mood:8}},
+            {id:'phone', name:'📱 最新手机', price:3000, desc:'科技潮品', effect:{affection:25}},
+            {id:'photobook', name:'📖 定制写真集', price:600, desc:'珍藏回忆', effect:{affection:10,popularity:5}},
+            {id:'stuffed_animal', name:'🐰 巨型公仔', price:400, desc:'少女心爆棚', effect:{affection:8}},
+            {id:'scarf', name:'🧣 品牌围巾', price:350, desc:'温暖呵护', effect:{affection:7}},
+            {id:'lipstick', name:'💄 限定口红', price:280, desc:'美妆必备', effect:{affection:6}},
+            {id:'tea_set', name:'🍵 精致茶具', price:450, desc:'文雅之礼', effect:{affection:8}},
+            {id:'leather_jacket', name:'🧥 皮衣', price:2500, desc:'帅气有型', effect:{affection:22}},
+            {id:'purse', name:'👛 钱包', price:600, desc:'实用之选', effect:{affection:9}},
+            {id:'headphones', name:'🎧 耳机', price:450, desc:'音乐之享', effect:{affection:7}},
+            {id:'crown', name:'👑 王冠', price:5000, desc:'至高荣耀', effect:{affection:40,popularity:10}},
+        ];
+        const gift = giftItems.find(g => g.id === type);
+        if (!gift) return;
+        if (G.stats.wechatBalance < gift.price) { this.showNotification('余额不足'); return; }
+        App.Store.updateStats({wechatBalance:-gift.price});
+        G.stats.backpack = G.stats.backpack || {};
+        G.stats.backpack[type] = (G.stats.backpack[type] || 0) + 1;
+        this.showNotification(`购买成功！${gift.name}已放入背包`);
+        this.renderBackpack();
+    },
+    showNotification(msg, durationMs) {
+        const el = document.getElementById('notification');
+        el.textContent = msg; el.classList.add('show');
+        App.Sound.play('Notif');
+        const dur = durationMs || (msg.startsWith('❌') || msg.startsWith('⚠️') || msg.startsWith('🔌') || msg.startsWith('⏱️') ? 3500 : 2000);
+        setTimeout(() => el.classList.remove('show'), dur);
+    },
+    showStatChange(text) {
+        const el = document.getElementById('statChange');
+        el.textContent = text; el.classList.add('show');
+        setTimeout(() => el.classList.remove('show'), 2500);
+    },
+    showEventModal(ev) {
+        const card = document.getElementById('eventCard');
+        const effects = ev.effects || [];
+        let choicesHtml = ev.choices.map((c,i) =>
+            `<div class="event-choice" onclick="App.UI.resolveEvent('${ev.type||'random'}',${i})">${c}</div>`
+        ).join('');
+        card.innerHTML = `<div class="event-icon">${ev.icon||'🎯'}</div><div class="event-title">${ev.title}</div><div class="event-desc">${ev.desc}</div><div class="event-choices">${choicesHtml}</div>`;
+        document.getElementById('eventModal').classList.add('show');
+        this._currentEvent = ev;
+        App.Sound.play('Notif');
+    },
+    resolveEvent(type, choiceIdx) {
+        document.getElementById('eventModal').classList.remove('show');
+        if (type === 'random') {
+            const ev = this._currentEvent;
+            if (ev && ev.effects[choiceIdx]) App.Store.updateStats(ev.effects[choiceIdx]);
+        } else {
+            App.Events.resolveStory(type, choiceIdx);
+        }
+        this._currentEvent = null;
+    },
+    closeEventModal() { document.getElementById('eventModal').classList.remove('show'); this._currentEvent = null; },
+
+    // ---------- 锁屏/密码 ----------
+    showPasswordScreen() {
+        this.showPage('passwordScreen'); this.pwdInput = ''; this.updateDots();
+        document.getElementById('passwordError').textContent = '';
+    },
+    updateDots() {
+        for (let i=0;i<4;i++) {
+            const dot = document.getElementById('dot'+i);
+            if (dot) dot.classList.toggle('filled', i < this.pwdInput.length);
+        }
+    },
+    enterPassword(d) {
+        if (this.pwdInput.length >= 4) return;
+        this.pwdInput += d; this.updateDots();
+        if (this.pwdInput.length === 4) {
+            if (this.pwdInput === '0814') {
+                this.pwdInput = ''; this.updateDots();
+                document.getElementById('passwordError').textContent = '';
+                if (G.player.name) {
+                    document.getElementById('bottomNav').style.display = '';
+                    this.goHome();
+                } else {
+                    this.showPage('createScreen'); this.renderCreateStep(1);
+                }
+            } else {
+                document.getElementById('passwordError').textContent = '密码错误';
+                this.pwdInput = ''; this.updateDots();
+            }
+        }
+    },
+    clearPwd() { this.pwdInput = ''; this.updateDots(); },
+    backspacePwd() { this.pwdInput = this.pwdInput.slice(0,-1); this.updateDots(); },
+
+    // ---------- 角色创建 ----------
+    renderCreateStep(step) {
+        const container = document.getElementById('createContent');
+        let html = '';
+        if (step === 1) {
+            html = `<div class="create-step active"><div class="create-emoji">🎤</div><div class="create-title">你的艺名是什么？</div><input class="create-input" id="inputName" placeholder="输入你的艺名" maxlength="10"><button class="create-btn" onclick="App.UI.nextCreateStep(1)">下一步</button></div>`;
+        } else if (step === 2) {
+            html = `<div class="create-step active"><div class="create-emoji">💫</div><div class="create-title">描述一下你的外貌</div><input class="create-input" id="inputAppearance" placeholder="如：黑色长发、大眼睛、甜美气质" maxlength="30"><button class="create-btn" onclick="App.UI.nextCreateStep(2)">下一步</button></div>`;
+        } else if (step === 3) {
+            html = `<div class="create-step active"><div class="create-emoji">🎭</div><div class="create-title">你的性格底色是？</div><div class="create-options">
+                <div class="create-option" onclick="App.UI.selectOption(this,'personality','温柔细腻','🌸')"><span class="emoji">🌸</span>温柔细腻</div>
+                <div class="create-option" onclick="App.UI.selectOption(this,'personality','热血直率','🔥')"><span class="emoji">🔥</span>热血直率</div>
+                <div class="create-option" onclick="App.UI.selectOption(this,'personality','内敛高冷','🌙')"><span class="emoji">🌙</span>内敛高冷</div>
+                <div class="create-option" onclick="App.UI.selectOption(this,'personality','古灵精怪','✨')"><span class="emoji">✨</span>古灵精怪</div>
+            </div><button class="create-btn" onclick="App.UI.nextCreateStep(3)">下一步</button></div>`;
+        } else if (step === 4) {
+            html = `<div class="create-step active"><div class="create-emoji">🏢</div><div class="create-title">选择你的分团</div><div class="create-options">`;
+            const groups = {SNH48:'🏙️',GNZ48:'🌺',BEJ48:'🏛️',CKG48:'🌶️',CGT48:'🐼'};
+            Object.entries(groups).forEach(([key,emoji]) => {
+                html += `<div class="create-option" onclick="App.UI.selectOption(this,'group','${key}','${emoji}')"><span class="emoji">${emoji}</span>${key}</div>`;
+            });
+            html += `</div><button class="create-btn" onclick="App.UI.nextCreateStep(4)">下一步</button></div>`;
+        } else if (step === 5) {
+            // 生成问答
+            this.quizQuestions = this.generateQuiz();
+            html = `<div class="create-step active"><div class="create-emoji">🎲</div><div class="create-title">随机问答分队</div><div id="quizArea" style="max-height:360px;overflow-y:auto;width:100%;-webkit-overflow-scrolling:touch">`;
+            this.quizQuestions.forEach((q,qi) => {
+                html += `<div style="margin-bottom:16px;text-align:left"><div style="font-size:14px;font-weight:600;margin-bottom:8px">${qi+1}. ${q.q}</div>`;
+                q.opts.forEach((o,oi) => {
+                    html += `<div class="quiz-option" onclick="App.UI.selectQuiz(this,${qi},${oi})">${o}</div>`;
+                });
+                html += `</div>`;
+            });
+            html += `</div><button class="create-btn" onclick="App.UI.nextCreateStep(5)" style="margin-top:12px">确认作答</button></div>`;
+        } else if (step === 6) {
+            // 分配队伍（使用分队算法）
+            this.tempCreate.team = assignTeam(this.tempCreate.personality, this.tempCreate.group, this.tempCreate.quizScores || this.tempCreate.quizAnswers);
+            html = `<div class="create-step active"><div class="create-emoji">✨</div><div class="create-title">确认你的档案</div><div class="profile-card"><div class="profile-header"><div class="profile-avatar">🎤</div><div><div class="profile-name">${this.tempCreate.name}</div><div class="profile-team">${this.tempCreate.group} Team ${this.tempCreate.team}</div></div></div><div class="profile-info">外貌：${this.tempCreate.appearance}<br>性格：${this.tempCreate.personalityEmoji} ${this.tempCreate.personality}</div></div><input class="create-input" id="inputBoot" placeholder="输入「开机」启动游戏" style="margin-top:16px"><button class="create-btn" onclick="App.UI.startGame()" style="margin-top:12px">🚀 启动</button><div style="font-size:11px;color:#bbb;margin-top:8px">在输入框中输入"开机"后点击启动按钮</div></div>`;
+        }
+        container.innerHTML = html;
+    },
+    selectOption(el, field, value, emoji) {
+        el.parentElement.querySelectorAll('.create-option').forEach(o => o.classList.remove('selected'));
+        el.classList.add('selected');
+        this.tempCreate[field] = value;
+        if (field === 'personality' && emoji) this.tempCreate.personalityEmoji = emoji;
+        if (field === 'group' && emoji) this.tempCreate.groupEmoji = emoji;
+    },
+    generateQuiz() {
+        const pool = [
+            {q:'公演前2小时，你会？',opts:['A. 默默背歌词和走位','B. 跟队友互相打气嗨起来','C. 一个人安静地冥想','D. 偷偷给粉丝准备小惊喜'],scores:[1,2,3,4]},
+            {q:'粉丝送了你超贵的礼物，你会？',opts:['A. 礼貌收下并真诚道谢','B. 开心得当场发朋友圈','C. 冷静让经纪人处理','D. 灵机一动跟粉丝开个玩笑'],scores:[1,2,3,4]},
+            {q:'队友突然哭了你怎么办？',opts:['A. 默默递上纸巾陪着她','B. 冲过去一把抱住说别哭啦','C. 假装没看到给她空间','D. 搞怪逗她笑'],scores:[1,2,3,4]},
+            {q:'上台前发现服装坏了，你会？',opts:['A. 轻声告诉工作人员','B. 大喊"快帮我看看！"','C. 自己尝试修补','D. 笑着说这是特别设计'],scores:[1,2,3,4]},
+            {q:'被问到敏感问题时，你会？',opts:['A. 温柔委婉地回答','B. 直接说出自己的想法','C. 保持沉默或转移话题','D. 用幽默化解尴尬'],scores:[1,2,3,4]},
+            {q:'休息日你更想做什么？',opts:['A. 在家看书听音乐','B. 和朋友出去逛街','C. 一个人看电影','D. 尝试新的冒险活动'],scores:[1,2,3,4]},
+            {q:'收到差评时，你会？',opts:['A. 认真反思并改进','B. 发微博反驳回去','C. 默默承受不回应','D. 开玩笑说谢谢建议'],scores:[1,2,3,4]},
+            {q:'团队聚餐时你通常是？',opts:['A. 贴心照顾每个人','B. 活跃气氛的开心果','C. 安静吃东西的观察者','D. 讲段子逗大家笑'],scores:[1,2,3,4]}
+        ];
+        const shuffled = [...pool].sort(()=>Math.random()-0.5);
+        return shuffled.slice(0, 5);
+    },
+    selectQuiz(el, qi, oi) {
+        el.parentElement.querySelectorAll('.quiz-option').forEach(o => o.classList.remove('selected'));
+        el.classList.add('selected');
+        this.tempCreate.quizAnswers[qi] = oi;
+        if (!this.tempCreate.quizScores) this.tempCreate.quizScores = [];
+        this.tempCreate.quizScores[qi] = this.quizQuestions[qi].scores[oi];
+    },
+    nextCreateStep(step) {
+        if (step === 1) {
+            const name = document.getElementById('inputName')?.value.trim();
+            if (!name) { this.showNotification('请输入艺名'); return; }
+            this.tempCreate.name = name;
+            this.renderCreateStep(2);
+        } else if (step === 2) {
+            const app = document.getElementById('inputAppearance')?.value.trim();
+            if (!app) { this.showNotification('请描述外貌'); return; }
+            this.tempCreate.appearance = app;
+            this.renderCreateStep(3);
+        } else if (step === 3) {
+            if (!this.tempCreate.personality) { this.showNotification('请选择性格'); return; }
+            this.renderCreateStep(4);
+        } else if (step === 4) {
+            if (!this.tempCreate.group) { this.showNotification('请选择分团'); return; }
+            this.renderCreateStep(5);
+        } else if (step === 5) {
+            if (!this.tempCreate.quizAnswers || this.tempCreate.quizAnswers.length !== this.quizQuestions.length || this.tempCreate.quizAnswers.some(a => a === undefined)) {
+                this.showNotification('请回答所有问题'); return;
+            }
+            this.renderCreateStep(6);
+        }
+    },
+    startGame() {
+        const boot = document.getElementById('inputBoot')?.value.trim();
+        if (boot !== '开机') { this.showNotification('请输入「开机」启动游戏'); return; }
+        G.player.name = this.tempCreate.name;
+        G.player.appearance = this.tempCreate.appearance;
+        G.player.personality = this.tempCreate.personality;
+        G.player.personalityEmoji = this.tempCreate.personalityEmoji;
+        G.player.group = this.tempCreate.group;
+        G.player.team = this.tempCreate.team;
+        this.initChatHistory();
+        this.initSmsMessages();
+        document.getElementById('createScreen').classList.remove('active');
+        document.getElementById('bottomNav').style.display = '';
+        this.goHome();
+        this.showNotification('欢迎，'+G.player.name+'！你的偶像之路开始了！');
+        App.Save.autoSave();
+    },
+
+    // ---------- 微信 ----------
+    initSmsMessages() {
+        const smsTypes = [
+            { from:'私生粉', avatar:'👁️', text:'我知道你住哪里，今天看到你进小区了~', type:'stalker' },
+            { from:'黑粉', avatar:'💀', text:'你这种人也能出道？笑死人了', type:'hater' },
+            { from:'狂热粉', avatar:'🔥', text:'姐姐！！我太爱你了！！今天握手会见到你了好激动啊啊啊！！', type:'fanatic' },
+            { from:'广告推销', avatar:'📢', text:'【星耀传媒】诚邀您参加年度盛典，回复1确认参加', type:'ad' }
+        ];
+        G.smsMessages = [pick(smsTypes)];
+    },
+    receiveRandomSms() {
+        const smsPool = [
+            { from:'私生粉', avatar:'👁️', text:'你今天穿的蓝色外套很好看，我拍下来了', type:'stalker' },
+            { from:'私生粉', avatar:'👁️', text:'你经常去的那家咖啡店，我也去了，可惜没遇到你', type:'stalker' },
+            { from:'私生粉', avatar:'👁️', text:'你的手机号是怎么泄露的呢？嘿嘿', type:'stalker' },
+            { from:'黑粉', avatar:'💀', text:'听说你又垫底了？笑死', type:'hater' },
+            { from:'黑粉', avatar:'💀', text:'你那点实力也配站C位？', type:'hater' },
+            { from:'黑粉', avatar:'💀', text:'赶紧退团吧，别丢人了', type:'hater' },
+            { from:'狂热粉', avatar:'🔥', text:'姐姐！！你的新公演太棒了！！我看了三遍！！', type:'fanatic' },
+            { from:'狂热粉', avatar:'🔥', text:'我把你的海报贴满了房间！！你是我的光！！', type:'fanatic' },
+            { from:'狂热粉', avatar:'🔥', text:'今天握手会你看了我一眼！！我要幸福晕了！！', type:'fanatic' },
+            { from:'狂热粉', avatar:'🔥', text:'姐姐的每一场公演我都会去的！！鸡腿已安排！！', type:'fanatic' },
+            { from:'广告推销', avatar:'📢', text:'【美妆品牌】邀请您代言新品口红，有意向请联系', type:'ad' },
+            { from:'广告推销', avatar:'📢', text:'【综艺邀请】《偶像的日常》节目组邀请您参加录制', type:'ad' },
+            { from:'广告推销', avatar:'📢', text:'【杂志拍摄】时尚杂志邀请您拍摄封面，酬劳丰厚', type:'ad' },
+            { from:'经纪人', avatar:'👔', text:'明天有行程安排，记得早起', type:'agent' },
+            { from:'经纪人', avatar:'👔', text:'公司要给你安排新通告，准备一下', type:'agent' },
+            { from:'粉丝', avatar:'🧸', text:'姐姐加油！我会一直支持你的！', type:'fan' },
+            { from:'粉丝', avatar:'🧸', text:'今天的公演超棒！期待下次见面！', type:'fan' }
+        ];
+        const newSms = pick(smsPool);
+        G.smsMessages.unshift(newSms);
+        this.showSmsPopup(newSms);
+        return newSms;
+    },
+    showSmsPopup(sms) {
+        const container = document.getElementById('phoneNotifContainer');
+        if (!container) return;
+        const notif = document.createElement('div');
+        notif.className = 'phone-notif-item';
+        notif.innerHTML = `<div class="phone-notif-icon">${sms.avatar}</div><div class="phone-notif-body"><div class="phone-notif-app">短信</div><div class="phone-notif-title">${sms.from}</div><div class="phone-notif-text">${sms.text}</div></div><div class="phone-notif-close">✕</div>`;
+        container.appendChild(notif);
+        setTimeout(() => notif.classList.add('show'), 10);
+        const autoRemove = setTimeout(() => {
+            notif.classList.remove('show');
+            setTimeout(() => notif.remove(), 350);
+        }, 5000);
+        const closeBtn = notif.querySelector('.phone-notif-close');
+        closeBtn.addEventListener('click', (e) => { e.stopPropagation(); clearTimeout(autoRemove); notif.remove(); });
+        let startY = 0, currentY = 0, isDragging = false;
+        notif.addEventListener('touchstart', (e) => { startY = e.touches[0].clientY; isDragging = true; notif.classList.add('swiping'); });
+        notif.addEventListener('touchmove', (e) => {
+            if (!isDragging) return;
+            currentY = e.touches[0].clientY;
+            const diff = currentY - startY;
+            if (diff < 0) { notif.style.transform = `translateY(${diff}px)`; notif.style.opacity = Math.max(0, 1 + diff / 100); }
+        });
+        notif.addEventListener('touchend', () => {
+            isDragging = false;
+            notif.classList.remove('swiping');
+            const diff = currentY - startY;
+            if (diff < -50) { clearTimeout(autoRemove); notif.remove(); }
+            else { notif.style.transform = ''; notif.style.opacity = ''; }
+        });
+        App.Sound.play('Notif');
+    },
+    initChatHistory() {
+        const grp = App.NPCData[G.player.group];
+        if (!grp) return;
+        G.chatHistory = {};
+        
+        // 添加经纪人
+        G.chatHistory[grp.agent.name] = { type:'agent', personality:grp.agent.personality, avatar:grp.agent.avatar, messages:[{from:'npc',text:'欢迎加入团队！',time:getTimeStr()}] };
+        
+        // 添加玩家所在队伍的成员
+        const myTeamMembers = grp.teams && grp.teams[G.player.team] ? grp.teams[G.player.team] : [];
+        myTeamMembers.forEach(memberName => {
+            if (!G.chatHistory[memberName]) {
+                G.chatHistory[memberName] = { 
+                    type:'member', 
+                    avatar:'👤', 
+                    messages:[{from:'npc',text:`你好！我是${G.player.group} Team ${G.player.team}的${memberName}，以后就是队友啦～`,time:getTimeStr()}] 
+                };
+            }
+        });
+        
+        // 添加工作组群
+        G.chatHistory['📋工作组'] = { type:'group', avatar:'📋', messages:[{from:'npc',text:`${grp.agent.name}：欢迎新成员加入！`,time:getTimeStr()}] };
+        
+        // 添加本队群
+        G.chatHistory['💬 Team '+G.player.team+'群'] = { type:'teamgroup', avatar:'💬', messages:[{from:'npc',text:`欢迎新队友！`,time:getTimeStr()}] };
+    },
+    renderWechatList() {
+        const el = document.getElementById('wechatPage');
+        el.innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">微信</span><span class="action" onclick="App.UI.showWechatMoments()">朋友圈</span></div>
+        <div class="wechat-tab-bar"><div class="wechat-tab active" id="wtab_chat" onclick="App.UI.switchWechatTab('chat')">聊天</div><div class="wechat-tab" id="wtab_contacts" onclick="App.UI.switchWechatTab('contacts')">通讯录</div></div>
+        <div id="wechatList" style="flex:1;overflow-y:auto"></div>`;
+        this.populateWechatList('chat');
+    },
+    switchWechatTab(tab) {
+        this.wechatTab = tab;
+        document.getElementById('wtab_chat').classList.toggle('active', tab==='chat');
+        document.getElementById('wtab_contacts').classList.toggle('active', tab==='contacts');
+        this.populateWechatList(tab);
+    },
+    populateWechatList(tab) {
+        const listEl = document.getElementById('wechatList');
+        const grp = App.NPCData[G.player.group];
+        const myTeam = G.player.team;
+        const myTeamMembers = myTeam && grp?.teams?.[myTeam] ? grp.teams[myTeam] : [];
+
+        if (tab === 'chat') {
+            let h = '';
+            const chatAllowed = [grp?.agent?.name].filter(Boolean);
+            if (grp?.core) chatAllowed.push(...grp.core.map(c => c.name));
+            if (myTeam) chatAllowed.push(...myTeamMembers);
+
+            for (let [name, data] of Object.entries(G.chatHistory)) {
+                if (!chatAllowed.includes(name)) continue;
+                const last = data.messages[data.messages.length-1];
+                h += `<div class="chat-item" onclick="App.UI.openWechatChat('${name}')"><div class="avatar" style="background:#f0f0f0">${data.avatar}</div><div class="info"><div class="name">${name}</div><div class="preview">${last?last.text:''}</div></div><div class="time-stamp">${last?last.time:''}</div></div>`;
+            }
+            listEl.innerHTML = h || '<div class="empty-hint">暂无消息</div>';
+        } else {
+            let h = '';
+
+            // 荣誉毕业生板块（放在最前面）
+            const honoraryGraduates = [
+                '鞠婧祎', '李艺彤', '孙芮', '袁一琦',
+                '陈观慧', '陈思', '戴萌', '孔肖吟', '李宇琪', '莫寒', '钱蓓婷', '邱欣怡', '吴哲晗', '徐晨辰', '许佳琪', '张语格',
+                '陆婷', '林思意', '赵粤', '蒋芸', '许杨玉琢', '张昕', '王晓佳', '姜杉', '段艺璇',
+                '农燕萍', '龙亦瑞', '张笑盈', '韩家乐', '赵天杨', '沈小爱'
+            ];
+            h += `<div class="contact-group-title" style="background:linear-gradient(135deg,#ffd700,#ffec8b);color:#8b4513">🏆 荣誉毕业生</div>`;
+            h += `<div style="font-size:12px;color:#b8860b;padding:8px 16px 4px;font-weight:600">⭐ 传奇偶像</div>`;
+            honoraryGraduates.forEach(name => {
+                const aff = G.memberAffection[name]||0;
+                let nameColor = '#666';
+                let nameWeight = 'normal';
+                if (aff >= 80) { nameColor = '#e91e63'; nameWeight = 'bold'; }
+                else if (aff >= 50) { nameColor = '#ff69b4'; }
+                else if (aff >= 30) { nameColor = '#999'; }
+                else { nameColor = '#bbb'; }
+                h += `<div class="contact-item" onclick="App.UI.startChatWithMember('${name}','honorary')"><div class="avatar">🏆</div><div class="info"><div class="name" style="color:${nameColor};font-weight:${nameWeight}">${name}</div></div></div>`;
+            });
+
+            // 各分团成员
+            Object.entries(App.NPCData).forEach(([groupKey, groupData]) => {
+                const isMyGroup = groupKey === G.player.group;
+                h += `<div class="contact-group-title">🏢 ${groupKey}${isMyGroup?' (我的分团)':''}</div>`;
+
+                if (groupData.teams) {
+                    Object.entries(groupData.teams).forEach(([teamName, members]) => {
+                        const isMyTeam = isMyGroup && teamName === myTeam;
+                        h += `<div style="font-size:12px;color:${isMyTeam?'#07c160':'#ff69b4'};padding:8px 16px 4px;font-weight:600">Team ${teamName}${isMyTeam?' ★':''}</div>`;
+                        members.forEach(name => {
+                            const aff = G.memberAffection[name]||0;
+                            let nameColor = '#666';
+                            let nameWeight = 'normal';
+                            if (aff >= 80) { nameColor = '#e91e63'; nameWeight = 'bold'; }
+                            else if (aff >= 50) { nameColor = '#ff69b4'; }
+                            else if (aff >= 30) { nameColor = '#999'; }
+                            else { nameColor = '#bbb'; }
+                            h += `<div class="contact-item" onclick="App.UI.startChatWithMember('${name}','${groupKey}')"><div class="avatar">👤</div><div class="info"><div class="name" style="color:${nameColor};font-weight:${nameWeight}">${name}</div></div></div>`;
+                        });
+                    });
+                }
+
+                if (groupData.graduated && groupData.graduated.length) {
+                    h += `<div style="font-size:12px;color:#999;padding:8px 16px 4px;font-weight:600">🎓 毕业生</div>`;
+                    groupData.graduated.slice(0, 10).forEach(name => {
+                        h += `<div class="contact-item" onclick="App.UI.startChatWithMember('${name}','${groupKey}')"><div class="avatar">🎓</div><div class="info"><div class="name" style="color:#999">${name}</div></div></div>`;
+                    });
+                }
+            });
+
+            listEl.innerHTML = h;
+        }
+    },
+    openWechatChat(id) {
+        this.currentChatId = id;
+        const data = G.chatHistory[id];
+        const el = document.getElementById('wechatChatPage');
+        el.innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.backToWechatList()">←</span><span class="title">${id}</span><span class="back-btn" style="margin-left:auto" onclick="App.UI.showChatOptions()">⋮</span></div>
+        <div class="chat-messages" id="wechatChatMsgs"></div>
+        <div class="wechat-input-bar">
+            <button class="wechat-plus-btn" onclick="App.UI.showWechatPlusMenu()">+</button>
+            <input id="wechatInput" placeholder="输入消息..." onkeydown="if(event.key==='Enter')App.UI.sendWechat()">
+            <button class="send-btn" onclick="App.UI.sendWechat()">发送</button>
+        </div>`;
+        this.renderWechatMessages();
+        this.showPage('wechatChatPage');
+    },
+    showWechatPlusMenu() {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = `
+            position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;
+            display:flex;align-items:flex-end;justify-content:center;
+        `;
+        
+        const menu = document.createElement('div');
+        menu.className = 'wechat-plus-menu';
+        menu.style.cssText = `
+            background:#fff;border-radius:12px;padding:8px;width:calc(100% - 60px);max-width:360px;box-sizing:border-box;
+            max-height:40vh;overflow-y:auto;margin-bottom:50px;
+        `;
+        
+        menu.innerHTML = `
+            <div style="text-align:center;font-size:11px;color:#999;margin-bottom:8px">更多功能</div>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:0 4px">
+                <div class="wechat-plus-item" onclick="App.UI.showTransferModal();this.closest('.modal-overlay').remove()">
+                    <div class="wechat-plus-icon" style="width:36px;height:36px;font-size:16px">💰</div>
+                    <div class="wechat-plus-label" style="font-size:11px">转账</div>
+                </div>
+                <div class="wechat-plus-item" onclick="App.UI.showGiftModal();this.closest('.modal-overlay').remove()">
+                    <div class="wechat-plus-icon" style="width:36px;height:36px;font-size:16px">🎁</div>
+                    <div class="wechat-plus-label" style="font-size:11px">礼物</div>
+                </div>
+                <div class="wechat-plus-item" onclick="App.UI.showMealModal();this.closest('.modal-overlay').remove()">
+                    <div class="wechat-plus-icon" style="width:36px;height:36px;font-size:16px">🍽️</div>
+                    <div class="wechat-plus-label" style="font-size:11px">请吃饭</div>
+                </div>
+                <div class="wechat-plus-item" onclick="App.UI.showBirthdayModal();this.closest('.modal-overlay').remove()">
+                    <div class="wechat-plus-icon" style="width:36px;height:36px;font-size:16px">🎂</div>
+                    <div class="wechat-plus-label" style="font-size:11px">过生日</div>
+                </div>
+                <div class="wechat-plus-item" onclick="App.UI.showHangoutModal();this.closest('.modal-overlay').remove()">
+                    <div class="wechat-plus-icon" style="width:36px;height:36px;font-size:16px">🚶</div>
+                    <div class="wechat-plus-label" style="font-size:11px">出去玩</div>
+                </div>
+                <div class="wechat-plus-item" onclick="App.UI.showPhotoModal();this.closest('.modal-overlay').remove()">
+                    <div class="wechat-plus-icon" style="width:36px;height:36px;font-size:16px">📷</div>
+                    <div class="wechat-plus-label" style="font-size:11px">照片</div>
+                </div>
+            </div>
+            <button onclick="this.closest('.modal-overlay').remove()" 
+                    style="width:100%;margin-top:8px;padding:8px;border:none;background:#f5f5f5;color:#333;font-size:12px;box-sizing:border-box;border-radius:6px">
+                取消
+            </button>
+        `;
+        
+        overlay.appendChild(menu);
+        document.body.appendChild(overlay);
+        
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                overlay.remove();
+            }
+        });
+    },
+    showHangoutModal() {
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
+            <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">🚶 邀请出去玩</div>
+            <div style="font-size:12px;color:#666;margin-bottom:8px">选择地点</div>
+            <select id="hangoutPlace" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;margin-bottom:12px">
+                <option value="park">公园散步</option>
+                <option value="cafe">咖啡厅聊天</option>
+                <option value="shopping">逛街购物</option>
+                <option value="movie">看电影</option>
+                <option value="dinner">一起晚餐</option>
+            </select>
+            <div style="font-size:12px;color:#666;margin-bottom:8px">留言</div>
+            <input type="text" id="hangoutNote" placeholder="想和你一起去..." style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;margin-bottom:16px;box-sizing:border-box">
+            <div style="display:flex;gap:8px">
+                <button style="flex:1;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
+                <button style="flex:1;padding:10px;border:none;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;border-radius:8px" onclick="App.UI.sendHangout()">发送邀请</button>
+            </div>
+        </div>`;
+        document.body.appendChild(modal);
+    },
+    sendHangout() {
+        const place = document.getElementById('hangoutPlace')?.value;
+        const note = document.getElementById('hangoutNote')?.value || '一起出去玩吧！';
+        
+        const placeNames = {
+            park: '公园散步',
+            cafe: '咖啡厅聊天',
+            shopping: '逛街购物',
+            movie: '看电影',
+            dinner: '一起晚餐'
+        };
+        
+        const message = `🚶 邀请你去${placeNames[place] || place}~ ${note}`;
+        this.sendWechat(message);
+        document.querySelector('.modal-overlay')?.remove();
+        
+        const affGain = Math.floor(Math.random() * 5) + 3;
+        G.memberAffection[this.currentChatId] = Math.min(100, (G.memberAffection[this.currentChatId] || 50) + affGain);
+        App.Store.updateStats({mood: 5});
+        this.showNotification(`好感度 +${affGain}`);
+    },
+    showChatOptions() {
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:flex-end';
+        modal.innerHTML = `<div style="background:#fff;width:100%;border-radius:16px 16px 0 0;padding:16px">
+            <div style="text-align:center;font-size:14px;color:#999;margin-bottom:16px">和 ${this.currentChatId} 的聊天</div>
+            <button style="width:100%;padding:12px;border:none;background:#f5f5f5;border-radius:8px;margin-bottom:8px" onclick="App.UI.clearChatHistory();this.closest('.modal-overlay').remove()">🗑️ 清空聊天记录</button>
+            <button style="width:100%;padding:12px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
+        </div>`;
+        document.body.appendChild(modal);
+        modal.addEventListener('click', (e) => { if(e.target === modal) modal.remove(); });
+    },
+    clearChatHistory() {
+        if (G.chatHistory[this.currentChatId]) {
+            G.chatHistory[this.currentChatId].messages = [];
+            this.renderWechatMessages();
+            this.showNotification('聊天记录已清空');
+        }
+    },
+    showTransferModal() {
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
+            <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">💰 微信转账</div>
+            <div style="font-size:12px;color:#666;margin-bottom:8px">转账金额 (元)</div>
+            <input type="number" id="transferAmount" placeholder="请输入金额" min="1" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;margin-bottom:12px;box-sizing:border-box">
+            <div style="font-size:12px;color:#666;margin-bottom:8px">给对方留言</div>
+            <input type="text" id="transferNote" placeholder="随便说点什么" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;margin-bottom:16px;box-sizing:border-box">
+            <div style="display:flex;gap:8px">
+                <button style="flex:1;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
+                <button style="flex:1;padding:10px;border:none;background:#07c160;color:#fff;border-radius:8px" onclick="App.UI.sendTransfer()">转账</button>
+            </div>
+        </div>`;
+        document.body.appendChild(modal);
+    },
+    sendTransfer() {
+        const amount = parseInt(document.getElementById('transferAmount')?.value);
+        const note = document.getElementById('transferNote')?.value || '给你转账了';
+        if (!amount || amount < 1) { this.showNotification('请输入有效金额'); return; }
+        if (G.stats.wechatBalance < amount) { this.showNotification('余额不足'); return; }
+        App.Store.updateStats({wechatBalance:-amount});
+        const affGain = Math.floor(amount / 10);
+        G.memberAffection[this.currentChatId] = (G.memberAffection[this.currentChatId]||50) + affGain;
+        const msg = {from:'player',text:`💰 转账 ¥${amount}`,transfer:amount,time:getTimeStr()};
+        if (!G.chatHistory[this.currentChatId]) G.chatHistory[this.currentChatId] = {type:'member',avatar:'👤',messages:[]};
+        G.chatHistory[this.currentChatId].messages.push(msg);
+        document.querySelector('.modal-overlay')?.remove();
+        this.renderWechatMessages();
+        const replies = amount >= 500 ? ['谢谢大佬！太豪气了！','姐姐最好了！','爱你！❤️'] : amount >= 200 ? ['谢谢姐姐！','太好了~','感激不尽'] : ['谢谢~','收到啦','谢谢姐姐(*^▽^*)'];
+        setTimeout(() => {
+            G.chatHistory[this.currentChatId].messages.push({from:'npc',text:pick(replies),time:getTimeStr()});
+            this.renderWechatMessages();
+        }, 800);
+        this.showNotification(`转账成功，好感+${affGain}`);
+        // 刷新好感度页面
+        const affectionPage = document.getElementById('affectionPage');
+        if (affectionPage && affectionPage.classList.contains('active')) {
+            this.renderAffection();
+        }
+    },
+    showPhotoModal() {
+        const photos = ['📸', '🌸', '🎤', '💄', '🎀', '✨', '🌟', '💖', '🎬', '📷'];
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        let photosHtml = photos.map(p => `<button style="width:60px;height:60px;font-size:32px;border:none;background:#f5f5f5;border-radius:8px;cursor:pointer" onclick="App.UI.sendPhoto('${p}')">${p}</button>`).join('');
+        modal.innerHTML = `<div style="background:#fff;width:320px;border-radius:16px;padding:20px">
+            <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">📷 发送图片</div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:16px">${photosHtml}</div>
+            <button style="width:100%;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
+        </div>`;
+        document.body.appendChild(modal);
+    },
+    sendPhoto(emoji) {
+        const msg = {from:'player',text:`${emoji} [图片]`,photo:emoji,time:getTimeStr()};
+        if (!G.chatHistory[this.currentChatId]) G.chatHistory[this.currentChatId] = {type:'member',avatar:'👤',messages:[]};
+        G.chatHistory[this.currentChatId].messages.push(msg);
+        document.querySelector('.modal-overlay')?.remove();
+        this.renderWechatMessages();
+    },
+    showMealModal() {
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
+            <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">🍽️ 请吃饭</div>
+            <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">
+                <button onclick="App.UI.inviteMealInChat('cheap')" style="padding:12px;background:#27ae60;color:#fff;border:none;border-radius:8px;cursor:pointer">快餐 ¥50 (好感+5)</button>
+                <button onclick="App.UI.inviteMealInChat('normal')" style="padding:12px;background:#3498db;color:#fff;border:none;border-radius:8px;cursor:pointer">餐厅 ¥200 (好感+15)</button>
+                <button onclick="App.UI.inviteMealInChat('expensive')" style="padding:12px;background:#e74c3c;color:#fff;border:none;border-radius:8px;cursor:pointer">豪华 ¥500 (好感+30)</button>
+            </div>
+            <button style="width:100%;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
+        </div>`;
+        document.body.appendChild(modal);
+    },
+    inviteMealInChat(level) {
+        const costs = {cheap:50, normal:200, expensive:500};
+        const cost = costs[level];
+        const member = this.currentChatId;
+        if (G.stats.wechatBalance < cost) { this.showNotification('余额不足'); return; }
+        App.Store.updateStats({wechatBalance:-cost, mood:3});
+        const affGain = level==='cheap'?5:level==='normal'?15:30;
+        G.memberAffection[member] = (G.memberAffection[member]||50) + affGain;
+        const msg = {from:'player',text:`🍽️ 请${member}吃了顿饭`,meal:level,cost,time:getTimeStr()};
+        if (!G.chatHistory[member]) G.chatHistory[member] = {type:'member',avatar:'👤',messages:[]};
+        G.chatHistory[member].messages.push(msg);
+        document.querySelector('.modal-overlay')?.remove();
+        this.renderWechatMessages();
+        const replies = level==='expensive'?['太豪华了！感动哭😭','姐姐我爱你！']:level==='normal'?['好吃！谢谢姐姐~','下次我请姐姐！']:['谢谢姐姐~','一起吃饭好开心！'];
+        setTimeout(() => {
+            G.chatHistory[member].messages.push({from:'npc',text:pick(replies),time:getTimeStr()});
+            this.renderWechatMessages();
+        }, 800);
+        this.showNotification(`和${member}一起吃了顿饭，好感+${affGain}`);
+        // 刷新好感度页面
+        const affectionPage = document.getElementById('affectionPage');
+        if (affectionPage && affectionPage.classList.contains('active')) {
+            this.renderAffection();
+        }
+    },
+    showBirthdayModal() {
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
+            <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">🎂 过生日</div>
+            <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">
+                <button onclick="App.UI.celebrateBirthdayInChat('small')" style="padding:12px;background:#9b59b6;color:#fff;border:none;border-radius:8px;cursor:pointer">小蛋糕 ¥100 (好感+10)</button>
+                <button onclick="App.UI.celebrateBirthdayInChat('medium')" style="padding:12px;background:#e74c3c;color:#fff;border:none;border-radius:8px;cursor:pointer">生日蛋糕 ¥300 (好感+25)</button>
+                <button onclick="App.UI.celebrateBirthdayInChat('big')" style="padding:12px;background:#c0392b;color:#fff;border:none;border-radius:8px;cursor:pointer">豪华派对 ¥800 (好感+50)</button>
+            </div>
+            <button style="width:100%;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
+        </div>`;
+        document.body.appendChild(modal);
+    },
+    celebrateBirthdayInChat(level) {
+        const costs = {small:100, medium:300, big:800};
+        const cost = costs[level];
+        const member = this.currentChatId;
+        if (G.stats.wechatBalance < cost) { this.showNotification('余额不足'); return; }
+        App.Store.updateStats({wechatBalance:-cost, mood:5});
+        const affGain = level==='small'?10:level==='medium'?25:50;
+        G.memberAffection[member] = (G.memberAffection[member]||50) + affGain;
+        const msg = {from:'player',text:`🎂 为${member}庆祝生日`,birthday:level,cost,time:getTimeStr()};
+        if (!G.chatHistory[member]) G.chatHistory[member] = {type:'member',avatar:'👤',messages:[]};
+        G.chatHistory[member].messages.push(msg);
+        document.querySelector('.modal-overlay')?.remove();
+        this.renderWechatMessages();
+        const replies = level==='big'?['生日派对太棒了！终身难忘！','这辈子最幸福的生日！']:level==='medium'?['蛋糕好漂亮！谢谢姐姐~','开心的生日！']:['谢谢姐姐记得我生日！','小小的蛋糕也超甜~'];
+        setTimeout(() => {
+            G.chatHistory[member].messages.push({from:'npc',text:pick(replies),time:getTimeStr()});
+            this.renderWechatMessages();
+        }, 800);
+        this.showNotification(`为${member}庆祝生日，好感+${affGain}`);
+        // 刷新好感度页面
+        const affectionPage = document.getElementById('affectionPage');
+        if (affectionPage && affectionPage.classList.contains('active')) {
+            this.renderAffection();
+        }
+    },
+    showGiftModal() {
+        const backpack = G.stats.backpack || {};
+        const items = Object.entries(backpack).filter(([_, count]) => count > 0);
+        const giftNames = {flower:'🌸 鲜花', perfume:'🌷 香水', bag:'👜 名牌包'};
+        const giftAff = {flower:8, perfume:20, bag:50};
+        
+        if (items.length === 0) {
+            this.showNotification('背包里没有礼物，请先购买');
+            return;
+        }
+        
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        
+        let itemsHtml = items.map(([id, count]) => 
+            `<button onclick="App.UI.sendGiftInChat('${id}')" style="padding:12px;background:#fff;border:1px solid #ddd;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:8px">
+                <span style="font-size:24px">${giftNames[id]?.split(' ')[0] || '🎁'}</span>
+                <span>${giftNames[id]?.split(' ')[1] || id}</span>
+                <span style="color:#999;font-size:12px">x${count}</span>
+                <span style="margin-left:auto;color:#27ae60;font-size:12px">好感+${giftAff[id]||0}</span>
+            </button>`
+        ).join('');
+        
+        modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
+            <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">🎁 赠送礼物</div>
+            <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">${itemsHtml}</div>
+            <button style="width:100%;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
+        </div>`;
+        document.body.appendChild(modal);
+    },
+    sendGiftInChat(type) {
+        const member = this.currentChatId;
+        const backpack = G.stats.backpack || {};
+        if (!backpack[type] || backpack[type] < 1) { this.showNotification('礼物不足'); return; }
+        
+        backpack[type]--;
+        if (backpack[type] <= 0) delete backpack[type];
+        
+        const giftNames = {flower:'🌸 鲜花', perfume:'🌷 香水', bag:'👜 名牌包'};
+        const affGain = {flower:8, perfume:20, bag:50};
+        G.memberAffection[member] = (G.memberAffection[member]||50) + affGain[type];
+        App.Store.updateStats({mood:2});
+        
+        const msg = {from:'player',text:`🎁 送给${member}一份${giftNames[type]}`,gift:type,time:getTimeStr()};
+        if (!G.chatHistory[member]) G.chatHistory[member] = {type:'member',avatar:'👤',messages:[]};
+        G.chatHistory[member].messages.push(msg);
+        document.querySelector('.modal-overlay')?.remove();
+        this.renderWechatMessages();
+        const replies = type==='bag'?['天哪！！名牌包！！姐姐我爱你！！']:type==='perfume'?['香水好香~谢谢姐姐','一直想要这个！']:['花好漂亮！','谢谢姐姐~'];
+        setTimeout(() => {
+            G.chatHistory[member].messages.push({from:'npc',text:pick(replies),time:getTimeStr()});
+            this.renderWechatMessages();
+        }, 800);
+        this.showNotification(`送给${member}一份礼物，好感+${affGain[type]}`);
+        // 刷新好感度页面
+        const affectionPage = document.getElementById('affectionPage');
+        if (affectionPage && affectionPage.classList.contains('active')) {
+            this.renderAffection();
+        }
+    },
+    startChatWithMember(name, groupKey) {
+        if (!G.chatHistory[name]) {
+            const groupData = App.NPCData[groupKey];
+            let avatar = '👤';
+            if (groupData?.agent?.name === name) avatar = groupData.agent.avatar;
+            else if (groupData?.core) {
+                const coreMember = groupData.core.find(c => c.name === name);
+                if (coreMember) avatar = coreMember.avatar;
+            }
+            G.chatHistory[name] = { type:'member', avatar, messages:[{from:'npc',text:'（你好呀！）',time:getTimeStr()}] };
+        }
+        this.openWechatChat(name);
+    },
+    backToWechatList() {
+        this.showPage('wechatPage');
+        this.renderWechatList();
+    },
+    renderWechatMessages() {
+        const data = G.chatHistory[this.currentChatId];
+        if (!data) return;
+        const container = document.getElementById('wechatChatMsgs');
+        let h = '';
+        data.messages.forEach(m => {
+            const isMe = m.from === 'me' || m.from === 'player';
+            h += `<div class="message ${isMe?'sent':'received'}"><div class="message-bubble">${m.text}</div></div>`;
+        });
+        container.innerHTML = h;
+        container.scrollTop = container.scrollHeight;
+    },
+    sendWechat() {
+        const input = document.getElementById('wechatInput');
+        const text = input.value.trim();
+        if (!text) return;
+        input.value = '';
+        const data = G.chatHistory[this.currentChatId];
+        data.messages.push({from:'player', text, time:getTimeStr()});
+        this.renderWechatMessages();
+        App.Sound.play('Msg');
+        const quality = evaluateReply(text);
+        App.Store.applyChatStress(quality);
+        const ctx = {npcType: data.type, personality: data.personality};
+        App.AI.reply(this.currentChatId, ctx, text).then(reply => {
+            data.messages.push({from:'npc', text:reply, time:getTimeStr()});
+            this.renderWechatMessages();
+            const aff = quality==='heartfelt'?3:quality==='normal'?1:-2;
+            if (!G.memberAffection[this.currentChatId]) G.memberAffection[this.currentChatId] = 50;
+            G.memberAffection[this.currentChatId] = clamp(G.memberAffection[this.currentChatId]+aff, 0, 100);
+            // 刷新好感度页面
+            const affectionPage = document.getElementById('affectionPage');
+            if (affectionPage && affectionPage.classList.contains('active')) {
+                this.renderAffection();
+            }
+        });
+    },
+    showWechatMoments() {
+        const grp = App.NPCData[G.player.group];
+        const memberPosts = [
+            {name:'小圆', emoji:'🎤', text:'今天排练好累但是很开心！新舞步终于拿下了💪', likes:23},
+            {name:'星星', emoji:'⭐', text:'粉丝们晚安~明天见！❤️', likes:45},
+            {name:'豆豆', emoji:'🌸', text:'吃到了好吃的蛋糕！甜甜的一天~', likes:31},
+            {name:'默默', emoji:'💫', text:'新歌的MV拍摄花絮，好期待播出呀！', likes:56},
+            {name:'小鱼', emoji:'🐟', text:'今天的公演圆满成功！谢谢大家的支持！', likes:78}
+        ];
+        
+        let h = '';
+        h += `<div style="padding:12px 16px;background:#fff;display:flex;align-items:center;gap:10px;cursor:pointer;border-bottom:1px solid #f0f0f0" onclick="App.UI.openPostMoment()">
+            <div style="width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#ff69b4,#ff1493);display:flex;align-items:center;justify-content:center;font-size:18px;color:#fff">${G.player.personalityEmoji||'✏️'}</div>
+            <div style="color:#999;font-size:14px">分享你的心情...</div>
+        </div>`;
+        
+        const allPosts = [
+            {name:G.player.name, emoji:G.player.personalityEmoji||'🎤', text:`${G.player.name}：${G.moments[G.moments.length-1]?.text || '今天也要加油！'}`, likes:G.moments[G.moments.length-1]?.likes || 0, isMe:true, time:G.moments[G.moments.length-1]?.time || ''},
+            ...memberPosts.map(p => ({...p, isMe:false}))
+        ];
+        
+        allPosts.forEach(m => {
+            h += `<div class="moment-item" style="${m.isMe?'border-left:3px solid #ff69b4':''}">
+                <div class="moment-header">
+                    <span style="font-size:20px">${m.emoji}</span>
+                    <span class="moment-user">${m.name}</span>
+                    <span style="font-size:11px;color:#bbb;margin-left:auto">${m.time||''}</span>
+                </div>
+                <div class="moment-content">${m.text}</div>
+                <div class="moment-actions">
+                    <span class="moment-action" onclick="App.UI.likeMoment(this)" data-likes="${m.likes}">❤️ ${m.likes}</span>
+                    <span class="moment-action">💬 评论</span>
+                </div>
+            </div>`;
+        });
+        
+        document.getElementById('wechatMomentsPage').innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('wechat')">←</span><span class="title">朋友圈</span></div><div style="flex:1;overflow-y:auto;background:#f5f5f5">${h||'<div class="empty-hint">暂无动态</div>'}</div>`;
+        this.showPage('wechatMomentsPage');
+    },
+    likeMoment(el) {
+        const likes = parseInt(el.dataset.likes || 0) + 1;
+        el.dataset.likes = likes;
+        el.innerHTML = `❤️ ${likes}`;
+        App.Store.updateStats({popularity:1});
+    },
+    openPostMoment() {
+        document.getElementById('postMomentPage').innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.showWechatMoments()">←</span><span class="title">发朋友圈</span></div>
+        <div style="padding:16px;background:#fff">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+                <span style="font-size:24px">${G.player.personalityEmoji||'🎤'}</span>
+                <span style="font-weight:600">${G.player.name}</span>
+            </div>
+            <textarea id="momentInput" placeholder="分享你的心情..." style="width:100%;min-height:120px;padding:12px;border:1px solid #ddd;border-radius:8px;font-size:14px;resize:none;box-sizing:border-box"></textarea>
+            <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+                <button onclick="App.UI.submitMomentWithEmoji('😊')" style="padding:6px 12px;background:#f5f5f5;border:none;border-radius:16px;font-size:14px;cursor:pointer">😊</button>
+                <button onclick="App.UI.submitMomentWithEmoji('❤️')" style="padding:6px 12px;background:#f5f5f5;border:none;border-radius:16px;font-size:14px;cursor:pointer">❤️</button>
+                <button onclick="App.UI.submitMomentWithEmoji('🎤')" style="padding:6px 12px;background:#f5f5f5;border:none;border-radius:16px;font-size:14px;cursor:pointer">🎤</button>
+                <button onclick="App.UI.submitMomentWithEmoji('🌟')" style="padding:6px 12px;background:#f5f5f5;border:none;border-radius:16px;font-size:14px;cursor:pointer">🌟</button>
+                <button onclick="App.UI.submitMomentWithEmoji('💪')" style="padding:6px 12px;background:#f5f5f5;border:none;border-radius:16px;font-size:14px;cursor:pointer">💪</button>
+            </div>
+            <button onclick="App.UI.submitMoment()" style="width:100%;padding:12px;margin-top:16px;background:linear-gradient(135deg,#07c160,#05a050);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer">发布</button>
+        </div>`;
+        this.showPage('postMomentPage');
+    },
+    submitMoment() {
+        const text = document.getElementById('momentInput')?.value.trim();
+        if (!text) { this.showNotification('请输入内容'); return; }
+        G.moments.push({text, likes:0, emoji:G.player.personalityEmoji, time:getTimeStr()});
+        App.Store.updateStats({popularity:2,mood:3});
+        this.showNotification('朋友圈发布成功！');
+        this.showWechatMoments();
+    },
+    submitMomentWithEmoji(emoji) {
+        const input = document.getElementById('momentInput');
+        input.value += emoji;
+    },
+
+    // ---------- 微博 ----------
+    renderWeibo() {
+        document.getElementById('weiboPage').innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">微博</span></div>
+        <div class="tab-bar"><div class="tab active" onclick="App.UI.renderWeiboHot()">热搜</div><div class="tab" onclick="App.UI.renderWeiboMy()">我的</div><div class="tab" onclick="App.UI.renderWeiboPost()">发微博</div></div>
+        <div id="weiboContent" style="flex:1;overflow-y:auto"></div>`;
+        this.renderWeiboHot();
+    },
+    renderWeiboHot() {
+        const followers = G.game.weibo_followers;
+        const topics = ['#SNH48总选举#','#最佳拍档#','#偶像运动会#','#新公演直拍#','#口袋48直播#',`#${G.player.name}相关话题#`];
+        let h = `<div style="padding:12px 16px;background:#fff;display:flex;justify-content:space-between;font-size:13px"><span>👥 粉丝：${followers}</span><span>📝 我的微博：${G.weiboPosts.length}条</span></div>
+        <div style="padding:12px 16px;font-weight:600;background:#fff">🔥 微博热搜</div>`;
+        topics.forEach((t,i) => {
+            h += `<div class="hot-item"><span class="hot-rank${i<3?' top3':''}">${i+1}</span><span class="hot-title">${t}</span></div>`;
+        });
+        const grp = App.NPCData[G.player.group];
+        if (grp) {
+            const members = [...grp.core, ...Object.values(grp.teams||{}).flat()].slice(0,5);
+            h += `<div style="padding:12px 16px;font-weight:600;background:#fff;border-top:8px solid #f5f5f5">📰 成员微博</div>`;
+            members.forEach(m => {
+                const name = typeof m === 'string' ? m : m.name;
+                h += `<div class="weibo-item"><div class="weibo-header"><span>👤</span><span class="weibo-name">${name}</span></div><div class="weibo-text">${pick(['今天排练好累~','新歌超好听！','粉丝们晚安🌙','吃到了好吃的火锅','明天公演加油💪'])}</div><div class="weibo-stats"><span>❤️ ${randInt(50,500)}</span></div></div>`;
+            });
+        }
+        document.getElementById('weiboContent').innerHTML = h;
+    },
+    renderWeiboMy() {
+        let h = '';
+        if (G.weiboPosts.length===0) h = '<div class="empty-hint">还没有发过微博</div>';
+        else G.weiboPosts.slice().reverse().forEach(p => {
+            h += `<div class="weibo-item"><div class="weibo-header"><span>${G.player.personalityEmoji}</span><span class="weibo-name">${G.player.name}</span></div><div class="weibo-text">${p.text}</div><div class="weibo-stats"><span>❤️ ${p.likes}</span></div></div>`;
+        });
+        document.getElementById('weiboContent').innerHTML = h;
+    },
+    renderWeiboPost() {
+        let optionsHtml = '';
+        if (G.stats.scandal > 0) {
+            optionsHtml = `
+                <div style="margin-bottom:12px">
+                    <button class="clarify-btn" onclick="App.UI.showClarifyForm()" style="width:100%;padding:10px;background:#ffc107;color:#333;border:none;border-radius:8px;font-size:14px;cursor:pointer">📢 发布澄清微博（减少绯闻）</button>
+                </div>
+                <div id="clarifyForm" style="display:none;margin-bottom:12px;padding:12px;background:#fff3cd;border-radius:8px">
+                    <textarea id="clarifyInput" placeholder="输入澄清内容..." style="width:100%;padding:8px;border:1px solid #ffc107;border-radius:4px;margin-bottom:8px;min-height:60px"></textarea>
+                    <button class="post-btn" onclick="App.UI.submitClarify()">发布澄清</button>
+                </div>
+                <div style="text-align:center;color:#666;margin:8px 0">— 或者发布普通微博 —</div>
+            `;
+        }
+        document.getElementById('weiboContent').innerHTML = `<div class="post-area">${optionsHtml}<textarea id="weiboInput" placeholder="分享你的动态..."></textarea><button class="post-btn" onclick="App.UI.submitWeibo()">发布</button></div>`;
+    },
+    showClarifyForm() {
+        const form = document.getElementById('clarifyForm');
+        form.style.display = form.style.display === 'none' ? 'block' : 'none';
+    },
+    submitClarify() {
+        const text = document.getElementById('clarifyInput')?.value.trim();
+        if (!text) return;
+        const scandalReduction = Math.min(G.stats.scandal, randInt(10, 20));
+        G.weiboPosts.push({text:'📢 [澄清] ' + text, likes:randInt(100,500), time:getTimeStr(), isClarify:true});
+        G.game.weibo_followers += randInt(50,200);
+        App.Store.updateStats({scandal:-scandalReduction,popularity:2,starlight:2});
+        this.showNotification(`澄清微博发布成功！📸 绯闻值 -${scandalReduction}`);
+        this.renderWeiboHot();
+    },
+    submitWeibo() {
+        const text = document.getElementById('weiboInput')?.value.trim();
+        if (!text) return;
+        G.weiboPosts.push({text, likes:randInt(10,200), time:getTimeStr()});
+        G.game.weibo_followers += randInt(5,50);
+        App.Store.updateStats({popularity:1,starlight:1});
+        this.showNotification('微博发布成功！👥 +粉丝');
+        this.renderWeiboHot();
+    },
+
+    // ---------- 短信 ----------
+    renderSms() {
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">短信</span></div><div style="flex:1;overflow-y:auto">`;
+        G.smsMessages.forEach((m,i) => {
+            const replyHtml = !m.replied ? `<div class="sms-reply"><input id="smsReply${i}" placeholder="回复..."><button onclick="App.UI.replySms(${i})">发送</button></div>` : `<div style="font-size:11px;color:#aaa">已回复：${m.reply}</div>`;
+            h += `<div class="sms-item"><div class="sms-avatar">${m.avatar||'📱'}</div><div class="sms-content"><div class="sms-sender">${m.from}</div><div class="sms-text">${m.text}</div>${replyHtml}</div></div>`;
+        });
+        if (G.smsMessages.length === 0) h += '<div class="empty-hint">暂无短信</div>';
+        h += '</div>';
+        document.getElementById('smsPage').innerHTML = h;
+    },
+    replySms(idx) {
+        const input = document.getElementById('smsReply'+idx);
+        const text = input?.value.trim();
+        if (!text) return;
+        G.smsMessages[idx].reply = text;
+        G.smsMessages[idx].replied = true;
+        const quality = evaluateReply(text);
+        App.Store.updateStats({mood:quality==='heartfelt'?2:quality==='perfunctory'?-1:0});
+        this.showNotification('短信已发送');
+        this.renderSms();
+    },
+
+    // ---------- 电话 ----------
+    renderPhone() {
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">📞 电话</span></div>
+        <div style="flex:1;display:flex;flex-direction:column;background:#f9f9f9">
+            <div class="phone-tabs">
+                <div class="phone-tab active" onclick="App.UI.switchPhoneTab('history')">📋 通话记录</div>
+                <div class="phone-tab" onclick="App.UI.switchPhoneTab('dial')">🔢 拨号</div>
+            </div>
+            <div class="phone-content" id="phoneContent">`;
+        
+        h += this.renderCallHistory();
+        
+        h += `</div></div>`;
+        document.getElementById('callPage').innerHTML = h;
+    },
+    renderCallHistory() {
+        let h = `<div class="call-history">`;
+        if (G.callHistory.length === 0) {
+            h += `<div class="call-history-empty">暂无通话记录</div>`;
+        } else {
+            G.callHistory.forEach((call, idx) => {
+                const phoneNum = call.phone || '123****4567';
+                const isMissed = !call.answered && call.isIncoming;
+                const isIncoming = call.isIncoming;
+                const callTypeIcon = isIncoming ? '⬇️' : '⬆️';
+                const callTypeColor = isIncoming ? '#07c160' : '#ff9500';
+                const callTypeText = isIncoming ? '打入' : '打出';
+                h += `<div class="call-history-item" onclick="App.UI.initiateCall('${call.name}','${call.type||'member'}')">
+                    <div class="call-history-avatar" style="position:relative">${call.avatar||'👤'}<span style="position:absolute;bottom:-2px;right:-2px;font-size:10px">${callTypeIcon}</span></div>
+                    <div class="call-history-info">
+                        <div class="call-history-name" style="color:${isMissed?'#ff3b30':'#000'}">${call.name}</div>
+                        <div class="call-history-phone" style="display:flex;align-items:center;gap:4px"><span style="font-size:10px;color:${callTypeColor};background:${isIncoming?'#e8f5e9':'#fff3e0'};padding:1px 4px;border-radius:4px">${callTypeText}</span>${phoneNum}</div>
+                    </div>
+                    <div class="call-history-time">${call.time}</div>
+                </div>`;
+            });
+        }
+        h += `</div>`;
+        return h;
+    },
+    renderDialPad() {
+        let h = `<div class="dial-pad-container">
+            <div class="dial-number-display" id="dialNumber"></div>
+            <div class="dial-grid">
+                <button class="dial-btn" onclick="App.UI.addDialNumber('1')">
+                    <span class="dial-btn-number">1</span>
+                </button>
+                <button class="dial-btn" onclick="App.UI.addDialNumber('2')">
+                    <span class="dial-btn-number">2</span>
+                    <span class="dial-btn-letters">ABC</span>
+                </button>
+                <button class="dial-btn" onclick="App.UI.addDialNumber('3')">
+                    <span class="dial-btn-number">3</span>
+                    <span class="dial-btn-letters">DEF</span>
+                </button>
+                <button class="dial-btn" onclick="App.UI.addDialNumber('4')">
+                    <span class="dial-btn-number">4</span>
+                    <span class="dial-btn-letters">GHI</span>
+                </button>
+                <button class="dial-btn" onclick="App.UI.addDialNumber('5')">
+                    <span class="dial-btn-number">5</span>
+                    <span class="dial-btn-letters">JKL</span>
+                </button>
+                <button class="dial-btn" onclick="App.UI.addDialNumber('6')">
+                    <span class="dial-btn-number">6</span>
+                    <span class="dial-btn-letters">MNO</span>
+                </button>
+                <button class="dial-btn" onclick="App.UI.addDialNumber('7')">
+                    <span class="dial-btn-number">7</span>
+                    <span class="dial-btn-letters">PQRS</span>
+                </button>
+                <button class="dial-btn" onclick="App.UI.addDialNumber('8')">
+                    <span class="dial-btn-number">8</span>
+                    <span class="dial-btn-letters">TUV</span>
+                </button>
+                <button class="dial-btn" onclick="App.UI.addDialNumber('9')">
+                    <span class="dial-btn-number">9</span>
+                    <span class="dial-btn-letters">WXYZ</span>
+                </button>
+                <button class="dial-btn dial-btn-empty"></button>
+                <button class="dial-btn" onclick="App.UI.addDialNumber('0')">
+                    <span class="dial-btn-number">0</span>
+                    <span class="dial-btn-letters">+</span>
+                </button>
+                <button class="dial-btn dial-btn-backspace" onclick="App.UI.backspaceDial()">⌫</button>
+            </div>
+            <div class="dial-call-btn" onclick="App.UI.makeCall()">
+                <div class="dial-call-icon">📞</div>
+            </div>
+        </div>`;
+        return h;
+    },
+    switchPhoneTab(tab) {
+        const tabs = document.querySelectorAll('.phone-tab');
+        tabs.forEach(t => t.classList.remove('active'));
+        
+        const content = document.getElementById('phoneContent');
+        if (tab === 'history') {
+            document.querySelector('.phone-tab:nth-child(1)').classList.add('active');
+            content.innerHTML = this.renderCallHistory();
+        } else {
+            document.querySelector('.phone-tab:nth-child(2)').classList.add('active');
+            content.innerHTML = this.renderDialPad();
+        }
+    },
+    addDialNumber(num) {
+        const el = document.getElementById('dialNumber');
+        if (el && el.textContent.length < 11) {
+            el.textContent += num;
+        }
+    },
+    backspaceDial() {
+        const el = document.getElementById('dialNumber');
+        if (el) {
+            el.textContent = el.textContent.slice(0, -1);
+        }
+    },
+    clearDial() {
+        const el = document.getElementById('dialNumber');
+        if (el) {
+            el.textContent = '';
+        }
+    },
+    makeCall() {
+        const el = document.getElementById('dialNumber');
+        const num = el?.textContent;
+        if (!num || num.length < 7) {
+            this.showNotification('请输入有效的号码');
+            return;
+        }
+        const maskedPhone = num.substring(0, 3) + '****' + num.substring(num.length - 4);
+        this.showNotification('正在拨号...');
+        this.currentCallNpc = {name:'未知号码', avatar:'❓', type:'unknown', phone:maskedPhone};
+        this.isOutgoingCall = true;
+        const callEl = document.getElementById('callPage');
+        callEl.innerHTML = `<div class="call-screen"><div class="caller-avatar">❓</div><div class="caller-name">${maskedPhone}</div><div class="caller-status">正在呼叫...</div><div class="call-actions"><button class="call-btn reject" onclick="App.UI.cancelOutgoingCall()">📵</button></div></div>`;
+        setTimeout(() => {
+            const isAnswered = Math.random() > 0.3;
+            if (isAnswered) {
+                const c = this.currentCallNpc;
+                document.getElementById('callChatPage').innerHTML = `<div class="app-header" style="background:#2d2d2d;border-color:#444"><span class="back-btn" style="color:#ff69b4" onclick="App.UI.endCall()">结束</span><span class="title" style="color:#fff">通话中 · ${maskedPhone}</span></div>
+                <div class="chat-messages" id="callChatMsgs" style="background:#1a1a2e"><div class="message received"><div class="message-bubble">${maskedPhone}：喂？</div></div></div>
+                <div class="call-input-bar"><input id="callInput" placeholder="说话..."><button class="send-btn" onclick="App.UI.sendCall()">说</button></div>`;
+                this.showPage('callChatPage');
+                this.addCallRecord(maskedPhone, '❓', 'unknown', maskedPhone, true, false);
+            } else {
+                const c = this.currentCallNpc;
+                document.getElementById('callChatPage').innerHTML = `<div class="app-header" style="background:#2d2d2d;border-color:#444"><span class="back-btn" style="color:#ff69b4" onclick="App.UI.goBackFromMissedCall()">返回</span><span class="title" style="color:#fff">通话中 · ${maskedPhone}</span></div>
+                <div class="chat-messages" id="callChatMsgs" style="background:#1a1a2e"><div class="message system" style="justify-content:center"><div class="message-bubble" style="background:#333;color:#888;font-size:12px;max-width:80%;text-align:center">${maskedPhone} 未接听您的电话</div></div></div>
+                <div class="call-input-bar"><input id="callInput" placeholder="说话..."><button class="send-btn" onclick="App.UI.sendCall()">说</button></div>`;
+                this.showPage('callChatPage');
+                this.addCallRecord(maskedPhone, '❓', 'unknown', maskedPhone, false, false);
+                this.isOutgoingCall = false;
+            }
+        }, 3000);
+    },
+    generateMaskedPhone() {
+        const prefix = String(Math.floor(Math.random() * 900) + 100);
+        const suffix = String(Math.floor(Math.random() * 9000) + 1000);
+        return prefix + '****' + suffix;
+    },
+    initiateCall(name, type) {
+        const grp = App.NPCData[G.player.group];
+        let caller = {name, avatar:'👤', type:type||'member'};
+        if (type === 'agent' && grp?.agent) {
+            caller = {...grp.agent, type:'agent'};
+        } else if (grp?.core) {
+            const found = grp.core.find(c => c.name === name);
+            if (found) caller = {...found, type:'member'};
+        }
+        caller.phone = this.generateMaskedPhone();
+        this.currentCallNpc = caller;
+        this.isOutgoingCall = true;
+        const callEl = document.getElementById('callPage');
+        callEl.innerHTML = `<div class="call-screen"><div class="caller-avatar">${caller.avatar}</div><div class="caller-name">${caller.name}</div><div class="caller-status">正在呼叫...</div><div class="call-actions"><button class="call-btn reject" onclick="App.UI.cancelOutgoingCall()">📵</button></div></div>`;
+        setTimeout(() => {
+            const isAnswered = Math.random() > 0.3;
+            if (isAnswered) {
+                const c = caller;
+                document.getElementById('callChatPage').innerHTML = `<div class="app-header" style="background:#2d2d2d;border-color:#444"><span class="back-btn" style="color:#ff69b4" onclick="App.UI.endCall()">结束</span><span class="title" style="color:#fff">通话中 · ${c.name}</span></div>
+                <div class="chat-messages" id="callChatMsgs" style="background:#1a1a2e"><div class="message received"><div class="message-bubble">${c.name}：喂？</div></div></div>
+                <div class="call-input-bar"><input id="callInput" placeholder="说话..."><button class="send-btn" onclick="App.UI.sendCall()">说</button></div>`;
+                this.showPage('callChatPage');
+                this.addCallRecord(caller.name, caller.avatar, caller.type, caller.phone || '123****4567', true, false);
+                App.Store.updateStats({affection:1});
+            } else {
+                const c = caller;
+                document.getElementById('callChatPage').innerHTML = `<div class="app-header" style="background:#2d2d2d;border-color:#444"><span class="back-btn" style="color:#ff69b4" onclick="App.UI.goBackFromMissedCall()">返回</span><span class="title" style="color:#fff">通话中 · ${c.name}</span></div>
+                <div class="chat-messages" id="callChatMsgs" style="background:#1a1a2e"><div class="message system" style="justify-content:center"><div class="message-bubble" style="background:#333;color:#888;font-size:12px;max-width:80%;text-align:center">${c.name} 未接听您的电话</div></div></div>
+                <div class="call-input-bar"><input id="callInput" placeholder="说话..."><button class="send-btn" onclick="App.UI.sendCall()">说</button></div>`;
+                this.showPage('callChatPage');
+                this.addCallRecord(caller.name, caller.avatar, caller.type, caller.phone || '123****4567', false, false);
+                this.isOutgoingCall = false;
+            }
+        }, 2000);
+    },
+    cancelOutgoingCall() {
+        const c = this.currentCallNpc;
+        this.addCallRecord(c?.name || '未知', c?.avatar || '❓', c?.type || 'unknown', c?.phone || '123****4567', false, false);
+        this.isOutgoingCall = false;
+        this.currentCallNpc = null;
+        this.renderPhone();
+    },
+    addCallRecord(name, avatar, type, phone, answered, isIncoming) {
+        const now = new Date();
+        const time = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`;
+        G.callHistory.unshift({name, avatar, type, phone, answered, time, isIncoming});
+        if (G.callHistory.length > 20) G.callHistory.pop();
+    },
+    triggerCall() {
+        const grp = App.NPCData[G.player.group];
+        if (!grp) return;
+        const callers = [grp.agent, ...grp.core];
+        const c = pick(callers);
+        c.phone = this.generateMaskedPhone();
+        this.currentCallNpc = c;
+        const el = document.getElementById('callPage');
+        el.innerHTML = `<div class="call-screen"><div class="caller-avatar">${c.avatar}</div><div class="caller-name">${c.name}</div><div class="caller-status">来电中...</div><div class="call-actions"><button class="call-btn accept" onclick="App.UI.acceptCall()">📞</button><button class="call-btn reject" onclick="App.UI.rejectCall()">📵</button></div></div>`;
+        this.showPage('callPage');
+        App.Sound.play('Call');
+    },
+    receiveRandomCall() {
+        if (this.incomingCall) return;
+        const grp = App.NPCData[G.player.group];
+        const allMembers = grp ? [...Object.values(grp.teams||{}).flat()] : [];
+        const callerPool = [
+            ...(grp?.agent ? [{name:grp.agent.name, avatar:grp.agent.avatar, type:'agent', personality:grp.agent.personality}] : []),
+            ...(grp?.core || []).map(c => ({...c, type:'member'})),
+            ...allMembers.map(name => ({name, avatar:'👤', type:'member'})),
+            {name:'私生粉', avatar:'👁️', type:'stalker'},
+            {name:'私生粉', avatar:'👁️', type:'stalker'},
+            {name:'黑粉', avatar:'💀', type:'hater'},
+            {name:'黑粉', avatar:'💀', type:'hater'},
+            {name:'狂热粉', avatar:'🔥', type:'fanatic'},
+            {name:'狂热粉', avatar:'🔥', type:'fanatic'}
+        ];
+        const caller = pick(callerPool);
+        caller.phone = this.generateMaskedPhone();
+        this.incomingCall = caller;
+        this.currentCallNpc = caller;
+        App.Sound.play('Call');
+        this.showCallPopup(caller);
+    },
+    showCallPopup(caller) {
+        const container = document.getElementById('phoneNotifContainer');
+        if (!container) return;
+        const pop = document.createElement('div');
+        pop.className = 'phone-notif-item';
+        pop.style.background = 'linear-gradient(135deg,#2d2d2d,#1a1a1a)';
+        pop.style.color = '#fff';
+        pop.innerHTML = `<div class="phone-notif-icon" style="font-size:32px">${caller.avatar}</div><div class="phone-notif-body"><div class="phone-notif-app" style="color:#ff69b4">📞 来电</div><div class="phone-notif-title" style="color:#fff">${caller.name}</div><div class="phone-notif-text" style="color:#aaa">来电中...</div></div><div style="display:flex;gap:6px"><button class="phone-notif-btn" style="background:#07c160;color:#fff;border:none;padding:6px 12px;border-radius:20px;font-size:12px" onclick="App.UI.acceptCallFromPopup()">接听</button><button class="phone-notif-btn" style="background:#ff4757;color:#fff;border:none;padding:6px 12px;border-radius:20px;font-size:12px" onclick="App.UI.rejectCallFromPopup()">拒绝</button></div>`;
+        container.appendChild(pop);
+        setTimeout(() => pop.classList.add('show'), 10);
+        this.callPopupElement = pop;
+    },
+    acceptCallFromPopup() {
+        if (this.callPopupElement) { this.callPopupElement.remove(); this.callPopupElement = null; }
+        this.incomingCall = null;
+        const c = this.currentCallNpc;
+        if (!c) return;
+        let greeting = '喂？';
+        if (c.type === 'agent' && c.personality) greeting = '有什么事吗？';
+        else if (c.type === 'member' || c.type === 'sweet') greeting = pick(['姐姐~在干嘛呀？','姐姐你好！','你好呀姐姐！']);
+        else if (c.type === 'sister') greeting = '有件事想跟你聊聊。';
+        else if (c.type === 'rival') greeting = '下次公演我可不会输。';
+        else if (c.type === 'stalker') greeting = '终于打通你电话了...（私生粉）';
+        else if (c.type === 'hater') greeting = pick(['哼，你有什么事？','说吧，我听着呢。']);
+        else if (c.type === 'fanatic') greeting = pick(['姐姐！！终于跟你通上电话了！！','天哪！是你吗姐姐！！']);
+        else if (c.type === 'fan') greeting = pick(['你好！我是你的粉丝！','偶像大人好！我是粉丝！']);
+        document.getElementById('callChatPage').innerHTML = `<div class="app-header" style="background:#2d2d2d;border-color:#444"><span class="back-btn" style="color:#ff69b4" onclick="App.UI.endCall()">结束</span><span class="title" style="color:#fff">通话中 · ${c.name}</span></div>
+        <div class="chat-messages" id="callChatMsgs" style="background:#1a1a2e"><div class="message received"><div class="message-bubble">${c.name}：${greeting}</div></div></div>
+        <div class="call-input-bar"><input id="callInput" placeholder="说话..."><button class="send-btn" onclick="App.UI.sendCall()">说</button></div>`;
+        this.showPage('callChatPage');
+        this.addCallRecord(c.name, c.avatar, c.type, c.phone || '123****4567', true, true);
+        App.Store.updateStats({affection: c.type === 'stalker' || c.type === 'hater' ? 0 : 1});
+    },
+    rejectCallFromPopup() {
+        if (this.callPopupElement) { this.callPopupElement.remove(); this.callPopupElement = null; }
+        this.incomingCall = null;
+        const c = this.currentCallNpc;
+        let effects = {affection:-3, mood:-2};
+        if (c?.type === 'stalker') { effects = {mood:-5, stress:3}; this.showNotification('被私生粉骚扰了...'); }
+        else if (c?.type === 'hater') { effects = {mood:-3}; this.showNotification('已拒绝'); }
+        else if (c?.type === 'fanatic') { effects = {affection:-2, mood:-2}; }
+        else { this.showNotification('已挂断'); }
+        App.Store.updateStats(effects);
+        this.addCallRecord(c?.name || '未知来电', c?.avatar || '❓', c?.type || 'unknown', c?.phone || '123****4567', false, true);
+        this.currentCallNpc = null;
+        this.isOutgoingCall = false;
+    },
+    acceptCall() {
+        if (!this.currentCallNpc) return;
+        const c = this.currentCallNpc;
+        let greeting = '喂？';
+        if (c.type === 'agent' && c.personality) greeting = '有什么事吗？';
+        else if (c.type === 'member' || c.type === 'sweet') greeting = pick(['姐姐~在干嘛呀？','姐姐你好！','你好呀姐姐！']);
+        else if (c.type === 'sister') greeting = '有件事想跟你聊聊。';
+        else if (c.type === 'rival') greeting = '下次公演我可不会输。';
+        else if (c.type === 'stalker') greeting = '终于打通你电话了...（私生粉）';
+        else if (c.type === 'hater') greeting = pick(['哼，你有什么事？','说吧，我听着呢。']);
+        else if (c.type === 'fanatic') greeting = pick(['姐姐！！终于跟你通上电话了！！','天哪！是你吗姐姐！！']);
+        else if (c.type === 'fan') greeting = pick(['你好！我是你的粉丝！','偶像大人好！我是粉丝！']);
+        document.getElementById('callChatPage').innerHTML = `<div class="app-header" style="background:#2d2d2d;border-color:#444"><span class="back-btn" style="color:#ff69b4" onclick="App.UI.endCall()">结束</span><span class="title" style="color:#fff">通话中 · ${c.name}</span></div>
+        <div class="chat-messages" id="callChatMsgs" style="background:#1a1a2e"><div class="message received"><div class="message-bubble">${c.name}：${greeting}</div></div></div>
+        <div class="call-input-bar"><input id="callInput" placeholder="说话..."><button class="send-btn" onclick="App.UI.sendCall()">说</button></div>`;
+        this.showPage('callChatPage');
+        this.addCallRecord(c.name, c.avatar, c.type, c.phone || '123****4567', true, true);
+        App.Store.updateStats({affection: c.type === 'stalker' || c.type === 'hater' ? 0 : 1});
+    },
+    rejectCall() {
+        const c = this.currentCallNpc;
+        let effects = {affection:-3,mood:-2};
+        if (c?.type === 'stalker') { effects = {mood:-5, stress:3}; this.showNotification('被私生粉骚扰了...'); }
+        else if (c?.type === 'hater') { effects = {mood:-3}; this.showNotification('已拒绝'); }
+        else if (c?.type === 'fanatic') { effects = {affection:-2, mood:-2}; }
+        else { this.showNotification('已挂断'); }
+        App.Store.updateStats(effects);
+        this.addCallRecord(c?.name || '未知来电', c?.avatar || '❓', c?.type || 'unknown', c?.phone || '123****4567', false, true);
+        this.currentCallNpc = null;
+        this.isOutgoingCall = false;
+        this.goHome();
+    },
+    sendCall() {
+        const input = document.getElementById('callInput');
+        const text = input.value.trim();
+        if (!text) return;
+        input.value = '';
+        const msgs = document.getElementById('callChatMsgs');
+        msgs.innerHTML += `<div class="message sent"><div class="message-bubble">${text}</div></div>`;
+        msgs.scrollTop = msgs.scrollHeight;
+        const quality = evaluateReply(text);
+        const c = this.currentCallNpc;
+        let replyText = '';
+        if (c.type === 'stalker') {
+            replyText = pick(['我在你家楼下呢','你住址我都知道的','跟踪你是我的乐趣']);
+        } else if (c.type === 'hater') {
+            replyText = pick(['你就这点实力？','别丢人现眼了','赶紧退团吧']);
+        } else if (c.type === 'fanatic') {
+            replyText = pick(['姐姐说什么都对！！','我永远支持姐姐！！','太幸福了能听到姐姐声音！！']);
+        } else {
+            const ctx = {npcType: c.type||'agent', personality: c.personality};
+            App.AI.reply(c.name, ctx, text).then(reply => {
+                msgs.innerHTML += `<div class="message received"><div class="message-bubble">${c.name}：${reply}</div></div>`;
+                msgs.scrollTop = msgs.scrollHeight;
+            });
+            App.Store.updateStats({mood:quality==='heartfelt'?3:quality==='perfunctory'?-1:1, affection:quality==='heartfelt'?3:1});
+            return;
+        }
+        msgs.innerHTML += `<div class="message received"><div class="message-bubble">${c.name}：${replyText}</div></div>`;
+        msgs.scrollTop = msgs.scrollHeight;
+        App.Store.updateStats({mood: c.type === 'stalker' || c.type === 'hater' ? -2 : (quality==='heartfelt'?3:quality==='perfunctory'?-1:1), affection: quality==='heartfelt'?3:1});
+    },
+    endCall() {
+        this.showNotification('通话结束');
+        App.Store.updateStats({mood:1});
+        this.currentCallNpc = null;
+        this.isOutgoingCall = false;
+        this.showPage('callPage');
+        this.renderPhone();
+    },
+    goBackFromMissedCall() {
+        this.currentCallNpc = null;
+        this.showPage('callPage');
+        this.renderPhone();
+    },
+
+    // ---------- 口袋48 ----------
+    renderPocketHome() {
+        const grp = App.NPCData[G.player.group];
+        const events = ['排练 14:00','公演 19:00','握手会 13:00'];
+        const notices = ['本周公演曲目已确定','总选举投票通道即将开启','新歌MV拍摄通知'];
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">口袋48</span></div>
+        <div class="tab-bar"><div class="tab active" onclick="App.UI.renderPocketHome()">首页</div><div class="tab" onclick="App.UI.renderPocketRoom()">聊天室</div><div class="tab" onclick="App.UI.renderPocketFlip()">翻牌</div><div class="tab" onclick="App.UI.renderPocketLive()">直播</div><div class="tab" onclick="App.UI.renderPocketShow()">演出</div></div>
+        <div style="flex:1;overflow-y:auto;padding:12px">
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px"><div style="font-size:15px;font-weight:600">📋 今日行程</div>${events.map(e=>`<div style="font-size:13px;color:#666;padding:4px 0">• ${e}</div>`).join('')}</div>
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px"><div style="font-size:15px;font-weight:600">📢 公告</div><div style="font-size:13px;color:#666">${pick(notices)}</div></div>
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px"><div style="font-size:15px;font-weight:600">📊 我的数据</div><div style="font-size:13px;color:#666">鸡腿：🍗 ${G.stats.drumstick} | 粉丝：👥 ${G.game.pocket_fans} | 排名：#${G.game.rank}</div></div>
+            
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+                <div style="font-size:15px;font-weight:600;margin-bottom:12px">💱 鸡腿兑换</div>
+                <div style="font-size:12px;color:#666;margin-bottom:8px">鸡腿可兑换为微信支付余额 (10鸡腿=1元)</div>
+                <div style="display:flex;align-items:center;gap:8px">
+                    <input type="number" id="pocketDrumstickExchange" placeholder="输入鸡腿数量" min="10" step="10" max="${G.stats.drumstick}" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:8px">
+                    <button onclick="App.UI.exchangeDrumstickFromPocket()" style="padding:8px 16px;background:#f39c12;color:#fff;border:none;border-radius:8px;cursor:pointer">兑换</button>
+                </div>
+                <div style="font-size:12px;color:#999;margin-top:4px">当前鸡腿: ${G.stats.drumstick} (10鸡腿 = ¥1)</div>
+            </div>
+            
+            <button class="create-btn" onclick="App.UI.renderPocketMembers()" style="width:100%;margin-top:12px">👥 成员名单</button>
+        </div>`;
+        document.getElementById('pocketPage').innerHTML = h;
+    },
+    renderPocketMembers() {
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">成员名单</span></div>
+        <div style="flex:1;overflow-y:auto">`;
+        Object.entries(App.NPCData).forEach(([groupKey, groupData]) => {
+            h += `<div class="contact-group-title">🏢 ${groupKey}</div>`;
+            if (groupData.teams) {
+                Object.entries(groupData.teams).forEach(([teamName, memberList]) => {
+                    h += `<div style="font-size:12px;color:#ff69b4;padding:4px 16px;font-weight:600">Team ${teamName}</div>`;
+                    memberList.forEach(name => {
+                        h += `<div class="member-list-item"><div class="avatar">👤</div><div class="info"><div class="name">${name}</div><div class="team">${groupKey} Team ${teamName}</div></div><button class="best-partner-btn" onclick="App.UI.invitePartner('${name}','${groupKey}')">🤝</button></div>`;
+                    });
+                });
+            }
+            if (groupData.graduates && groupData.graduates.length) {
+                h += `<div style="font-size:12px;color:#999;padding:4px 16px;font-weight:600">🎓 荣誉毕业生</div>`;
+                groupData.graduates.forEach(name => {
+                    h += `<div class="member-list-item"><div class="avatar">🎓</div><div class="info"><div class="name">${name}<span class="graduate-tag">毕业生</span></div><div class="team">${groupKey} 毕业生</div></div></div>`;
+                });
+            }
+        });
+        h += `</div>`;
+        document.getElementById('pocketPage').innerHTML = h;
+    },
+    renderPocketRoom() {
+        if (!G.pocketRoomMessages.length) {
+            G.pocketRoomMessages = [
+                {sender:'粉丝001',avatar:'🧸',text:'姐姐好！',isMe:false},
+                {sender:G.player.name,text:'大家好~',isMe:true}
+            ];
+        }
+        
+        let chatHtml = G.pocketRoomMessages.map((m, idx) => `
+            <div style="display:flex;justify-content:${m.isMe?'flex-end':'flex-start'};margin-bottom:16px">
+                ${!m.isMe ? `<div class="avatar" style="width:36px;height:36px;border-radius:50%;background:#f0f0f0;margin-right:10px;display:flex;align-items:center;justify-content:center;font-size:16px">${m.avatar || '👤'}</div>` : ''}
+                <div style="max-width:70%">
+                    ${!m.isMe ? `<div style="font-size:11px;color:#999;margin-bottom:4px;padding-left:4px">${m.sender}</div>` : ''}
+                    <div style="${m.isMe?'background:#07c160;color:#fff;border-radius:18px 18px 4px 18px':'background:#fff;border-radius:18px 18px 18px 4px;border:1px solid #eee'};padding:10px 14px;font-size:14px;box-shadow:0 1px 2px rgba(0,0,0,0.05)">
+                        ${m.text}
+                    </div>
+                </div>
+                ${m.isMe ? `<div class="avatar" style="width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;margin-left:10px;display:flex;align-items:center;justify-content:center;font-size:12px">我</div>` : ''}
+            </div>
+        `).join('');
+        
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">房间</span></div>
+        <div style="flex:1;overflow-y:auto;padding:12px;background:#f5f5f5">
+            <div style="max-width:400px;margin:0 auto">
+                ${chatHtml || '<div style="text-align:center;color:#999;padding:60px 20px">暂无消息，快来和粉丝互动吧~</div>'}
+            </div>
+        </div>
+        <div class="chat-input-bar" style="padding:10px 12px;">
+            <input id="pocketInput" placeholder="说点什么..." onkeydown="if(event.key==='Enter')App.UI.sendPocketMessage()" style="padding:10px 16px;border-radius:22px">
+            <button class="send-btn" onclick="App.UI.sendPocketMessage()" style="padding:10px 20px;border-radius:22px">发送</button>
+        </div>`;
+        document.getElementById('pocketPage').innerHTML = h;
+        setTimeout(() => {
+            const chatArea = document.getElementById('pocketPage').querySelector('[style*="flex:1"]');
+            if (chatArea) chatArea.scrollTop = chatArea.scrollHeight;
+        }, 100);
+    },
+    sendPocketMessage() {
+        const input = document.getElementById('pocketInput');
+        const text = input?.value.trim();
+        if (!text) return;
+        
+        G.pocketRoomMessages.push({ sender: G.player.name, text, isMe: true });
+        
+        // 增加更丰富的NPC粉丝词库
+        const replies = [
+            // 普通粉丝回复
+            '姐姐好可爱！',
+            '支持你！',
+            '加油！',
+            '今天也要努力哦~',
+            '期待你的新舞台！',
+            '你真的很棒！',
+            '爱你哦~❤️',
+            '永远支持你！',
+            '姐姐最棒了！',
+            '今天也要元气满满！',
+            '翻我翻我~',
+            '好想看姐姐公演！',
+            '姐姐在干嘛呀',
+            '今天辛苦啦~',
+            '新歌好好听！',
+            '期待下次直播！',
+            // 铁粉回复
+            '铁粉报到！姐姐我来了！',
+            '每天都来打卡！',
+            '姐姐的每场公演我都在！',
+            '什么时候来我们城市！',
+            '已经买了下次公演的票！',
+            // 热情粉丝
+            '天哪天哪！！姐姐！！',
+            '啊啊啊啊姐姐！！好激动！！',
+            '妈妈我看到偶像了！！',
+            '太幸福了！！',
+            // 好奇粉丝
+            '姐姐最近在练什么舞呀',
+            '新公演什么时候上线呀',
+            '姐姐吃饭了吗~',
+            '姐姐住哪里呀',
+            '姐姐喜欢吃什么',
+            // 活跃粉丝
+            '哈哈哈笑死我了😂',
+            '姐姐好幽默！',
+            '这也太可爱了吧！',
+            '姐姐瘦了吗？',
+            '新衣服好好看！',
+            '今天的妆容好美！',
+            // 关心粉丝
+            '姐姐要好好休息哦',
+            '不要太累了！',
+            '注意身体呀姐姐',
+            '多喝水多休息！',
+            // 追星粉丝
+            '❤️❤️❤️❤️❤️',
+            '💖💖💖💖💖',
+            '🌟🌟🌟🌟🌟',
+            '今天的造型绝绝子！',
+            '姐姐是我的光！',
+            // 调皮粉丝
+            '姐姐偷走了我的心！',
+            '要请我吃饭哦~',
+            '什么时候开演唱会！',
+            '翻牌翻牌！',
+            // 鼓励粉丝
+            '姐姐最厉害了！',
+            '加油加油！我们一直都在！',
+            '不要有压力！我们支持你！',
+            '相信自己！你最棒！',
+        ];
+        
+        // 不同类型粉丝的专属回复
+        const fanTypes = [
+            // 普通粉丝
+            { prefix:'粉丝', avatars:['🧸','🐰','🐱','🐶','🦄','🌸','🌟','💖','🎀','✨'], replies:replies },
+            // 铁粉
+            { prefix:'铁粉', avatars:['⭐','💪','🔥','🎖️','👑'], replies:['铁粉报到！永远支持姐姐！','每天必来报到！','姐姐的每条消息我都看！','铁粉永远追随！','姐姐最棒！'] },
+            // 狂热粉丝
+            { prefix:'狂热粉', avatars:['💥','🌈','🎉','🎊','💝'], replies:['天哪天哪！！太激动了！！','姐姐我爱死你了！！','啊啊啊啊要晕倒了！！','最爱你了姐姐！！','永远追随你！！'] },
+            // 好奇宝宝
+            { prefix:'好奇', avatars:['🤔','💭','❓','🧐','👀'], replies:['姐姐最近在忙什么呀？','新公演是什么主题呀？','下次直播是什么时候呀？','姐姐有什么想对我们说的吗？','可以多发点日常吗~'] },
+            // 温暖粉丝
+            { prefix:'暖心粉', avatars:['🌻','🌺','💐','🌷','🪻'], replies:['姐姐要照顾好自己哦','不要太累了，我们会心疼的','注意休息多喝水呀','我们永远支持你！','加油！我们相信你！'] },
+        ];
+        
+        setTimeout(() => {
+            const fanType = pick(fanTypes);
+            G.pocketRoomMessages.push({
+                sender: fanType.prefix + randInt(1, 999),
+                avatar: pick(fanType.avatars),
+                text: pick(fanType.replies),
+                isMe: false
+            });
+            this.renderPocketRoom();
+        }, 1000);
+        
+        input.value = '';
+        this.renderPocketRoom();
+    },
+    sendRoomMsg() {
+        const input = document.getElementById('roomInput');
+        const text = input?.value.trim();
+        if (!text) return;
+        input.value = '';
+        G.pocketRoomMessages.push({sender:G.player.name,text,isMe:true});
+        const earn = randInt(1,50);
+        App.Store.updateStats({drumstick:earn,popularity:1});
+        this.showNotification(`🍗 +${earn}`);
+        this.renderPocketRoom();
+        const fanComments = ['姐姐好棒！','鸡腿安排！','哈哈哈','爱你哟❤️','太可爱了！','加油加油！','笑死我了😂','姐姐瘦了吗？','今天妆容好好看','新衣服吗？','好想你啊！','等下有公演吗？','翻我翻我！','姐姐在干嘛呀','❤️❤️❤️','好感动！','冲冲冲！','今天也要元气满满！'];
+        const sendFanMsg = () => {
+            G.pocketRoomMessages.push({sender:'粉丝'+randInt(100,999),avatar:'🧸',text:pick(fanComments),isMe:false});
+            if (this.currentPage === 'pocketPage') {
+                this.renderPocketRoom();
+                const msgs = document.getElementById('roomChatArea');
+                if (msgs) msgs.scrollTop = msgs.scrollHeight;
+            }
+        };
+        sendFanMsg();
+        setTimeout(sendFanMsg, 500);
+        setTimeout(sendFanMsg, 1200);
+        setTimeout(sendFanMsg, 2000);
+    },
+    renderPocketFlip() {
+        const fanMsgs = [
+            '姐姐今天公演超棒！','新歌好好听啊！','每天都来看姐姐','姐姐要好好休息哦','太甜了吧姐姐！','加油我们支持你','什么时候出周边啊','公演票好难抢...','姐姐广州人吗？','期待下次见面！','想看姐姐拍广告','姐姐笑容好治愈'
+        ];
+        const fans = ['小圆','星星','默默','阿花','小鱼','小月','琪琪','豆豆','花花','小雪'];
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">翻牌</span></div><div style="flex:1;overflow-y:auto;padding:8px">`;
+        fans.forEach((f,i) => {
+            h += `<div class="flip-card"><div class="flip-fan">🧸 ${f}</div><div class="flip-msg">${fanMsgs[i % fanMsgs.length]}</div><div class="flip-reply"><input id="flipInput${i}" placeholder="回复粉丝..."><button onclick="App.UI.sendFlip(${i})">翻牌</button></div></div>`;
+        });
+        h += '</div>';
+        document.getElementById('pocketPage').innerHTML = h;
+    },
+    sendFlip(idx) {
+        const input = document.getElementById('flipInput'+idx);
+        const text = input?.value.trim();
+        if (!text) return;
+        input.value = '';
+        const quality = evaluateReply(text);
+        const earn = quality==='heartfelt'?randInt(15,30):quality==='normal'?randInt(5,15):randInt(1,5);
+        App.Store.updateStats({drumstick:earn});
+        this.showNotification(`🍗 +${earn}`);
+    },
+    renderPocketLive() {
+        if (this.liveActive) { this.renderLiveStream(); return; }
+        document.getElementById('pocketPage').innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">直播</span></div><div class="live-container"><input class="live-theme-input" id="liveTheme" placeholder="输入直播主题..."><button class="live-start-btn" onclick="App.UI.startLive()">🎥 开始直播</button></div>`;
+    },
+    startLive() {
+        const theme = document.getElementById('liveTheme')?.value.trim();
+        if (!theme) { this.showNotification('请输入直播主题'); return; }
+        this.liveActive = true;
+        const earn = randInt(5,500);
+        App.Store.updateStats({drumstick:earn,popularity:2});
+        G.game.pocket_fans += randInt(5,30);
+        this.renderLiveStream();
+    },
+    renderLiveStream() {
+        const viewerCount = randInt(50,500);
+        
+        // 扩展直播弹幕NPC词库
+        const danmakuLibrary = [
+            // 热情弹幕
+            '姐姐好美！',
+            '太好看了！',
+            '哈哈哈',
+            '加油加油！',
+            '鸡腿安排🍗',
+            '好可爱！',
+            '美哭啦！',
+            '比心❤️',
+            '啊啊啊啊！！',
+            '天哪！！',
+            '太激动了！！',
+            '终于看到姐姐了！！',
+            '好幸福！！',
+            '姐姐我爱死你了！！',
+            '太棒了！！',
+            // 普通弹幕
+            '姐姐好！',
+            '今天也好美！',
+            '新造型好好看！',
+            '这首歌超好听！',
+            '舞蹈绝了！',
+            '姐姐辛苦了！',
+            '支持支持！',
+            '永远追随！',
+            '今天状态好好！',
+            '元气满满！',
+            '好想见面！',
+            '公演什么时候！',
+            // 好奇弹幕
+            '姐姐在干嘛呀',
+            '这是在哪里呀',
+            '今天吃了什么呀',
+            '新歌什么时候上呀',
+            '下次直播是什么时候',
+            '公演票怎么买呀',
+            '姐姐住哪里呀',
+            '最近在忙什么呀',
+            // 调皮弹幕
+            '姐姐偷走了我的心',
+            '要请我吃饭哦',
+            '翻牌翻牌！',
+            '抽我抽我！',
+            '连我连我！',
+            '什么时候开演唱会！',
+            // 感动弹幕
+            '好感动😭',
+            '看哭了！',
+            '太暖心了！',
+            '姐姐最好了！',
+            '好幸福！',
+            '被治愈了！',
+            // 夸赞弹幕
+            '太厉害了！',
+            '绝绝子！',
+            'yyds!',
+            '太完美了！',
+            '姐姐最棒！',
+            '实力认证！',
+            // 互动弹幕
+            '学到了学到了',
+            '姐姐说得好对',
+            '哈哈笑死我了',
+            '这也太好笑了吧',
+            '姐姐好幽默',
+            // 粉丝福利弹幕
+            '多发自拍呀',
+            '多发日常呀',
+            '多开直播呀',
+            '可以翻牌吗',
+            '能握手吗',
+            // 追星弹幕
+            '❤️❤️❤️❤️❤️',
+            '💖💖💖💖💖',
+            '🌟🌟🌟🌟🌟',
+            '姐姐是我的光！',
+            '永远支持你！',
+            '为你打call！',
+            // 应援弹幕
+            '冲冲冲！',
+            '姐姐冲鸭！',
+            '势不可挡！',
+            '我们最棒！',
+            '永远第一！',
+        ];
+        
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">直播中</span></div>
+        <div class="live-container"><div style="background:#ff4757;color:#fff;padding:8px;border-radius:8px;text-align:center;margin-bottom:8px">🔴 直播中 | 👥 ${viewerCount}人观看</div>
+        <div class="live-danmaku-area" id="liveDanmakuArea" style="height:200px;overflow-y:auto;background:#000;border-radius:8px;padding:8px;margin-bottom:8px">`;
+        
+        // 生成初始弹幕
+        for (let i=0;i<8;i++) {
+            h += `<div class="danmaku"><span class="dm-user">粉丝${randInt(100,999)}：</span>${pick(danmakuLibrary)}</div>`;
+        }
+        
+        h += `</div><div class="chat-input-bar"><input id="liveInput" placeholder="说点什么..." onkeydown="if(event.key==='Enter')App.UI.sendLiveMsg()"><button class="send-btn" onclick="App.UI.sendLiveMsg()">发送</button></div>
+        <button class="create-btn" onclick="App.UI.endLive()" style="margin-top:8px;width:100%">结束直播</button></div>`;
+        document.getElementById('pocketPage').innerHTML = h;
+    },
+    sendLiveMsg() {
+        const input = document.getElementById('liveInput');
+        const text = input?.value.trim();
+        if (!text) return;
+        input.value = '';
+        const earn = randInt(1,20);
+        App.Store.updateStats({drumstick:earn,popularity:1});
+        const area = document.getElementById('liveDanmakuArea');
+        if (area) {
+            const msg = document.createElement('div');
+            msg.className = 'danmaku';
+            msg.innerHTML = `<span style="color:#ff69b4;font-weight:bold">${G.player.name}：</span>${text}`;
+            area.appendChild(msg);
+            area.scrollTop = area.scrollHeight;
+        }
+        
+        // 扩展直播回复弹幕库
+        const fanReplies = [
+            // 热情回复
+            '太棒了！',
+            '哈哈哈！',
+            '姐姐说得好！',
+            '支持你！',
+            '加油加油！',
+            '说得对！',
+            '好感动😭',
+            '太真实了',
+            '❤️❤️❤️',
+            '这也太好笑了吧',
+            '学到了学到了',
+            '姐姐好厉害',
+            // 普通回复
+            '好！',
+            '嗯嗯！',
+            '知道啦！',
+            '哈哈！',
+            '好可爱！',
+            '厉害！',
+            '👍👍👍',
+            '收到！',
+            'okok！',
+            '好好好！',
+            // 追星回复
+            '姐姐我爱死你了！',
+            '永远支持你！',
+            '为你打call！',
+            '姐姐最棒！',
+            '加油冲冲冲！',
+            '永远追随！',
+            '太感动了！',
+            // 互动回复
+            '真的吗！',
+            '天哪！！',
+            '好羡慕！',
+            '好好玩！',
+            '太有意思了！',
+            '学到了！',
+            // 撒娇回复
+            '姐姐~~',
+            '嘿嘿~',
+            '好耶！',
+            '好开心！',
+            '太幸福了！',
+            // 好奇回复
+            '为什么呀',
+            '真的吗',
+            '好厉害！',
+            '怎么做到的',
+            '可以教我吗',
+        ];
+        
+        setTimeout(() => {
+            if (area) {
+                const reply = document.createElement('div');
+                reply.className = 'danmaku';
+                reply.innerHTML = `<span class="dm-user">粉丝${randInt(100,999)}：</span>${pick(fanReplies)}`;
+                area.appendChild(reply);
+                area.scrollTop = area.scrollHeight;
+            }
+        }, 600);
+        setTimeout(() => {
+            if (area) {
+                const reply2 = document.createElement('div');
+                reply2.className = 'danmaku';
+                reply2.innerHTML = `<span class="dm-user">粉丝${randInt(100,999)}：</span>${pick(fanReplies)}`;
+                area.appendChild(reply2);
+                area.scrollTop = area.scrollHeight;
+            }
+        }, 1200);
+    },
+    endLive() {
+        this.liveActive = false;
+        this.showNotification('直播已结束');
+        this.renderPocketHome();
+    },
+    renderPocketShow() {
+        document.getElementById('pocketPage').innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">演出</span></div>
+        <div style="padding:8px">
+            <div class="show-card"><div class="show-title">🎭 排练</div><button class="show-btn" onclick="App.UI.doRehearsal()">开始排练</button></div>
+            <div class="show-card"><div class="show-title">🎤 公演</div><button class="show-btn" onclick="App.UI.doPerformance()">参加公演</button></div>
+            <div class="show-card"><div class="show-title">🤝 握手会</div><button class="show-btn" onclick="App.UI.openApp('handshake')">参加握手会</button></div>
+        </div>`;
+    },
+    doRehearsal() {
+        App.Store.updateStats({skill:2,stress:2,mood:-1});
+        this.showNotification('排练完成！💪 实力提升');
+    },
+    doPerformance() {
+        if (G.stats.popularity < 15) { this.showNotification('人气不足15，还不能参加公演'); return; }
+        const base = G.stats.skill + randInt(-10,10);
+        let grade, detail, effects;
+        if (base >= 80) { grade='S'; detail='完美的舞台！'; effects={popularity:8,drumstick:100,mood:5}; }
+        else if (base >= 60) { grade='A'; detail='出色的表现！'; effects={popularity:5,drumstick:60,mood:3}; }
+        else if (base >= 40) { grade='B'; detail='表现不错'; effects={popularity:3,drumstick:30}; }
+        else if (base >= 20) { grade='C'; detail='还需努力'; effects={popularity:1,drumstick:15}; }
+        else { grade='D'; detail='表现不佳...'; effects={mood:-5,stress:3}; }
+        App.Store.updateStats(effects);
+        document.getElementById('showEvalContent').innerHTML = `<div class="show-eval"><div class="show-eval-grade ${grade}">${grade}</div><div class="show-eval-detail">${detail}</div><button class="create-btn" onclick="App.UI.goHome()">返回</button></div>`;
+        this.showPage('showEvalPage');
+    },
+
+    // ---------- 最佳拍档 ----------
+    invitePartner(name, groupKey) {
+        const aff = G.memberAffection[name] || 40;
+        if (aff < 61) { this.showNotification(`与${name}的好感度需达到「挚友」(61)才能邀请最佳拍档`); return; }
+        if (G.bestPartner && G.bestPartner.name === name) { this.showNotification(`${name}已经是你的最佳拍档了！`); return; }
+        if (confirm(`邀请${name}成为最佳拍档？确认后本阶段只能与一人组队。`)) {
+            G.bestPartner = { name, avatar: '👤', sinceDay: G.game.day };
+            G.partnerStageUsed = false;
+            this.showNotification(`💞 与${name}结成最佳拍档！`);
+            App.Save.autoSave();
+        }
+    },
+    startPartnerStage() {
+        if (!G.bestPartner) { this.showNotification('还没有最佳拍档'); return; }
+        if (G.partnerStageUsed) { this.showNotification('本周期已进行过双人舞台'); return; }
+        G.partnerStageUsed = true;
+        const earn = randInt(100,300);
+        App.Store.updateStats({popularity:10, starlight:5, drumstick:earn});
+        this.showNotification(`🎶 与${G.bestPartner.name}的双人舞台大成功！🍗+${earn}`);
+        App.Achievements.checkAll();
+    },
+
+    // ---------- 移籍 ----------
+    checkMoveGroupAvailable() {
+        if (G.game.rank <= 7 && G.player.group !== 'SNH48') return 'toHQ';
+        if (G.game.rank <= 16 && G.player.group === 'SNH48') return 'toOtherTeam';
+        return null;
+    },
+    renderMoveGroupPanel() {
+        const can = this.checkMoveGroupAvailable();
+        if (!can) return;
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🚄 移籍选择</span></div><div style="padding:16px">`;
+        if (can === 'toHQ') {
+            h += `<p style="font-size:14px;margin-bottom:12px">恭喜进入神七！你获得了移籍SNH48本部的机会，保留原队伍。</p>`;
+            const teams = Object.keys(App.NPCData.SNH48.teams);
+            teams.forEach(t => { h += `<button class="create-btn" onclick="App.Store.moveGroup('SNH48','${t}')" style="margin:4px">移籍 SNH48 Team ${t}</button>`; });
+        } else if (can === 'toOtherTeam') {
+            h += `<p style="font-size:14px;margin-bottom:12px">你在本部排名优异，可选择更换队伍。</p>`;
+            const currentTeam = G.player.team;
+            const teams = Object.keys(App.NPCData.SNH48.teams).filter(t => t !== currentTeam);
+            teams.forEach(t => { h += `<button class="create-btn" onclick="App.Store.moveGroup('SNH48','${t}')" style="margin:4px">更换至 SNH48 Team ${t}</button>`; });
+        }
+        h += `<button class="create-btn" onclick="App.UI.goHome()" style="background:#999;margin-top:12px">暂不移籍</button></div>`;
+        document.getElementById('settingsPage').innerHTML = h;
+        this.showPage('settingsPage');
+    },
+
+    // ---------- 档案 ----------
+    renderProfile() {
+        const s = G.stats;
+        const stage = getPersonalityStage();
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">我的档案</span></div><div style="padding:12px">
+        <div style="text-align:center;padding:16px;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;border-radius:16px;margin-bottom:12px">
+            <div style="font-size:36px">${stage.emoji}</div>
+            <div style="font-size:20px;font-weight:700">${G.player.name}</div>
+            <div style="font-size:13px">${G.player.group} Team ${G.player.team} · ${stage.name}</div>
+        </div>`;
+        const stats = [
+            {label:'⭐人气',key:'popularity',color:'#ff69b4'},
+            {label:'💪实力',key:'skill',color:'#3498db'},
+            {label:'😊心情',key:'mood',color:'#4cd137'},
+            {label:'💎星光',key:'starlight',color:'#9b59b6'},
+            {label:'😰压力',key:'stress',color:'#e67e22'},
+            {label:'📸绯闻',key:'scandal',color:'#95a5a6'}
+        ];
+        stats.forEach(st => {
+            const v = s[st.key]||0;
+            const pct = Math.min(100, Math.floor(v/100*100));
+            h += `<div class="stat-row"><span class="stat-label">${st.label}</span><div class="stat-bar"><div class="stat-fill" style="width:${pct}%;background:${st.color}"></div></div><span class="stat-value">${v}</span></div>`;
+        });
+        h += `<div style="margin-top:12px;font-size:14px">🍗鸡腿：${s.drumstick} | 排名：#${G.game.rank}</div>`;
+        if (G.achievements.length) {
+            h += `<div style="margin-top:8px;font-weight:600">🏆 成就</div>`;
+            G.achievements.forEach(a => h += `<span class="achievement-badge">${a}</span>`);
+        }
+        if (G.bestPartner) {
+            h += `<div style="margin-top:12px;font-weight:600">💞 最佳拍档：${G.bestPartner.name} (自Day${G.bestPartner.sinceDay})</div>
+                  ${G.partnerStageUsed ? '<span style="color:#999">(本周期已演出)</span>' : '<button class="best-partner-btn" onclick="App.UI.startPartnerStage()">🎶 双人舞台</button>'}`;
+        }
+        if (this.checkMoveGroupAvailable()) {
+            h += `<div style="margin-top:12px"><button class="create-btn" onclick="App.UI.renderMoveGroupPanel()">🚄 移籍/换队</button></div>`;
+        }
+        h += '</div>';
+        document.getElementById('profilePage').innerHTML = h;
+    },
+
+    // ---------- 好感度查询 ----------
+    renderAffection() {
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">💕 好感度</span></div>
+        <div style="flex:1;overflow-y:auto">`;
+        
+        let hasData = false;
+        
+        Object.entries(App.NPCData).forEach(([groupKey, groupData]) => {
+            const isMyGroup = groupKey === G.player.group;
+            h += `<div class="contact-group-title">🏢 ${groupKey}${isMyGroup?' (我的分团)':''}</div>`;
+            
+            if (groupData.teams) {
+                Object.entries(groupData.teams).forEach(([teamName, members]) => {
+                    const isMyTeam = isMyGroup && teamName === G.player.team;
+                    h += `<div style="font-size:12px;color:${isMyTeam?'#07c160':'#ff69b4'};padding:8px 16px 4px;font-weight:600">Team ${teamName}${isMyTeam?' ★':''}</div>`;
+                    
+                    members.forEach(name => {
+                        hasData = true;
+                        const aff = G.memberAffection[name] || 50;
+                        const canInvite = aff >= 80;
+                        const affColor = aff >= 80 ? '#ff69b4' : aff >= 50 ? '#07c160' : aff >= 30 ? '#ff9500' : '#ff3b30';
+                        const affLevel = aff >= 80 ? '亲密' : aff >= 50 ? '友好' : aff >= 30 ? '普通' : '疏远';
+                        
+                        h += `<div class="affection-item">
+                            <div class="affection-avatar">👤</div>
+                            <div class="affection-info">
+                                <div class="affection-name">${name}</div>
+                                <div class="affection-bar-container">
+                                    <div class="affection-bar" style="width:${aff}%;background:${affColor}"></div>
+                                </div>
+                                <div style="display:flex;justify-content:space-between;margin-top:4px">
+                                    <span style="font-size:12px;color:#888">${affLevel}</span>
+                                    <span style="font-size:14px;font-weight:600;color:${affColor}">${aff}%</span>
+                                </div>
+                            </div>
+                            ${canInvite ? `<button class="affection-invite-btn" onclick="App.UI.inviteBestPartner('${name}')">✨ 邀请</button>` : ''}
+                        </div>`;
+                    });
+                });
+            }
+        });
+        
+        if (!hasData) {
+            h += '<div class="empty-hint">暂无成员数据</div>';
+        }
+        
+        h += `</div>`;
+        document.getElementById('affectionPage').innerHTML = h;
+    },
+    inviteBestPartner(name) {
+        if (G.bestPartner) {
+            this.showNotification(`你已经和 ${G.bestPartner} 是最佳拍档了`);
+            return;
+        }
+        
+        const confirm = window.confirm(`确定邀请 ${name} 成为你的最佳拍档吗？`);
+        if (confirm) {
+            G.bestPartner = name;
+            G.memberAffection[name] = Math.min(100, (G.memberAffection[name] || 50) + 10);
+            this.showNotification(`🎉 成功邀请 ${name} 成为最佳拍档！`);
+            App.Store.updateStats({popularity: 20, mood: 10});
+            this.renderAffection();
+        }
+    },
+
+    // ---------- 选举、握手、设置 ----------
+    renderElection() {
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🏆 总选举</span></div>`;
+        
+        const dayInMonth = G.game.day % 30 || 30;
+        const daysUntilElection = 30 - dayInMonth;
+        const daysUntilFirst = dayInMonth < 10 ? 10 - dayInMonth : (40 - dayInMonth);
+        const daysUntilSecond = dayInMonth < 20 ? 20 - dayInMonth : (50 - dayInMonth);
+        
+        if (!G.electionResults.length) {
+            let statusText = '';
+            if (dayInMonth < 10) {
+                statusText = `距离初报还有 ${10 - dayInMonth} 天`;
+            } else if (dayInMonth < 20) {
+                statusText = `初报已发布，距离中报还有 ${20 - dayInMonth} 天`;
+            } else if (dayInMonth < 30) {
+                statusText = `中报已发布，距离最终结果还有 ${30 - dayInMonth} 天`;
+            }
+            
+            h += `<div style="padding:20px">
+                <div style="text-align:center;margin-bottom:20px">
+                    <div style="font-size:48px;margin-bottom:8px">🏆</div>
+                    <div style="font-size:18px;font-weight:600;color:#333">总选举进行中</div>
+                </div>
+                
+                <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+                    <div style="font-size:14px;color:#666;margin-bottom:12px">📅 总选时间表</div>
+                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0">
+                        <span>📊 初报（第10天）</span>
+                        <span style="color:#ff69b4;font-weight:600">${dayInMonth >= 10 ? '已发布' : daysUntilFirst + '天后'}</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0">
+                        <span>📈 中报（第20天）</span>
+                        <span style="color:#ff69b4;font-weight:600">${dayInMonth >= 20 ? '已发布' : daysUntilSecond + '天后'}</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;padding:8px 0">
+                        <span>🏆 最终（第30天）</span>
+                        <span style="color:#ffd700;font-weight:600">${daysUntilElection} 天后</span>
+                    </div>
+                </div>
+                
+                <div style="text-align:center;color:#888">${statusText}</div>
+            </div>`;
+        } else {
+            const currentVotes = G.electionResults.find(r => r.name === G.player.name)?.votes || 0;
+            h += `<div style="text-align:center;padding:16px;background:linear-gradient(135deg,#ffd700,#ff9500);color:#fff">
+                <div style="font-size:24px;font-weight:700">🏆 总选举最终结果</div>
+                <div style="font-size:48px;font-weight:700">#${G.game.rank}</div>
+                <div style="font-size:14px;margin-top:8px">${currentVotes.toLocaleString()} 票</div>
+            </div>`;
+            
+            h += `<div style="padding:12px;background:#f8f8f8;border-bottom:1px solid #eee">
+                <div style="font-weight:600;color:#333">📊 排名榜</div>
+            </div>`;
+            
+            G.electionResults.slice(0,10).forEach((r,i) => {
+                h += `<div class="election-rank"><span class="election-pos top7">${i+1}</span><span class="election-name">${r.name}${r.name===G.player.name?' ⬅️ 你':''}</span><span class="election-votes">${r.votes.toLocaleString()}票</span></div>`;
+            });
+            
+            h += `<div style="padding:16px">
+                <button class="election-participate-btn" onclick="App.UI.goHome()">🏠 返回主页</button>
+            </div>`;
+        }
+        
+        document.getElementById('electionPage').innerHTML = h;
+    },
+    participateElection() {
+        const votes = this.calculateVotes();
+        const allMembers = App.getAllMembers().filter(m => !m.graduate);
+        let rankings = allMembers.map(m => ({ name: m.name, votes: randInt(1000, 50000) }));
+        rankings.push({ name: G.player.name, votes: votes });
+        rankings.sort((a, b) => b.votes - a.votes);
+        G.electionResults = rankings;
+        G.game.rank = rankings.findIndex(r => r.name === G.player.name) + 1;
+        
+        this.showNotification(`📣 总选举投票完成！你获得了 ${votes.toLocaleString()} 票，排名第 ${G.game.rank} 名`);
+        App.Store.updateStats({popularity: 5});
+        this.renderElection();
+    },
+    renderHandshake() {
+        const types = [
+            {icon:'🌟',type:'纯粉',desc:'真心支持你的粉丝',choices:['热情回应','微笑点头'],effects:[{drumstick:30,mood:2},{drumstick:10}]},
+            {icon:'😤',type:'毒粉',desc:'看起来不太友好的粉丝',choices:['保持冷静','冷脸应对'],effects:[{mood:-2},{mood:-5,scandal:5}]},
+            {icon:'📸',type:'拍照粉',desc:'拿着手机一直拍你的粉丝',choices:['配合拍照','婉拒拍摄'],effects:[{popularity:3,drumstick:20},{drumstick:5}]},
+            {icon:'💝',type:'礼物粉',desc:'送了你小礼物的粉丝',choices:['开心收下','婉拒贵重礼物'],effects:[{mood:5,drumstick:25},{popularity:2,mood:3}]},
+            {icon:'🤳',type:'直播粉',desc:'正在直播跟你握手的粉丝',choices:['对着镜头打招呼','低调握手'],effects:[{popularity:5,drumstick:15},{drumstick:10}]},
+            {icon:'😭',type:'泪粉',desc:'激动到哭的粉丝',choices:['温柔安慰','给她签名'],effects:[{mood:3,drumstick:25},{popularity:3,drumstick:20}]},
+            {icon:'🧐',type:'好奇粉',desc:'问你私人问题的粉丝',choices:['礼貌回避','幽默化解'],effects:[{mood:-1,scandal:3},{scandal:1}]},
+            {icon:'⭐',type:'应援粉',desc:'举着大幅应援牌的粉丝',choices:['表示感谢','挥手互动'],effects:[{popularity:5,mood:3},{popularity:3,drumstick:15}]}
+        ];
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🤝 握手会</span></div><div style="padding:8px">`;
+        types.forEach((t,i) => {
+            h += `<div class="handshake-item"><div class="handshake-icon">${t.icon}</div><div class="handshake-info"><div class="handshake-type">${t.type}粉丝</div><div class="handshake-desc">${t.desc}</div></div><div class="handshake-choices">${t.choices.map((c,ci)=>`<button class="handshake-btn" onclick="App.UI.handleHandshake(${i},${ci})">${c}</button>`).join('')}</div></div>`;
+        });
+        h += '</div>';
+        document.getElementById('handshakePage').innerHTML = h;
+    },
+    handleHandshake(typeIdx, choiceIdx) {
+        const types = [
+            {effects:[{drumstick:30,mood:2},{drumstick:10}]},
+            {effects:[{mood:-2},{mood:-5,scandal:5}]},
+            {effects:[{popularity:3,drumstick:20},{drumstick:5}]},
+            {effects:[{mood:5,drumstick:25},{popularity:2,mood:3}]},
+            {effects:[{popularity:5,drumstick:15},{drumstick:10}]},
+            {effects:[{mood:3,drumstick:25},{popularity:3,drumstick:20}]},
+            {effects:[{mood:-1,scandal:3},{scandal:1}]},
+            {effects:[{popularity:5,mood:3},{popularity:3,drumstick:15}]}
+        ];
+        const effects = types[typeIdx]?.effects?.[choiceIdx] || {};
+        App.Store.updateStats(effects);
+        this.showNotification('握手完成');
+    },
+    renderOutdoor() {
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🚗 外出</span></div>
+        <div style="flex:1;overflow-y:auto;padding:16px">
+            <div style="background:linear-gradient(135deg,#e74c3c,#c0392b);color:#fff;padding:20px;border-radius:16px;margin-bottom:16px;text-align:center">
+                <div style="font-size:14px;margin-bottom:8px">💰 微信支付余额</div>
+                <div style="font-size:32px;font-weight:700">¥${(G.stats.wechatBalance||0).toLocaleString()}</div>
+                <div style="font-size:12px;opacity:0.8;margin-top:4px">当前压力值: ${G.stats.stress}</div>
+            </div>
+            
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:16px">
+                <div style="font-size:15px;font-weight:600;margin-bottom:12px">🧘 放松减压</div>
+                <div style="display:flex;flex-direction:column;gap:8px">
+                    <button onclick="App.UI.reduceStress('massage')" style="padding:12px;background:#27ae60;color:#fff;border:none;border-radius:8px;cursor:pointer">💆 按摩 ¥80 (压力-15)</button>
+                    <button onclick="App.UI.reduceStress('movie')" style="padding:12px;background:#3498db;color:#fff;border:none;border-radius:8px;cursor:pointer">🎬 看电影 ¥50 (压力-10)</button>
+                    <button onclick="App.UI.reduceStress('spa')" style="padding:12px;background:#9b59b6;color:#fff;border:none;border-radius:8px;cursor:pointer">🛁 SPA ¥150 (压力-25)</button>
+                    <button onclick="App.UI.reduceStress('cafe')" style="padding:12px;background:#e67e22;color:#fff;border:none;border-radius:8px;cursor:pointer">☕ 咖啡厅 ¥30 (压力-5)</button>
+                </div>
+            </div>
+        </div>`;
+        document.getElementById('outdoorPage').innerHTML = h;
+    },
+    reduceStress(type) {
+        const costs = {massage:80, movie:50, spa:150, cafe:30};
+        const stressReduce = {massage:15, movie:10, spa:25, cafe:5};
+        const cost = costs[type];
+        const reduce = stressReduce[type];
+        if (G.stats.wechatBalance < cost) { this.showNotification('余额不足'); return; }
+        App.Store.updateStats({wechatBalance:-cost, stress:-reduce, mood:3});
+        this.showNotification(`放松完成，压力-${reduce}，心情+3`);
+        this.renderOutdoor();
+    },
+    exchangeDrumstickFromPocket() {
+        const input = document.getElementById('pocketDrumstickExchange');
+        const amount = parseInt(input?.value);
+        if (!amount || amount < 10) { this.showNotification('至少需要10鸡腿'); return; }
+        if (G.stats.drumstick < amount) { this.showNotification('鸡腿不足'); return; }
+        const exchangeAmount = Math.floor(amount / 10);
+        const remainingDrumstick = G.stats.drumstick - amount;
+        App.Store.updateStats({drumstick:-amount, wechatBalance:exchangeAmount});
+        this.showNotification(`✅ 成功兑换 ¥${exchangeAmount}，剩余鸡腿: ${remainingDrumstick}`);
+        input.value = '';
+        this.renderPocketHome();
+    },
+    renderSettings() {
+        const soundEnabled = App.Sound.enabled;
+        const cloudStatus = App.Save.getCloudStatus();
+        const netStatus = App.Network.status;
+        const netIcon = { online: '🟢', degraded: '🟡', offline: '🔴', unknown: '⚪' };
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">⚙️ 设置</span></div>
+        <div style="flex:1;overflow-y:auto;padding:16px">
+            <div style="background:#fff;border-radius:16px;overflow:hidden;margin-bottom:16px">
+                <div style="padding:16px;font-size:14px;font-weight:600;color:#333;border-bottom:1px solid #f0f0f0">💾 本地存档</div>
+                <button onclick="App.Save.exportJSON()" style="width:100%;padding:14px;border:none;background:#fff;text-align:left;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:12px">
+                    <span style="font-size:20px">📤</span><span style="flex:1">导出存档</span><span style="color:#999">→</span>
+                </button>
+                <label style="width:100%;padding:14px;border:none;background:#fff;text-align:left;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:12px;border-top:1px solid #f0f0f0">
+                    <span style="font-size:20px">📥</span><span style="flex:1">导入存档</span><span style="color:#999">→</span>
+                    <input type="file" onchange="App.Save.importJSON(this.files[0])" style="display:none">
+                </label>
+            </div>
+
+            <div style="background:#fff;border-radius:16px;overflow:hidden;margin-bottom:16px">
+                <div style="padding:16px;font-size:14px;font-weight:600;color:#333;border-bottom:1px solid #f0f0f0">☁️ 云存档</div>
+                <div id="cloudSaveInfo" style="padding:12px 16px;font-size:12px;color:#999;background:#f8f9fa;min-height:36px">
+                    正在连接云端...
+                </div>
+                <button onclick="App.Save.cloudUpload()" style="width:100%;padding:14px;border:none;background:#fff;text-align:left;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:12px">
+                    <span style="font-size:20px">☁️</span><span style="flex:1">上传至云端</span><span style="color:#999">↑</span>
+                </button>
+                <button onclick="App.Save.cloudDownload()" style="width:100%;padding:14px;border:none;background:#fff;text-align:left;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:12px;border-top:1px solid #f0f0f0">
+                    <span style="font-size:20px">⬇️</span><span style="flex:1">从云端恢复</span><span style="color:#999">↓</span>
+                </button>
+                <button onclick="App.Save.cloudForceSync()" style="width:100%;padding:14px;border:none;background:#fff;text-align:left;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:12px;border-top:1px solid #f0f0f0">
+                    <span style="font-size:20px">⚡</span><span style="flex:1">强制同步（应对网络波动）</span><span style="color:#ff9500;font-size:11px">多重重试</span>
+                </button>
+                <button onclick="App.Save.cloudDelete()" style="width:100%;padding:14px;border:none;background:#fff;text-align:left;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:12px;border-top:1px solid #f0f0f0;color:#ff4757">
+                    <span style="font-size:20px">🗑️</span><span style="flex:1">删除云端存档</span><span style="color:#ff4757">✕</span>
+                </button>
+            </div>
+
+            <div style="background:#fff;border-radius:16px;overflow:hidden;margin-bottom:16px">
+                <div style="padding:16px;font-size:14px;font-weight:600;color:#333;border-bottom:1px solid #f0f0f0">🔍 网络诊断</div>
+                <div id="networkDiagInfo" style="padding:12px 16px;font-size:12px;color:#999;background:#f8f9fa;min-height:36px">
+                    ${netIcon[netStatus] || '⚪'} 网络状态：${netStatus === 'online' ? '已连接' : netStatus === 'degraded' ? '不稳定' : netStatus === 'offline' ? '已断开' : '检测中...'}
+                </div>
+                <button onclick="App.UI.runNetworkDiagnosis()" style="width:100%;padding:14px;border:none;background:#fff;text-align:left;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:12px">
+                    <span style="font-size:20px">🩺</span><span style="flex:1">运行网络诊断</span><span style="color:#999">→</span>
+                </button>
+                <button onclick="App.Network.checkNow().then(r => {App.UI.renderSettings(); if(!r.apiReachable) App.UI.showNotification('⚠️ API 不可达: ' + r.detail, 4000); else App.UI.showNotification('✅ ' + r.detail, 2500);})" style="width:100%;padding:14px;border:none;background:#fff;text-align:left;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:12px;border-top:1px solid #f0f0f0">
+                    <span style="font-size:20px">🔗</span><span style="flex:1">快速连接检测</span><span style="color:#999">→</span>
+                </button>
+            </div>
+            
+            <div style="background:#fff;border-radius:16px;overflow:hidden;margin-bottom:16px">
+                <div style="padding:16px;font-size:14px;font-weight:600;color:#333;border-bottom:1px solid #f0f0f0">🔊 音效设置</div>
+                <div style="padding:14px;display:flex;align-items:center;gap:12px;cursor:pointer" onclick="App.Sound.toggle();App.UI.renderSettings()">
+                    <span style="font-size:20px">${soundEnabled?'🔔':'🔕'}</span>
+                    <span style="flex:1;font-size:14px">音效开关</span>
+                    <div style="width:50px;height:28px;border-radius:14px;background:${soundEnabled?'#07c160':'#ccc'};position:relative;transition:.3s">
+                        <div style="width:24px;height:24px;background:#fff;border-radius:50%;position:absolute;top:2px;${soundEnabled?'right:2px':'left:2px'};transition:.3s"></div>
+                    </div>
+                </div>
+                <div style="padding:14px;font-size:12px;color:#999;border-top:1px solid #f0f0f0">
+                    当前状态：${soundEnabled?'已开启' :'已关闭'}
+                </div>
+            </div>
+            
+            <div style="background:#fff;border-radius:16px;overflow:hidden;margin-bottom:16px">
+                <div style="padding:16px;font-size:14px;font-weight:600;color:#333;border-bottom:1px solid #f0f0f0">🎮 游戏数据</div>
+                <div style="padding:14px;font-size:13px;color:#666;line-height:1.8">
+                    <div>游戏天数：第 ${G.game.day} 天</div>
+                    <div>人气值：${G.stats.popularity}</div>
+                    <div>压力值：${G.stats.stress}</div>
+                    <div>心情值：${G.stats.mood}</div>
+                </div>
+            </div>
+            
+            <button onclick="App.UI.restartGame()" style="width:100%;padding:14px;background:#ff4757;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer">
+                🔄 重新开始游戏
+            </button>
+            
+            <div style="text-align:center;margin-top:20px;font-size:12px;color:#999">
+                48SNH模拟器 v1.0
+            </div>
+        </div>`;
+        document.getElementById('settingsPage').innerHTML = h;
+
+        // 异步加载云端存档信息
+        App.Save.cloudInfo().then(info => {
+            const el = document.getElementById('cloudSaveInfo');
+            if (el) {
+                if (info.exists) {
+                    const time = info.saved_at ? new Date(info.saved_at).toLocaleString() : '未知';
+                    el.innerHTML = `<div>☁️ ${info.player_name || '未命名'} | 第${info.game_day}天 | ${time}</div><div style="font-size:10px;color:#999;margin-top:2px">上次同步：${cloudStatus.synced ? cloudStatus.ago : '从未'}</div>`;
+                    el.style.color = '#27ae60';
+                } else if (info.message) {
+                    el.innerHTML = info.message;
+                    el.style.color = '#e67e22';
+                } else {
+                    el.innerHTML = '暂无云端存档，点击上方按钮上传';
+                    el.style.color = '#999';
+                }
+            }
+        }).catch(() => {
+            const el = document.getElementById('cloudSaveInfo');
+            if (el) { el.innerHTML = '⚠️ 无法连接云端服务器，请检查网络或运行诊断'; el.style.color = '#ff4757'; }
+        });
+    },
+    restartGame() {
+        if (!confirm('确定重新开始？这将清除所有本地存档，无法恢复！')) return;
+        // 清除所有 localStorage
+        localStorage.removeItem('inviteCode');
+        localStorage.removeItem('inviteUserId');
+        localStorage.removeItem('starlight48_save');
+        localStorage.removeItem('starlight48_cloud_token');
+        // 重置 App.Invite 状态
+        App.Invite.inviteCode = null;
+        App.Invite.userId = null;
+        // 重置游戏状态
+        Object.assign(G, {
+            player: { name:'', appearance:'', personality:'', personalityEmoji:'', group:'', team:'', stage:'练习生' },
+            stats: { popularity:10, skill:10, mood:70, affection:50, starlight:10, stress:10, scandal:0, drumstick:0, wechatBalance:0, backpack:{}, agent_satisfaction:50, training:0 },
+            game: { day:1, phase:'morning', interaction_count:0, rank:150, weibo_followers:100, pocket_fans:50, handshake_this_month:false, fan_letters_this_week:0, electionInProgress:false, electionPhase:null, firstReportVotes:0, secondReportVotes:0, firstReportPulls:0, secondReportPulls:0 },
+            flags: { hasFirstShow:false, hasFirstElection:false, hasStalker:false, hasCenterBattle:false, hasCrisis:false, hasEmo:false, hasZeroStress:false, hasMoved:false },
+            achievements: [], chatHistory: {}, weiboPosts: [], moments: [], smsMessages: [], callHistory: [], fanLetters: [], electionResults: [],
+            memberAffection: {}, blockedContacts: [], pocketRoomMessages: [], bestPartner: null, partnerStageUsed: false
+        });
+        App.Save.autoSave();
+        // 显示邀请码页面，重新验证
+        document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+        document.getElementById('inviteScreen').classList.add('active');
+        document.getElementById('bottomNav').style.display = 'none';
+        this.showNotification('🔄 存档已清除，请重新输入邀请码');
+    },
+
+    async runNetworkDiagnosis() {
+        this.showNotification('🩺 正在运行网络诊断...', 4000);
+        const el = document.getElementById('networkDiagInfo');
+        if (el) { el.innerHTML = '🔄 诊断中...'; el.style.color = '#3498db'; }
+
+        try {
+            const report = await App.Network.diagnose();
+
+            // 构建详细报告 HTML
+            const statusIcon = { healthy: '✅', partial: '⚠️', offline: '🔴', unreachable: '❌' };
+            const statusText = { healthy: '一切正常', partial: '部分异常', offline: '设备离线', unreachable: '无法连接服务器' };
+
+            let detailHtml = `<div style="font-weight:600;margin-bottom:4px">${statusIcon[report.overall] || '❓'} ${statusText[report.overall] || '未知'}</div>`;
+            detailHtml += `<div style="font-size:11px;line-height:1.6">`;
+            detailHtml += `设备网络：${report.browserOnline ? '✅ 已连接' : '❌ 未连接'}<br>`;
+            if (report.health) {
+                const aiOk = report.health.ai_configured ? '✅ 已配置' : '⚠️ 未配置';
+                detailHtml += `API 状态：${report.health.status || '未知'} | AI: ${aiOk}<br>`;
+            } else {
+                detailHtml += `API 状态：❌ ${report.healthError || '不可达'}<br>`;
+            }
+            if (report.chatTest) {
+                detailHtml += `聊天端点：${report.chatTest.status === 200 ? '✅' : '⚠️'} HTTP ${report.chatTest.status} (${report.chatTest.latency})<br>`;
+            } else {
+                detailHtml += `聊天端点：❌ ${report.chatError || '不可达'}<br>`;
+            }
+            detailHtml += `目标服务器：${report.apiUrl}`;
+            detailHtml += `</div>`;
+
+            if (el) {
+                el.innerHTML = detailHtml;
+                el.style.color = report.overall === 'healthy' ? '#27ae60' : report.overall === 'partial' ? '#e67e22' : '#ff4757';
+            }
+
+            // 弹窗显示完整报告
+            const summary = `网络诊断完成：${statusText[report.overall]}\n\n` +
+                `设备在线：${report.browserOnline ? '是' : '否'}\n` +
+                `API 健康：${report.health ? '正常' : report.healthError || '不可达'}\n` +
+                `聊天测试：${report.chatTest ? 'HTTP ' + report.chatTest.status : report.chatError || '失败'}\n` +
+                `服务器：${report.apiUrl}`;
+            alert(summary);
+        } catch (e) {
+            if (el) { el.innerHTML = `❌ 诊断失败: ${e.message}`; el.style.color = '#ff4757'; }
+            this.showNotification('❌ 网络诊断执行失败', 3500);
+        }
+    },
+
+    showPhoneNotification(appName, title, text, type) {
+        const container = document.getElementById('phoneNotifContainer');
+        const id = 'notif_' + Date.now();
+        const iconMap = {hater:'😈',wechat:'💬',sms:'📱',call:'📞',weibo:'📷',pocket:'🎬'};
+        const icon = iconMap[type] || '🔔';
+        const el = document.createElement('div');
+        el.className = 'phone-notif-item';
+        el.id = id;
+        el.innerHTML = `<div class="phone-notif-icon">${icon}</div><div class="phone-notif-body"><div class="phone-notif-app">${appName}</div><div class="phone-notif-title">${title}</div><div class="phone-notif-text">${text}</div></div><div class="phone-notif-close" onclick="this.parentElement.remove()">✕</div>`;
+        container.appendChild(el);
+        requestAnimationFrame(() => { el.classList.add('show'); });
+        setTimeout(() => { el.remove(); }, 5000);
+        App.Sound.play('Notif');
+    }
+};
+
+// ============ 分队算法 ============
+function assignTeam(personality, group, quizScores) {
+    const teams = GROUP_TEAMS[group] || ['SII'];
+    
+    // 性格维度映射
+    const pMap = {'温柔细腻':1, '热血直率':2, '内敛高冷':3, '古灵精怪':4};
+    const pDim = pMap[personality] || 1;
+    
+    // 计算各维度得分
+    let dimScore = {1:0, 2:0, 3:0, 4:0};
+    dimScore[pDim] += 3; // 性格选择权重最高
+    if (quizScores) quizScores.forEach(s => { if (s >= 1 && s <= 4) dimScore[s]++; });
+    
+    // 根据不同分团的规则分配队伍
+    if (group === 'SNH48') {
+        // SNH48: SII=温柔、NII=热血、HII=内敛、X=古灵精怪
+        const map = {1:'SII', 2:'NII', 3:'HII', 4:'X'};
+        let maxDim = 1, maxVal = 0;
+        for (let d=1; d<=4; d++) { if (dimScore[d] > maxVal) { maxVal = dimScore[d]; maxDim = d; } }
+        return map[maxDim] || teams[0];
+    } else if (group === 'GNZ48') {
+        // GNZ48: G=温柔、NIII=热血、Z=内敛+古灵
+        const gentleScore = dimScore[1];
+        const hotScore = dimScore[2];
+        const introvertScore = dimScore[3] + dimScore[4]; // 内敛+古灵合并
+        
+        if (gentleScore >= hotScore && gentleScore >= introvertScore) {
+            return 'G';
+        } else if (hotScore >= gentleScore && hotScore >= introvertScore) {
+            return 'NIII';
+        } else {
+            return 'Z';
+        }
+    } else if (group === 'BEJ48') {
+        // BEJ48: B=温柔+内敛、E=热血+古灵
+        const beScore = dimScore[1] + dimScore[3]; // 温柔+内敛
+        const eeScore = dimScore[2] + dimScore[4]; // 热血+古灵
+        return beScore >= eeScore ? 'B' : 'E';
+    } else if (group === 'CKG48') {
+        // CKG48: C=温柔+内敛、K=热血+古灵
+        const ccScore = dimScore[1] + dimScore[3]; // 温柔+内敛
+        const kkScore = dimScore[2] + dimScore[4]; // 热血+古灵
+        return ccScore >= kkScore ? 'C' : 'K';
+    } else if (group === 'CGT48') {
+        // CGT48: CⅡ=温柔+内敛、GⅡ=热血+古灵
+        const c2Score = dimScore[1] + dimScore[3]; // 温柔+内敛
+        const g2Score = dimScore[2] + dimScore[4]; // 热血+古灵
+        return c2Score >= g2Score ? 'CⅡ' : 'GⅡ';
+    }
+    
+    // 默认返回第一个队伍
+    return teams[0];
+}
+
+// ============ 初始化 ============
+document.addEventListener('DOMContentLoaded', () => {
+    App.Sound.init();
+    App.Save.load();
+    App.Network.init();
+
+    // 先检查是否已经验证过邀请码
+    if (App.Invite.checkAlreadyValidated()) {
+        // 已经验证过，直接隐藏邀请码页面
+        document.getElementById('inviteScreen').classList.remove('active');
+        document.getElementById('lockScreen').classList.add('active');
+    }
+
+    let keypadHTML = '';
+    for (let i=1;i<=9;i++) keypadHTML += `<button class="key" onclick="App.UI.enterPassword('${i}')">${i}</button>`;
+    keypadHTML += `<button class="key" onclick="App.UI.clearPwd()">×</button><button class="key" onclick="App.UI.enterPassword('0')">0</button><button class="key" onclick="App.UI.backspacePwd()">⌫</button>`;
+    document.getElementById('passwordKeypad').innerHTML = keypadHTML;
+
+    document.getElementById('homeGrid').innerHTML = `
+        <div class="app-icon" onclick="App.UI.openApp('wechat')"><div class="icon" style="background:linear-gradient(135deg,#07c160,#06ad56)">💬</div><div class="label">微信</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('weibo')"><div class="icon" style="background:linear-gradient(135deg,#ff4757,#ff6b81)">📷</div><div class="label">微博</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('sms')"><div class="icon" style="background:linear-gradient(135deg,#3498db,#2980b9)">📱</div><div class="label">短信</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('phone')"><div class="icon" style="background:linear-gradient(135deg,#2ecc71,#27ae60)">📞</div><div class="label">电话</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('pocket')"><div class="icon" style="background:linear-gradient(135deg,#ff9500,#ff6f00)">🎬</div><div class="label">口袋48</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('calendar')"><div class="icon" style="background:linear-gradient(135deg,#3498db,#2980b9)">📅</div><div class="label">日程</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('backpack')"><div class="icon" style="background:linear-gradient(135deg,#8b4513,#a0522d)">🎒</div><div class="label">背包</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('outdoor')"><div class="icon" style="background:linear-gradient(135deg,#e74c3c,#c0392b)">🚗</div><div class="label">外出</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('profile')"><div class="icon" style="background:linear-gradient(135deg,#a55eea,#8854d0)">👤</div><div class="label">档案</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('election')"><div class="icon" style="background:linear-gradient(135deg,#ffd700,#f39c12)">🏆</div><div class="label">总选举</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('affection')"><div class="icon" style="background:linear-gradient(135deg,#ff69b4,#ff1493)">💕</div><div class="label">好感度</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('settings')"><div class="icon" style="background:linear-gradient(135deg,#95a5a6,#7f8c8d)">⚙️</div><div class="label">设置</div></div>`;
+
+    function updateClock() {
+        const n = new Date();
+        const t = n.getHours().toString().padStart(2,'0') + ':' + n.getMinutes().toString().padStart(2,'0');
+        document.getElementById('statusTime').textContent = t;
+        document.getElementById('lockTime').textContent = t;
+        document.getElementById('lockDate').textContent = n.getFullYear()+'/'+(n.getMonth()+1)+'/'+n.getDate()+' 周'+['日','一','二','三','四','五','六'][n.getDay()];
+    }
+    updateClock();
+    setInterval(updateClock, 60000);
+
+    let lastRealTime = Date.now();
+    setInterval(() => {
+        if (!G.player.name) return;
+        const now = Date.now();
+        const elapsedHours = (now - lastRealTime) / (1000 * 3600);
+        if (elapsedHours >= 1) {
+            const daysPassed = Math.floor(elapsedHours);
+            G.game.day += daysPassed;
+            G.game.phase = 'morning';
+            G.game.handshake_this_month = false;
+            
+            lastRealTime = now;
+            App.UI.updateTimeBar();
+            App.Save.autoSave();
+            App.UI.showNotification(`⏰ 时间流逝，已过${daysPassed}天`);
+            
+            if (G.game.day % 30 === 0) {
+                App.UI.showElectionModal();
+            }
+        }
+    }, 30000);
+
+    function triggerElection() {
+        const votes = App.UI.calculateVotes();
+        const allMembers = App.getAllMembers().filter(m => !m.graduate);
+        let rankings = allMembers.map(m => ({ name: m.name, votes: randInt(1000, 50000) }));
+        rankings.push({ name: G.player.name, votes: votes });
+        rankings.sort((a, b) => b.votes - a.votes);
+        G.electionResults = rankings;
+        G.game.rank = rankings.findIndex(r => r.name === G.player.name) + 1;
+    }
+
+    function triggerHandshake() {
+        if (!G.game.handshake_this_month) G.game.handshake_this_month = true;
+    }
+
+    if (G.player.name) {
+        document.getElementById('bottomNav').style.display = '';
+        App.UI.goHome();
+    } else {
+        // 如果已经验证过邀请码，显示锁屏，否则保持邀请码页面
+        if (App.Invite.checkAlreadyValidated()) {
+            App.UI.showPage('lockScreen');
+        }
+    }
+});
