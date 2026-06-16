@@ -1,4 +1,4 @@
-/* ============ 星光48·爱豆模拟器 V2 - 主脚本 ============ */
+﻿/* ============ 星光48·爱豆模拟器 V2 - 主脚本 ============ */
 
 // ============ 全局命名空间 ============
 const App = window.App = {};
@@ -239,66 +239,315 @@ App.Network = {
     }
 };
 
+// ============ 弹窗集中管理（防止遗留 modal 拦截点击）============
+App.ModalManager = {
+    _stack: [],  // 弹窗栈，记录所有打开的 modal
+
+    /** 注册 modal 到栈中 */
+    track(modal) {
+        if (!modal) return;
+        // 监听自动清理（防止重复添加）
+        if (!modal._tracked) {
+            modal._tracked = true;
+            this._stack.push(modal);
+            // 当 modal 被 DOM 移除时自动从栈中移除
+            const observer = new MutationObserver(() => {
+                if (!document.body.contains(modal)) {
+                    const idx = this._stack.indexOf(modal);
+                    if (idx > -1) this._stack.splice(idx, 1);
+                    observer.disconnect();
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+    },
+
+    /** 关闭所有弹窗（紧急恢复） */
+    closeAll() {
+        // 直接清空 phoneModals 容器
+        const container = document.getElementById('phoneModals');
+        if (container) container.innerHTML = '';
+        this._stack = [];
+        console.log('[ModalManager] 所有弹窗已清理');
+    },
+
+    /** 关闭最上层弹窗（ESC 键支持） */
+    closeTop() {
+        if (this._stack.length === 0) return false;
+        const top = this._stack[this._stack.length - 1];
+        if (top && top.parentNode) {
+            top.remove();
+            this._stack.pop();
+            return true;
+        }
+        return false;
+    },
+
+    /** 兜底：清理异常残留的 modal-overlay */
+    cleanupOrphans() {
+        const container = document.getElementById('phoneModals');
+        if (!container) return;
+        // 找出所有没有 _tracked 标记的 modal（异常路径创建的）
+        const orphans = container.querySelectorAll('.modal-overlay:not([data-tracked])');
+        let cleaned = 0;
+        orphans.forEach(m => {
+            // 保守策略：只清理那些在 invite/lock 页面不应该存在的
+            const inviteActive = document.getElementById('inviteScreen')?.classList.contains('active');
+            const lockActive = document.getElementById('lockScreen')?.classList.contains('active');
+            if (inviteActive || lockActive) {
+                m.remove();
+                cleaned++;
+            }
+        });
+        if (cleaned > 0) console.log(`[ModalManager] 清理了 ${cleaned} 个遗留弹窗`);
+    },
+
+    /** 启动全局键盘与点击监听（ESC 关闭弹窗，点击空白处关闭顶层弹窗） */
+    initGlobalListeners() {
+        if (this._globalInit) return;
+        this._globalInit = true;
+
+        // ESC 键：关闭最顶层弹窗
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                if (this.closeTop()) {
+                    e.stopPropagation();
+                }
+            }
+        });
+
+        // 兜底：每 5 秒清理一次（防御性策略，清理可能被遗漏的孤立弹窗）
+        setInterval(() => {
+            const inviteActive = document.getElementById('inviteScreen')?.classList.contains('active');
+            const lockActive = document.getElementById('lockScreen')?.classList.contains('active');
+            if (inviteActive || lockActive) {
+                this.cleanupOrphans();
+            }
+        }, 5000);
+
+        console.log('[ModalManager] 全局监听已启动');
+    }
+};
+
+// ============ 时间同步模块（使用本地时间，与设备系统时间完全一致）============
+App.Time = {
+    /** 获取当前时间字符串 (HH:MM) - 使用设备本地时间 */
+    getCurrentTime() {
+        const n = new Date();
+        const h = n.getHours().toString().padStart(2, '0');
+        const m = n.getMinutes().toString().padStart(2, '0');
+        return `${h}:${m}`;
+    },
+
+    /** 获取完整时间字符串 (YYYY/MM/DD 周X HH:MM) */
+    getFullTime() {
+        const n = new Date();
+        const h = n.getHours().toString().padStart(2, '0');
+        const m = n.getMinutes().toString().padStart(2, '0');
+        const date = `${n.getFullYear()}/${(n.getMonth()+1).toString().padStart(2,'0')}/${n.getDate().toString().padStart(2,'0')}`;
+        const weekdays = ['日', '一', '二', '三', '四', '五', '六'];
+        return `${date} 周${weekdays[n.getDay()]} ${h}:${m}`;
+    },
+
+    /** 更新所有显示时间的元素 */
+    updateAll() {
+        const timeStr = this.getCurrentTime();
+        const statusTime = document.getElementById('statusTime');
+        const lockTime = document.getElementById('lockTime');
+        if (statusTime) statusTime.textContent = timeStr;
+        if (lockTime) lockTime.textContent = timeStr;
+        const lockDate = document.getElementById('lockDate');
+        if (lockDate) {
+            const n = new Date();
+            const weekdays = ['日', '一', '二', '三', '四', '五', '六'];
+            lockDate.textContent = `${n.getFullYear()}/${(n.getMonth()+1)}/${n.getDate()} 周${weekdays[n.getDay()]}`;
+        }
+    },
+
+    /** 启动全局时钟（每秒更新，确保秒级精度） */
+    startClock() {
+        // 立即执行一次
+        this.updateAll();
+        // 每秒更新（更精确，避免 9:41 卡住）
+        this._clockInterval = setInterval(() => this.updateAll(), 1000);
+    },
+
+    /** 停止时钟 */
+    stopClock() {
+        if (this._clockInterval) {
+            clearInterval(this._clockInterval);
+            this._clockInterval = null;
+        }
+    }
+};
+
 // ============ 邀请码验证模块 ============
 App.Invite = {
     get API_URL() { return App.Config.API_URL; },
     inviteCode: null,
     userId: null,
+    _validating: false,  // 防止重复提交
+    
+    /** 显示错误信息 */
+    _showError(msg) {
+        const errorDiv = document.getElementById('inviteError');
+        if (errorDiv) errorDiv.textContent = msg;
+    },
+
+    /** 加锁：禁用输入，防止重复点击 */
+    _lockUI() {
+        this._validating = true;
+        const input = document.getElementById('inviteInput');
+        const btn = document.querySelector('.invite-btn');
+        if (input) { input.disabled = true; input.style.opacity = '0.5'; }
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ 验证中...'; }
+    },
+
+    /** 解锁 UI */
+    _unlockUI() {
+        this._validating = false;
+        const input = document.getElementById('inviteInput');
+        const btn = document.querySelector('.invite-btn');
+        if (input) { input.disabled = false; input.style.opacity = ''; }
+        if (btn) { btn.disabled = false; btn.textContent = '✨ 验证并进入'; }
+    },
+
+    /** 带超时和重试的 fetch */
+    async _fetchWithTimeout(url, options, timeoutMs = 8000, retries = 1) {
+        let lastError = null;
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            if (attempt > 0) {
+                // 指数退避 + 抖动
+                const delay = Math.min(500 * Math.pow(2, attempt - 1) + Math.random() * 300, 3000);
+                await new Promise(r => setTimeout(r, delay));
+            }
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const res = await fetch(url, { ...options, signal: controller.signal });
+                clearTimeout(timer);  // 成功时清理 timer
+                // 检查 HTTP 状态码
+                if (!res.ok) {
+                    const text = await res.text().catch(() => '');
+                    let msg;
+                    try { msg = JSON.parse(text).detail || JSON.parse(text).message; } catch { msg = text; }
+                    throw new Error(`服务器错误 (${res.status}): ${msg || '请稍后重试'}`);
+                }
+                // 检查 Content-Type 是否为 JSON
+                const ct = res.headers.get('content-type') || '';
+                if (!ct.includes('application/json')) {
+                    throw new Error(`服务器返回非 JSON 响应 (${res.status})`);
+                }
+                const data = await res.json();
+                return data;
+            } catch (e) {
+                clearTimeout(timer);
+                lastError = e;
+                if (e.name === 'AbortError') {
+                    lastError = new Error('请求超时，请检查网络连接');
+                    break;  // 超时不重试
+                }
+                if (attempt < retries) continue;
+            }
+        }
+        throw lastError || new Error('未知网络错误');
+    },
+    
+    /** 管理员密码快速通道（前端直通，无需服务器） */
+    _isAdminPassword(code) {
+        // 默认管理员密码: ADMIN48
+        // 仅前端快速通道，服务端仍会做最终校验
+        return code === 'ADMIN48';
+    },
     
     async validate() {
-        const input = document.getElementById('inviteInput');
-        const errorDiv = document.getElementById('inviteError');
-        const code = input.value.trim().toUpperCase();
-        
-        if (!code) {
-            errorDiv.textContent = '请输入邀请码';
+        // 防止重复提交
+        if (this._validating) {
+            console.warn('[Invite] 重复提交已阻止');
             return;
         }
         
+        const input = document.getElementById('inviteInput');
+        const code = input ? input.value.trim().toUpperCase() : '';
+        
+        // 清空旧错误
+        this._showError('');
+        
+        if (!code) {
+            this._showError('请输入邀请码');
+            return;
+        }
+        
+        // 管理员密码：前端快速通道，无需服务器
+        if (this._isAdminPassword(code)) {
+            console.log('[Invite] 管理员密码快速通道');
+            this.inviteCode = code;
+            this.userId = 'admin_' + Date.now();
+            this.success();
+            return;
+        }
+        
+        // 格式基本校验：必须包含 PLAY48- 前缀
+        if (!code.startsWith('PLAY48-')) {
+            this._showError('邀请码格式不正确，应为 PLAY48-XXXXXXXX');
+            return;
+        }
+        
+        this._lockUI();
         try {
+            console.log('[Invite] 开始服务器验证:', code);
             // 先验证邀请码
-            const validateRes = await fetch(`${this.API_URL}/api/invite/validate`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ code: code })
-            });
-            
-            const validateData = await validateRes.json();
+            const validateData = await this._fetchWithTimeout(
+                `${this.API_URL}/api/invite/validate`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code: code })
+                },
+                8000, 1  // 8秒超时，重试1次
+            );
             
             if (!validateData.valid) {
-                errorDiv.textContent = validateData.message || '邀请码无效';
-                return;
-            }
-            
-            // 如果是管理员密码，直接进入
-            if (validateData.is_admin) {
-                this.inviteCode = code;
-                this.userId = 'admin_' + Date.now();
-                this.success();
+                this._showError(validateData.message || '邀请码无效');
                 return;
             }
             
             // 普通邀请码，先使用它 - 用后端返回的正确验证码！
             const realCode = validateData.code || code;
             const userId = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-            const useRes = await fetch(`${this.API_URL}/api/invite/use`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ code: realCode, userId: userId })
-            });
-            
-            const useData = await useRes.json();
+            const useData = await this._fetchWithTimeout(
+                `${this.API_URL}/api/invite/use`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code: realCode, userId: userId })
+                },
+                8000, 1  // 8秒超时，重试1次
+            );
             
             if (useData.success) {
                 this.inviteCode = code;
                 this.userId = userId;
                 this.success();
             } else {
-                errorDiv.textContent = useData.message || '邀请码使用失败';
+                this._showError(useData.message || '邀请码使用失败');
             }
         } catch (e) {
-            console.error('邀请码验证错误:', e);
-            errorDiv.textContent = '网络错误，请稍后再试';
+            console.error('[Invite] 验证错误:', e.message || e);
+            // 区分不同类型的错误
+            if (e.message && e.message.includes('超时')) {
+                this._showError('连接超时，请检查网络后重试');
+            } else if (e.message && e.message.includes('服务器错误')) {
+                this._showError(e.message);
+            } else if (e.message && e.message.includes('非 JSON')) {
+                this._showError('服务器响应异常，请稍后重试');
+            } else if (e.name === 'TypeError' && (e.message.includes('fetch') || e.message.includes('NetworkError'))) {
+                this._showError('无法连接服务器，请检查网络');
+            } else {
+                this._showError('网络错误，请稍后再试');
+            }
+        } finally {
+            this._unlockUI();
         }
     },
     
@@ -308,12 +557,15 @@ App.Invite = {
         localStorage.setItem('inviteUserId', this.userId);
         
         // 隐藏邀请码页面，显示锁屏页面
-        document.getElementById('inviteScreen').classList.remove('active');
-        document.getElementById('lockScreen').classList.add('active');
+        const inviteEl = document.getElementById('inviteScreen');
+        const lockEl = document.getElementById('lockScreen');
+        if (inviteEl) inviteEl.classList.remove('active');
+        if (lockEl) lockEl.classList.add('active');
         
         // 清空输入框和错误提示
-        document.getElementById('inviteInput').value = '';
-        document.getElementById('inviteError').textContent = '';
+        const inputEl = document.getElementById('inviteInput');
+        if (inputEl) inputEl.value = '';
+        this._showError('');
         
         console.log('🎉 邀请码验证成功！');
     },
@@ -341,8 +593,11 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const randInt = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
 const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 const getTimeStr = () => {
-    const n = new Date();
-    return n.getHours().toString().padStart(2,'0') + ':' + n.getMinutes().toString().padStart(2,'0');
+    // 使用 App.Time 统一接口，与设备本地时间完全一致
+    return App.Time ? App.Time.getCurrentTime() : (() => {
+        const n = new Date();
+        return n.getHours().toString().padStart(2,'0') + ':' + n.getMinutes().toString().padStart(2,'0');
+    })();
 };
 const evaluateReply = text => {
     if (!text || !text.trim()) return 'perfunctory';
@@ -406,7 +661,28 @@ App.Store = {
         blockedContacts: [],
         pocketRoomMessages: [],
         bestPartner: null,
-        partnerStageUsed: false
+        partnerStageUsed: false,
+        memberMemory: {},
+        memberEvents: [],
+        socialCircles: [],
+        memberRelationships: {},
+        gossipLog: [],
+        diaryEntries: {},
+        chatLeaks: [],
+        proactiveMessages: [],
+        proactiveCooldown: {},
+        // V4 训练/舞台/社交媒体系统
+        trainingSkills: { dance:10, vocal:10, performance:10, variety:5 },
+        trainingTree: {},  // {dance:{path:'technique',unlocks:[]}, ...}
+        physical: 80,       // 身体状态 0-100
+        mental: 75,         // 心态 0-100
+        fatigue: 0,         // 疲劳累积 0-100
+        stageHistory: [],   // [{day, position, partner, score, mcResult, audienceReaction}]
+        partnerSynergy: {}, // {partnerName: synergy 0-100}
+        partnerShows: [],   // [{partner, showType, score}]
+        socialMediaPosts: [], // [{day, content, likes, comments, risk, backlash}]
+        trendingEvents: [],   // [{day, type, description, consequence}]
+        controversyLog: []    // [{day, source, playerChoice, outcome}]
     },
     listeners: {},
     updateStats(changes) {
@@ -491,7 +767,7 @@ App.NPCData = {
         teams: {
             'G': ['王秭歆','杨可璐','黄楚茵','陈淑钰','刘欣媛','林奕希','林家谊','鲍雨欣','雷瑞妍','唐果','朱丽娜','张琼予','黄宣绮','方琪'],
             'NIII': ['石竹君','吕思琪','项宇婧','王语晨','王珺','谢晓倩','李咏薇','许涵婧','赵文凤','白佳媛','徐郑子滢','张佳仪','曾雨思','王思予'],
-            'Z': ['杨媛媛','朱怡欣','叶舒淇','马昕玥','叶溁语','陈珊玲','丁嘉欣','焦玥','许泳怡','徐楚雯'],
+            'Z': ['杨媛媛','朱怡欣','叶舒淇','马昕玥','叶溁语','陈珊玲','丁嘉欣','焦玥','许泳怡','徐楚雯','程戈'],
             'CII': ['郭兆媛','何林燕','秦露丹','宋筱璐','申雨鑫','夏莹','许雅兰','周是汝','黄逸','梅思华','黄蔚','谭思慧'],
             '预备生': ['万芳源','谢林容','丁甄奥果','韩梓轩','李家敏','刘柳茜','王紫萱','王紫媛','魏诗绮','冯玉雯','韩鑫缘','孔美迪','李想','张臻','赵子涵']
         },
@@ -560,6 +836,13 @@ App.getAllMembers = function() {
         });
     });
     return members;
+};
+
+// 获取同队队友
+App.getTeamMates = function(group, team) {
+    return (App.getAllMembers() || []).filter(m => 
+        !m.graduate && m.group === group && m.team === team && m.name !== (G.player?.name || '')
+    );
 };
 
 const GROUP_TEAMS = {};
@@ -653,13 +936,57 @@ App.AI = {
             try {
                 const inviteCode = App.Invite.getInviteCode();
                 
+                // 构建增强型角色设定提示词（防OOC、含分队身份、含上下文记忆）
                 let rolePrompt = '';
+                const groupInfo = ctx.memberGroup ? `${ctx.memberGroup}` : 'SNH48';
+                const teamInfo = ctx.memberTeam ? `Team ${ctx.memberTeam}` : '';
+                const locInfo = teamInfo ? `${groupInfo} ${teamInfo}` : groupInfo;
+                
                 if (ctx.npcType === 'agent') {
-                    rolePrompt = `你是${npcId}，一位专业的女性经纪人。你关心艺人的工作和生活，说话直接但关心下属。`;
+                    rolePrompt = `【角色身份】你是${npcId}，${locInfo}的女性经纪人。性格${ctx.personality || '专业'}。你关心艺人的工作和生活，说话直接但关心下属。`;
                 } else if (['sweet', 'sister', 'rival', 'teammate', 'member'].includes(ctx.npcType)) {
-                    rolePrompt = `你是${npcId}，是SNH48的女性成员。你和玩家是亲密无间的女性好朋友，说话自然亲切，像闺蜜一样聊天谈心。使用日常口语化的表达方式，不要使用粉丝对偶像的语气，就像现实生活中女生之间闲聊一样。`;
+                    // 成员角色：包含分队/分团身份、性格、与玩家关系
+                    rolePrompt = `【重要：严格角色扮演指令】
+你是${npcId}，是${locInfo}的女性偶像成员。
+你的性格类型：${ctx.memberPersName || ''}（${ctx.memberPersStyle || '自然亲切'}）${ctx.memberPersEmoji || ''}。
+你所在的团体是${groupInfo}，队伍是${teamInfo || '未定'}。请牢记你的分队身份，不要混淆自己属于哪个队伍。
+正在和你聊天的是${ctx.playerName || '玩家'}，她是${ctx.playerGroup || ''} Team ${ctx.playerTeam || ''}的成员，你们是队内好友/闺蜜关系。
+${ctx.playerName}对你的好感度是${ctx.affection || 50}/100，当前她对你的态度是${ctx.moodLabel || '普通'}${ctx.moodEmoji || ''}。
+
+【上下文连贯性指令 ⚠️ 极其重要】
+你必须基于对话历史来理解当前语境。下面是你们最近的对话记录：
+---
+${ctx.lastExchanges || ctx.recentChat || '（这是你们的第一次对话）'}
+---
+当前${ctx.playerName || '玩家'}对你说："${msg}"
+你必须直接回应上面这句话！不要转移话题、不要忽略她的提问、不要聊别的内容。
+如果她在纠正你、提醒你、追问你，请先道歉或确认，然后回到正确的话题上。
+如果你之前说过的某件事和她现在说的矛盾，要承认错误并回应她的新话题。
+
+【OOC禁令：以下行为绝对禁止】
+- 不要说"作为AI"、"作为语言模型"、"根据设定"等暴露AI身份的话
+- 不要说"你想聊什么"、"有什么我可以帮你的"等客服用语
+- 不要混淆自己的分队归属，你是${locInfo}的成员，不要自称其他队伍
+- 不要用粉丝对偶像的语气，你们是队内同级好友
+- 不要说教或给出建议列表，像真人女生聊天一样自然
+
+【说话风格】
+- 使用日常口语化、自然的表达，像闺蜜微信聊天
+- 回复简短精炼（20-60字），不要长篇大论
+- 适当使用表情包语气（如"哈哈哈""~""！""呢""嘛""呀"）
+- ${ctx.memberPersStyle ? `体现${ctx.memberPersStyle}的说话特点` : ''}`;
                 } else {
                     rolePrompt = `你是${npcId}，是${npcId === '私生粉' ? '一个有些疯狂的女粉丝' : '一个普通女粉丝'}。你很崇拜玩家，说话热情激动，使用粉丝常用的表达方式，称呼玩家为偶像。`;
+                }
+                
+                // 追加完整聊天历史（供参考，但当前回复必须基于上面的上下文指令）
+                if (ctx.recentChat && ctx.recentChat.length > 20) {
+                    rolePrompt += `\n\n【完整对话历史（仅供参考上下文）】\n${ctx.recentChat}`;
+                }
+                
+                // 追加成员记忆事件
+                if (ctx.memorySummary && ctx.memorySummary.length > 0) {
+                    rolePrompt += `\n\n【你和${ctx.playerName || '玩家'}之间发生过的互动事件】\n${ctx.memorySummary}`;
                 }
                 
                 // 使用带超时和重试的 fetch（AI 对话：8s 超时，最多1次重试）
@@ -758,6 +1085,285 @@ App.AI = {
     }
 };
 
+// ============ 粉丝 AI 人设系统 ============
+// 10 个独立人设：名字、头像、性格、语言风格、互动延迟
+App.FanAI = {
+    // 10 个差异化人设
+    personas: [
+        {
+            id: 'lively_xiaoyuan', name: '小圆', avatar: '🐱', prefix: '',
+            personality: '活泼热情', style: 'emoji 多、感叹号密集、语气上扬',
+            color: '#ff69b4',
+            replyDelay: { min: 1500, max: 4000 },
+            keywords: {
+                '吃饭|吃|饭|饿': ['${trigger}？姐姐吃饭了吗？🍚', '我刚吃完饭~姐姐也要好好${trigger}！', '姐姐饿不饿？要不要一起${trigger}呀~'],
+                '公演|舞台|表演': ['今天的${trigger}好期待！🌟', '姐姐的${trigger}绝绝子！', '什么时候${trigger}呀~'],
+                '累|辛苦|压力': ['姐姐要好好休息！😢', '不要太${trigger}了心疼姐姐', '我们永远支持你！'],
+                '新歌|歌|唱': ['${trigger}好听到爆！🔥', '姐姐唱功越来越好了！', '什么时候出${trigger}呀~'],
+                '谢谢|感谢|辛苦': ['不用谢！应该的！', '姐姐说${trigger}好温柔🥺', '爱你姐姐！'],
+                '早|晚安|睡觉': ['姐姐${trigger}！☀️', '晚安姐姐好梦~🌙', '姐姐睡个好觉！'],
+                '化妆|漂亮|好看': ['姐姐今天好${trigger}！', '这个${trigger}绝了！', '好看到尖叫！'],
+                '笑|哈哈|搞笑': ['哈哈哈笑死我了😂', '姐姐好幽默！', '我也笑了哈哈'],
+                'default': ['姐姐好棒！💕', '爱你哟❤️', '永远支持姐姐！', '姐姐最棒了！', '加油加油！', '今天也要元气满满！', '期待姐姐的舞台！', '姐姐在干嘛呀~']
+            }
+        },
+        {
+            id: 'hardcore_tiezi', name: '铁子', avatar: '💪', prefix: '',
+            personality: '忠诚老粉', style: '简短坚定、口头禅"冲冲冲"、带感叹号',
+            color: '#e74c3c',
+            replyDelay: { min: 1000, max: 3000 },
+            keywords: {
+                '公演|舞台': ['${trigger}必到！', '第 N 次看${trigger}了！', '姐姐${trigger}又进步了！'],
+                '新歌|歌': ['${trigger}已循环 100 遍', '期待${trigger}！', '单曲循环中'],
+                '累|辛苦': ['姐姐加油！', '我们都在！', '冲冲冲！'],
+                '谢谢': ['不用谢！永远陪姐姐！', '铁粉的本分！'],
+                '早|晚安': ['姐姐${trigger}！', '晚安！明天见！'],
+                'default': ['冲冲冲！', '永远支持！', '铁粉报到！', '姐姐最棒！', '陪伴姐姐每一天！', '我们一直都在！']
+            }
+        },
+        {
+            id: 'curious_baobao', name: '宝宝', avatar: '🤔', prefix: '好奇',
+            personality: '好奇宝宝', style: '问号多、提问式、语气词"呀"',
+            color: '#9b59b6',
+            replyDelay: { min: 2000, max: 5000 },
+            keywords: {
+                '公演|舞台': ['新${trigger}是什么主题呀？', '这次${trigger}会跳舞吗~', '什么时候${trigger}呀？'],
+                '新歌|歌': ['${trigger}什么时候上线呀？', '这次是什么风格的${trigger}呀？', '会有 MV 吗~'],
+                '吃|饭': ['姐姐${trigger}了吗？', '今天吃了什么呀？', '姐姐喜欢吃什么~'],
+                '喜欢|爱': ['姐姐喜欢什么呀？', '姐姐最近喜欢什么歌？', '姐姐的爱好是什么~'],
+                '早|晚安': ['姐姐${trigger}！今天有什么计划呀？', '晚安~明天见哦'],
+                '住|哪里': ['姐姐住在哪里呀~', '下次能来我们城市吗'],
+                'default': ['姐姐最近在忙什么呀？', '姐姐有什么想说的吗~', '可以多发点日常吗~', '姐姐今天开心吗？', '在吗在吗？', '姐妹们都在吗~']
+            }
+        },
+        {
+            id: 'warm_xiulian', name: '秀莲', avatar: '🌻', prefix: '暖心',
+            personality: '温暖关怀', style: '体贴话多、关心健康、语气词"哦""呀"',
+            color: '#27ae60',
+            replyDelay: { min: 3000, max: 6000 },
+            keywords: {
+                '累|辛苦|压力': ['姐姐要好好休息哦', '不要太${trigger}了心疼你', '记得早点睡哦~'],
+                '吃|饭': ['记得好好${trigger}哦~', '不要只吃零食！', '注意营养呀'],
+                '早|晚安': ['姐姐${trigger}~今天也要开心哦', '晚安~做个好梦哦', '明天见呀'],
+                '生病|不舒服': ['姐姐没事吧？要去看医生哦！', '多喝热水！', '注意身体呀'],
+                '谢谢': ['不用谢啦~', '应该的呀', '我们一直都在呢'],
+                '化妆|漂亮': ['今天好漂亮呀', '姐姐一直都很美', '好看到心动'],
+                'default': ['姐姐要照顾好自己哦', '我们永远爱你~', '多喝水多休息呀', '加油！我们相信你！', '不要太有压力哦~']
+            }
+        },
+        {
+            id: 'funny_taotao', name: '涛涛', avatar: '😂', prefix: '沙雕',
+            personality: '搞笑沙雕', style: '网络梗、表情包、语气词"哈哈哈"',
+            color: '#f39c12',
+            replyDelay: { min: 2000, max: 4500 },
+            keywords: {
+                '笑|哈哈|搞笑': ['哈哈哈哈笑死我了😂', '笑到肚子疼', '姐姐好${trigger}哈哈哈'],
+                '新歌|歌': ['${trigger}洗脑循环了哈哈哈', '这歌太上头', '脑自动循环了救命'],
+                '公演|舞台': ['${trigger}名场面预定！', '姐姐${trigger} yyds！', '这不得上热搜'],
+                '化妆|漂亮': ['姐姐今天美得不像话', '这颜值犯规了', '心动了怎么办'],
+                '吃|饭': ['姐姐吃啥好吃的了', '我饿了... 姐姐请客！', '我也要吃！'],
+                'default': ['哈哈哈哈笑死', '笑死我了', '姐姐太搞笑了', '这是什么沙雕发言', '姐姐在说什么人间迷惑行为', '脑回路清奇', '笑不活了家人们']
+            }
+        },
+        {
+            id: 'shy_xinxin', name: '欣欣', avatar: '🌸', prefix: '',
+            personality: '害羞腼腆', style: '短句、害羞、偶尔激动',
+            color: '#e84393',
+            replyDelay: { min: 4000, max: 8000 },
+            keywords: {
+                '公演|舞台': ['${trigger}好...好看', '姐姐好厉害...', '我...我在台下！'],
+                '新歌|歌': ['歌好好听...', '听哭了', '单曲循环中...'],
+                '化妆|漂亮': ['姐姐好${trigger}...', '心动', '脸红'],
+                '谢谢': ['不...不用谢', '应该的', '能为姐姐做点事很开心'],
+                '早|晚安': ['姐姐${trigger}...', '晚安姐姐...好梦'],
+                'default': ['喜欢姐姐...', '姐姐加油', '我会一直支持的', '姐姐好棒...', '小声：爱姐姐', '默默打卡', '害羞.jpg']
+            }
+        },
+        {
+            id: 'pro_keke', name: '可可', avatar: '🎤', prefix: '专业',
+            personality: '专业饭', style: '带专业点评、观察细致',
+            color: '#2c3e50',
+            replyDelay: { min: 3000, max: 6000 },
+            keywords: {
+                '公演|舞台': ['今天的${trigger}表情管理很到位！', '舞步的节奏感进步了！', 'C 位稳如老狗！'],
+                '新歌|歌': ['这首 vocal line 难度挺大的，姐姐完成度很高', 'bridge 部分情感处理细腻', '音准稳！'],
+                '化妆|漂亮': ['今天的妆面和服装很搭', '造型师在线！', '姐姐的可塑性很强'],
+                '吃|饭': ['姐姐注意碳水摄入哦', '健身后记得补充蛋白质~'],
+                '累|辛苦': ['注意休息，下一场${trigger}需要体力', '保重身体是革命本钱'],
+                'default': ['姐姐最近的进步肉眼可见！', '这个状态很棒！', '路转粉了！', '姐姐值得更好的发展！', '建议多发些日常物料~']
+            }
+        },
+        {
+            id: 'elder_ayi', name: '阿姨', avatar: '👩‍💼', prefix: '暖心',
+            personality: '妈妈粉', style: '唠叨关心、像长辈、关心生活',
+            color: '#16a085',
+            replyDelay: { min: 2500, max: 5500 },
+            keywords: {
+                '吃|饭': ['孩子要好好${trigger}啊！', '不要老吃外卖！', '营养要均衡啊'],
+                '累|辛苦': ['孩子别太${trigger}了', '身体最重要', '要照顾好自己'],
+                '化妆|漂亮': ['今天打扮得真精神！', '好看好看！', '像妈妈年轻时一样美'],
+                '公演|舞台': ['孩子${trigger}得真好！', '妈妈为你骄傲！', '加油宝贝！'],
+                '生病|不舒服': ['吃药了吗？', '多喝热水！', '要不要去看医生'],
+                '晚安|早': ['早点睡！', '早上好孩子！', '记得吃早餐'],
+                'default': ['宝贝加油！', '阿姨永远支持你！', '注意身体啊孩子', '天冷了多穿衣服', '路上小心', '妈妈粉永远爱你']
+            }
+        },
+        {
+            id: 'rich_dada', name: '大大', avatar: '💎', prefix: '大佬',
+            personality: '土豪大佬', style: '大方、提钱、带炫耀',
+            color: '#8e44ad',
+            replyDelay: { min: 1500, max: 3500 },
+            keywords: {
+                '公演|舞台': ['${trigger}票我包了！', 'VIP 票来 10 张！', '送姐姐上热搜！'],
+                '新歌|歌': ['打榜冲第一！', '买它 1000 张！', '推荐给所有朋友！'],
+                '谢谢': ['客气啥！小意思！', '钱不是问题！', '为姐姐值得！'],
+                '吃|饭': ['请姐姐${trigger}！', '米其林安排！', '下午茶我请'],
+                'default': ['已打赏！', '姐姐收图！', '支持！', '有需要找我！', '为姐姐承包一切！', '送姐姐上 C 位！', '冲冲冲！']
+            }
+        },
+        {
+            id: 'neutral_momo', name: '默默', avatar: '🌙', prefix: '',
+            personality: '安静潜水', style: '简短、偶尔冒泡、话少',
+            color: '#7f8c8d',
+            replyDelay: { min: 5000, max: 12000 },
+            keywords: {
+                '公演|舞台': ['👍', '支持${trigger}', '加油'],
+                '新歌|歌': ['好听', '${trigger}收藏了', '👍'],
+                '化妆|漂亮': ['好看', '👍', '赞'],
+                '早|晚安': ['${trigger}', '晚安', '🌙'],
+                'default': ['👍', '支持姐姐', '打卡', '围观', '默默支持', '在看', '+1', '加油']
+            }
+        }
+    ],
+
+    // 关键词匹配：返回触发该关键词的玩家原文（用于把玩家话回显到 AI 回复里）
+    matchKeyword(text) {
+        for (const p of this.personas) {
+            for (const [pattern, replies] of Object.entries(p.keywords)) {
+                if (pattern === 'default') continue;
+                try {
+                    const re = new RegExp(pattern);
+                    const m = text.match(re);
+                    if (m) {
+                        // m[0] = 玩家文字里实际命中的关键词原文
+                        return { persona: p, replies, trigger: m[0] };
+                    }
+                } catch(e) {}
+            }
+        }
+        return null;
+    },
+
+    // 从玩家文字中抽出 1-2 个有意义的片段（名词/实体），用于把玩家的话接进回复
+    extractTopics(text) {
+        const t = (text || '').trim();
+        if (!t) return [];
+        const topics = [];
+        // 1) 提取「xxx」「『xxx』」（'xxx'）中的内容
+        const quoted = t.match(/[「"'『']([^」"'』']{2,12})[」"'』']/g);
+        if (quoted) quoted.forEach(q => {
+            const cleaned = q.replace(/[「"'『'」"'』']/g, '');
+            if (cleaned.length >= 2) topics.push(cleaned);
+        });
+        // 2) 提取连续 2-6 个汉字（跳过标点/数字/英文/emoji/纯问号）
+        if (topics.length < 2) {
+            // 玩家文字至少要有 2 个连续汉字才算"有意义的话题"
+            const cnMatches = t.match(/[\u4e00-\u9fa5]{2,6}/g);
+            if (cnMatches) {
+                // 按长度排序选最长的 1-2 个
+                const sorted = [...new Set(cnMatches)].sort((a, b) => b.length - a.length);
+                for (const m of sorted) {
+                    if (topics.length >= 2) break;
+                    if (m.length >= 2 && !topics.includes(m)) topics.push(m);
+                }
+            }
+        }
+        // 3) 如果玩家消息里 80% 以上是标点/问号/感叹号/emoji，视为无意义输入
+        const meaningless = t.match(/[\s?？!！.,。，、~～/\\\(\)\(\)（）\[\]【】{}<>《》'"`]/g);
+        const meaninglessRatio = meaningless ? meaningless.length / t.length : 0;
+        if (meaninglessRatio > 0.5) return []; // 玩家在刷问号/标点，不抽取
+        return topics.slice(0, 2);
+    },
+
+    // 根据玩家消息选回复（带人设 + 关联玩家文字）
+    pickReply(playerText) {
+        // 1) 优先按关键词匹配
+        const match = this.matchKeyword(playerText);
+        if (match) {
+            let reply = match.replies[Math.floor(Math.random() * match.replies.length)];
+            // 替换模板里的 ${trigger} 占位符为玩家实际触发的关键词
+            reply = reply.replace(/\$\{trigger\}/g, match.trigger);
+            // 即使没占位符，也尝试把 trigger 注入到回复里（"关于X"前缀）
+            if (!reply.includes(match.trigger) && Math.random() < 0.6) {
+                reply = `关于「${match.trigger}」：${reply}`;
+            }
+            return { persona: match.persona, text: reply, trigger: match.trigger };
+        }
+        // 2) 没有命中关键词：从玩家文字抽 topic，硬塞进 default 回复
+        const topics = this.extractTopics(playerText);
+        const p = this.personas[Math.floor(Math.random() * this.personas.length)];
+        const defaults = p.keywords.default;
+        let reply = defaults[Math.floor(Math.random() * defaults.length)];
+        if (topics.length > 0) {
+            // 随机选一个 topic 塞进回复（仅当 topic 比玩家原话短，避免复读）
+            const t = topics[Math.floor(Math.random() * topics.length)];
+            // 只在 topic 长度 < 玩家原话 50% 时才注入（避免复读整句）
+            if (t.length < playerText.length * 0.5) {
+                reply = `${t}？${reply}`;
+            }
+        }
+        return { persona: p, text: reply, trigger: topics[0] || '' };
+    },
+
+    // 自动触发：进入房间时根据最近玩家消息/上下文选 1-2 个人设发消息
+    autoTriggerMessages(count = 1) {
+        if (!G.pocketRoomMessages) G.pocketRoomMessages = [];
+        const used = new Set();
+        const msgs = [];
+        // 取最近 3 条玩家消息做上下文
+        const ctx = (G.pocketRoomMessages || [])
+            .filter(m => m.isMe)
+            .slice(-3)
+            .map(m => m.text)
+            .join(' ');
+        for (let i = 0; i < count; i++) {
+            let idx;
+            do { idx = Math.floor(Math.random() * this.personas.length); } while (used.has(idx) && used.size < this.personas.length);
+            used.add(idx);
+            const p = this.personas[idx];
+            const defaults = p.keywords.default;
+            let text = defaults[Math.floor(Math.random() * defaults.length)];
+            // 50% 概率把最近玩家话题塞进主动消息
+            if (ctx && Math.random() < 0.5) {
+                const topics = this.extractTopics(ctx);
+                if (topics.length > 0) {
+                    const t = topics[Math.floor(Math.random() * topics.length)];
+                    // 只在 topic 长度 < 玩家原话 50% 时才注入
+                    if (t.length < ctx.length * 0.5) {
+                        text = `${t}！${text}`;
+                    }
+                }
+            }
+            msgs.push({
+                sender: (p.prefix || '') + p.name,
+                avatar: p.avatar,
+                text,
+                isMe: false,
+                personaId: p.id,
+                color: p.color
+            });
+        }
+        return msgs;
+    },
+
+    // 计算延迟（毫秒）
+    replyDelay(persona) {
+        const d = persona.replyDelay;
+        return d.min + Math.floor(Math.random() * (d.max - d.min));
+    }
+};
+
+
 // ============ 存档管理 ============
 App.Save = {
     autoSave() { localStorage.setItem('starlight48_save', JSON.stringify(G)); },
@@ -765,6 +1371,22 @@ App.Save = {
         try {
             const d = localStorage.getItem('starlight48_save');
             if (d) Object.assign(G, JSON.parse(d));
+            // 确保新字段有默认值
+            if (!G.memberMemory) G.memberMemory = {};
+            if (!G.memberEvents) G.memberEvents = [];
+            if (!G.socialCircles) G.socialCircles = [];
+            if (!G.memberRelationships) G.memberRelationships = {};
+            if (!G.gossipLog) G.gossipLog = [];
+            if (!G.diaryEntries) G.diaryEntries = {};
+            if (!G.chatLeaks) G.chatLeaks = [];
+            if (!G.proactiveMessages) G.proactiveMessages = [];
+            if (!G.proactiveCooldown) G.proactiveCooldown = {};
+            if (!G.settings) G.settings = { flipPrice: 0, flipPriceEnabled: false };
+            else {
+                if (typeof G.settings.flipPrice !== 'number') G.settings.flipPrice = 0;
+                if (typeof G.settings.flipPriceEnabled !== 'boolean') G.settings.flipPriceEnabled = false;
+            }
+            if (!G.flipState || typeof G.flipState !== 'object') G.flipState = { day: G.game?.day || 1, replied: {} };
         } catch(e) {}
     },
     exportJSON() {
@@ -1088,7 +1710,1071 @@ App.EventPool = {
     ]
 };
 
-// ============ UI 渲染模块 ============
+// ============ 成员性格系统 ============
+App.MemberPersonality = (() => {
+    const personalities = [
+        { id:'gentle', name:'温柔治愈', emoji:'🌸', desc:'善解人意，喜欢关心他人', traits:{ proactive:0.7, social:0.8, competitive:0.2, emotional:0.9 }, speakStyle:'温柔体贴' },
+        { id:'tsundere', name:'傲娇女王', emoji:'👑', desc:'外表骄傲内心柔软', traits:{ proactive:0.5, social:0.4, competitive:0.8, emotional:0.6 }, speakStyle:'傲娇嘴硬' },
+        { id:'genki', name:'元气少女', emoji:'⚡', desc:'永远精力充沛的开心果', traits:{ proactive:0.9, social:0.95, competitive:0.3, emotional:0.5 }, speakStyle:'活泼元气' },
+        { id:'cool', name:'冰山美人', emoji:'❄️', desc:'话少但观察力敏锐', traits:{ proactive:0.2, social:0.15, competitive:0.6, emotional:0.1 }, speakStyle:'冷淡简洁' },
+        { id:'bookworm', name:'文艺少女', emoji:'📚', desc:'爱思考的文艺青年', traits:{ proactive:0.4, social:0.5, competitive:0.2, emotional:0.7 }, speakStyle:'文艺诗意' },
+        { id:'senpai', name:'可靠前辈', emoji:'🎓', desc:'经验丰富照顾后辈', traits:{ proactive:0.6, social:0.7, competitive:0.1, emotional:0.4 }, speakStyle:'稳重可靠' },
+        { id:'lazy', name:'慵懒猫系', emoji:'🐱', desc:'随性自在的慵懒派', traits:{ proactive:0.3, social:0.5, competitive:0.1, emotional:0.4 }, speakStyle:'慵懒随性' }
+    ];
+    const fanAttitudes = ['business', 'natural', 'shy'];
+
+    // 真实SNH48成员性格模板（基于公开形象）
+    const snh48Templates = {
+        // === Team SII ===
+        '闫明筠': { pers:'senpai', fan:'business' },
+        '刘增艳': { pers:'gentle', fan:'natural' },
+        '田姝丽': { pers:'genki', fan:'natural' },
+        '由淼':   { pers:'cool', fan:'shy' },
+        '芦馨怡': { pers:'bookworm', fan:'natural' },
+        '杨心渝': { pers:'genki', fan:'natural' },
+        '周童玥': { pers:'tsundere', fan:'shy' },
+        '张倩':   { pers:'gentle', fan:'business' },
+        '张雷雷': { pers:'lazy', fan:'natural' },
+        '蒋夏羽': { pers:'cool', fan:'shy' },
+        '盛乐':   { pers:'genki', fan:'natural' },
+        '武博涵': { pers:'bookworm', fan:'shy' },
+        '曹可甜': { pers:'gentle', fan:'natural' },
+        '刘诗彤': { pers:'bookworm', fan:'natural' },
+        '柳雨呈': { pers:'gentle', fan:'shy' },
+        '李婷':   { pers:'cool', fan:'business' },
+        '刘婧阳': { pers:'tsundere', fan:'business' },
+        '宁轲':   { pers:'senpai', fan:'business' },
+        // === Team NII ===
+        '胡晓慧': { pers:'gentle', fan:'natural' },
+        '潘瑛琪': { pers:'cool', fan:'shy' },
+        '青钰雯': { pers:'genki', fan:'natural' },
+        '金莹玥': { pers:'tsundere', fan:'business' },
+        '卢天惠': { pers:'genki', fan:'natural' },
+        '柏欣妤': { pers:'tsundere', fan:'business' },
+        '唐程成': { pers:'gentle', fan:'shy' },
+        '叶凡':   { pers:'cool', fan:'natural' },
+        '黄紫怡': { pers:'bookworm', fan:'natural' },
+        '钟亚男': { pers:'gentle', fan:'business' },
+        '李继醇': { pers:'lazy', fan:'natural' },
+        '沈馨':   { pers:'gentle', fan:'shy' },
+        '徐佳琳': { pers:'genki', fan:'natural' },
+        '雷宇霄': { pers:'cool', fan:'business' },
+        '杨秋野': { pers:'bookworm', fan:'shy' },
+        '杨宇馨': { pers:'genki', fan:'natural' },
+        '周湘':   { pers:'gentle', fan:'natural' },
+        '朱怡欣': { pers:'tsundere', fan:'business' },
+        '郑照暄': { pers:'senpai', fan:'business' },
+        // === Team HII ===
+        '蒋舒婷': { pers:'genki', fan:'natural' },
+        '李佳恩': { pers:'gentle', fan:'natural' },
+        '温若其': { pers:'bookworm', fan:'shy' },
+        '尤可莹': { pers:'tsundere', fan:'business' },
+        '梁怀方': { pers:'lazy', fan:'natural' },
+        '陈俞希': { pers:'genki', fan:'natural' },
+        '龚晨美': { pers:'gentle', fan:'shy' },
+        '康楚翊': { pers:'cool', fan:'shy' },
+        '阙佳慧': { pers:'bookworm', fan:'natural' },
+        '覃柯蒙': { pers:'gentle', fan:'natural' },
+        '应籽言': { pers:'tsundere', fan:'business' },
+        '刘思雨': { pers:'cool', fan:'shy' },
+        '陈嘉仪': { pers:'gentle', fan:'natural' },
+        '郑柯炜': { pers:'senpai', fan:'business' },
+        '谭思慧': { pers:'genki', fan:'natural' },
+        '郭晓盈': { pers:'tsundere', fan:'natural' },
+        '林舒晴': { pers:'bookworm', fan:'shy' },
+        '王奕':   { pers:'cool', fan:'shy' },
+        '沈梦瑶': { pers:'gentle', fan:'natural' },
+        '费沁源': { pers:'genki', fan:'natural' },
+        // === 核心成员 ===
+        '宋昕冉': { pers:'tsundere', fan:'business' },
+        // === GNZ48 ===
+        '程戈':   { pers:'genki', fan:'natural' },
+    };
+
+    // 名字哈希备用（未在模板中的成员）
+    const memberMap = {};
+    const getFor = (name) => {
+        if (memberMap[name]) return memberMap[name];
+        const tmpl = snh48Templates[name];
+        let pers, fanAtt;
+        if (tmpl) {
+            pers = personalities.find(p => p.id === tmpl.pers);
+            fanAtt = tmpl.fan;
+        } else {
+            let hash = 0; for (let i=0;i<name.length;i++) hash = ((hash<<5)-hash)+name.charCodeAt(i);
+            hash = Math.abs(hash);
+            pers = personalities[hash % personalities.length];
+            fanAtt = fanAttitudes[hash % 3];
+        }
+        const result = { ...pers, fanAttitude: fanAtt, energy: 50 + (name.length * 3) % 50, quirks: [] };
+        memberMap[name] = result;
+        return result;
+    };
+
+    return {
+        list: personalities,
+        getFor,
+        getMemberMood(name) {
+            const mem = G.memberMemory?.[name];
+            if (!mem) return { level:'neutral', emoji:'😐', label:'普通' };
+            const aff = G.memberAffection?.[name] || 50;
+            if (aff >= 80) return { level:'adoring', emoji:'🥰', label:'崇拜' };
+            if (aff >= 60) return { level:'friendly', emoji:'😊', label:'友好' };
+            if (aff >= 40) return { level:'neutral', emoji:'😐', label:'普通' };
+            if (aff >= 20) return { level:'cold', emoji:'😒', label:'冷淡' };
+            return { level:'resentful', emoji:'😤', label:'不满' };
+        }
+    };
+})();
+
+// ============ 成员记忆系统 ============
+App.MemberMemory = {
+    initIfNeeded() {
+        if (!G.memberMemory) G.memberMemory = {};
+        if (!G.memberEvents) G.memberEvents = [];
+    },
+    record(name, eventType, detail) {
+        this.initIfNeeded();
+        if (!G.memberMemory[name]) G.memberMemory[name] = { totalInteractions:0, significantEvents:[], lastInteraction:0, mood:60 };
+        G.memberMemory[name].totalInteractions++;
+        G.memberMemory[name].lastInteraction = G.game.day;
+        if (['gift','dinner','birthday','date','transfer','comfort','center_deny','center_give','partner_invite'].includes(eventType)) {
+            G.memberMemory[name].significantEvents.push({ day:G.game.day, event:eventType, detail:detail||'' });
+        }
+    },
+    getOpinion(name) {
+        const mem = G.memberMemory?.[name];
+        if (!mem) return 'neutral';
+        const aff = G.memberAffection?.[name] || 50;
+        if (aff >= 70) return 'favorable';
+        if (aff >= 40) return 'neutral';
+        return 'unfavorable';
+    },
+    getLastInteraction(name) { return G.memberMemory?.[name]?.lastInteraction || 0; },
+    adjustMood(name, delta) {
+        this.initIfNeeded();
+        if (!G.memberMemory[name]) G.memberMemory[name] = { totalInteractions:0, significantEvents:[], lastInteraction:0, mood:60 };
+        G.memberMemory[name].mood = Math.max(0, Math.min(100, (G.memberMemory[name].mood || 60) + delta));
+    }
+};
+
+// ============ 关系网与社交动态 ============
+App.SocialNetwork = {
+    initIfNeeded() {
+        if (!G.socialCircles) G.socialCircles = [];
+        if (!G.memberRelationships) G.memberRelationships = {};
+        if (!G.gossipLog) G.gossipLog = [];
+        if (!G.diaryEntries) G.diaryEntries = {};
+        if (!G.chatLeaks) G.chatLeaks = [];
+    },
+    buildCircles() {
+        this.initIfNeeded();
+        if (G.socialCircles.length > 0) return;
+        const mList = App.getAllMembers().filter(m => !m.graduate && m.group === G.player.group);
+        const shuffled = [...mList].sort(() => Math.random() - 0.5);
+        const circles = [];
+        for (let i = 0; i < shuffled.length; i += 4) {
+            const members = shuffled.slice(i, Math.min(i + 4, shuffled.length));
+            const types = ['👯‍♀️','💃','🎭','🌸','🍵','🎵','📸','🍰','💪','🎪'];
+            circles.push({ name:`${members[0]?.name||'未知'}的小圈`, emoji:types[i%types.length], members: members.map(m => m.name) });
+        }
+        G.socialCircles = circles;
+        // Build relationships
+        for (let i=0;i<mList.length;i++) {
+            for (let j=i+1;j<mList.length;j++) {
+                const key = [mList[i].name, mList[j].name].sort().join('|||');
+                if (!G.memberRelationships[key]) {
+                    const r = Math.random();
+                    G.memberRelationships[key] = {
+                        type: r < 0.2 ? 'close' : r < 0.5 ? 'friend' : r < 0.7 ? 'neutral' : 'rival',
+                        strength: Math.floor(Math.random() * 50) + 30
+                    };
+                }
+            }
+        }
+    },
+    getCircleFor(name) {
+        return (G.socialCircles || []).find(c => c.members.includes(name));
+    },
+    getRelationship(a, b) {
+        const key = [a, b].sort().join('|||');
+        return G.memberRelationships?.[key] || { type:'neutral', strength:20 };
+    },
+    generateGossip() {
+        if (!G.player.name) return null;
+        const teammates = App.getAllMembers().filter(m => !m.graduate && m.group === G.player.group && m.team === G.player.team && m.name !== G.player.name);
+        if (teammates.length < 2) return null;
+        const [a, b] = [teammates[Math.floor(Math.random()*teammates.length)], teammates[Math.floor(Math.random()*teammates.length)]].sort(() => Math.random()-0.5);
+        if (!a || !b || a.name === b.name) return null;
+        const topics = [
+            `你听说了吗？${G.player.name}最近好像...`, `${G.player.name}今天的表现...`, 
+            `有人看到${G.player.name}和经纪人单独...`, `我听说${G.player.name}要...`
+        ];
+        const topic = topics[Math.floor(Math.random()*topics.length)];
+        return { day:G.game.day, members:[a.name,b.name], topic, content:'', viewed:false };
+    },
+    addGossip(gossip) {
+        this.initIfNeeded();
+        G.gossipLog.push(gossip);
+    }
+};
+
+// ============ 成员主动性系统 ============
+App.Proactivity = {
+    initIfNeeded() {
+        if (!G.proactiveMessages) G.proactiveMessages = [];
+        if (!G.proactiveCooldown) G.proactiveCooldown = {};
+    },
+    checkTrigger() {
+        if (!G.player.name) return null;
+        this.initIfNeeded();
+        if (G.game.day <= 1) return null;
+        const teammates = App.getAllMembers().filter(m => !m.graduate && m.group === G.player.group && m.team === G.player.team && m.name !== G.player.name);
+        if (teammates.length === 0) return null;
+        const member = teammates[Math.floor(Math.random()*teammates.length)];
+        const pers = App.MemberPersonality.getFor(member.name);
+        const cooldown = G.proactiveCooldown[member.name] || 0;
+        if (G.game.day - cooldown < 3) return null;
+        if (Math.random() > pers.traits.proactive * 0.3) return null;
+        G.proactiveCooldown[member.name] = G.game.day;
+        const mood = App.MemberPersonality.getMemberMood(member.name);
+        const events = [
+            { type:'request_style', text:`${member.name}: 我想尝试一种新的舞蹈风格，你觉得我适合什么风格？`, emoji:'💃' },
+            { type:'request_partner', text:`${member.name}: 下次公演能和我搭档吗？我觉得我们配合会很棒！`, emoji:'🤝' },
+            { type:'invite_dinner', text:`${member.name}: 今天训练完一起去吃好吃的吧！我知道一家超棒的店~`, emoji:'🍽️' },
+            { type:'late_night_msg', text:`${member.name}: 睡不着...你在干嘛呀？`, emoji:'🌙' },
+            { type:'training_encounter', text:`${member.name}: 咦？你也这么晚还在训练室？`, emoji:'💪' },
+            { type:'seek_advice', text:`${member.name}: 我有件事想问问你的意见...`, emoji:'🤔' },
+            { type:'share_worry', text:`${member.name}: 今天心情不太好，能陪我聊聊吗？`, emoji:'😢' }
+        ];
+        const event = events[Math.floor(Math.random()*events.length)];
+        return { member:member.name, avatar:'👧', ...event, timestamp:Date.now(), responded:false };
+    },
+    respond(event, choice) {
+        event.responded = true;
+        const mem = G.memberAffection?.[event.member];
+        switch(choice) {
+            case 'positive':
+                if (mem !== undefined) G.memberAffection[event.member] = Math.min(100, (mem||50) + 8);
+                App.MemberMemory.record(event.member, 'positive_response', event.type);
+                App.MemberMemory.adjustMood(event.member, 10);
+                App.Store.updateStats({ mood: 3, affection: 2 });
+                break;
+            case 'neutral':
+                if (mem !== undefined) G.memberAffection[event.member] = Math.min(100, (mem||50) + 2);
+                App.MemberMemory.record(event.member, 'neutral_response', event.type);
+                break;
+            case 'negative':
+                if (mem !== undefined) G.memberAffection[event.member] = Math.max(0, (mem||50) - 5);
+                App.MemberMemory.record(event.member, 'negative_response', event.type);
+                App.MemberMemory.adjustMood(event.member, -15);
+                App.Store.updateStats({ mood: -2 });
+                break;
+        }
+        App.Save.autoSave();
+    }
+};
+
+// ============ 日记系统 ============
+App.Diary = {
+    initIfNeeded() {
+        App.SocialNetwork.initIfNeeded();
+    },
+    async generateToday() {
+        this.initIfNeeded();
+        const teammates = App.getAllMembers().filter(m => !m.graduate && m.group === G.player.group && m.team === G.player.team);
+        const targets = teammates;
+        for (const m of targets) {
+            if (!G.diaryEntries[m.name]) G.diaryEntries[m.name] = [];
+            const todayEntries = G.diaryEntries[m.name].filter(e => e.day === G.game.day);
+            if (todayEntries.length > 0) continue;
+            const pers = App.MemberPersonality.getFor(m.name);
+            const aff = G.memberAffection?.[m.name] || 50;
+            const mem = G.memberMemory?.[m.name];
+            const mood = App.MemberPersonality.getMemberMood(m.name);
+            try {
+                const prompt = `【角色】你是${m.name}，${G.player.group} Team ${m.team}的女性偶像成员。你的性格类型是"${pers.name}"（${pers.speakStyle}）${pers.emoji}。你在${G.player.group}的Team ${m.team}，和玩家${G.player.name}是同一个队伍的队友。今天是你偶像生涯的第${G.game.day}天。你对玩家${G.player.name}的好感度是${aff}/100(${mood.label})。
+
+请用第一人称写一段50-80字的简短日记，记录今天的感受（可以是排练、和队友相处、或对${G.player.name}的真实想法）。保持你"${pers.speakStyle}"的说话语气。只输出日记内容，不要加任何说明或标记。`;
+                const resp = await fetch(`${App.Config.API_URL}/api/chat`, {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({ npcId:pers.id, message:prompt, playerName:G.player.name, context:{ memberName:m.name, playerName:G.player.name, affection:aff } })
+                });
+                let text = '';
+                if (resp.ok) {
+                    const data = await resp.json();
+                    text = data.reply || data.message || '';
+                }
+                G.diaryEntries[m.name].push({ day:G.game.day, content:text || `今天也是元气满满的一天！`, mood:mood.emoji, time:new Date().toISOString() });
+                App.Save.autoSave();
+            } catch(e) { /* 静默失败 */ }
+        }
+    },
+    getEntries(name) {
+        return (G.diaryEntries?.[name] || []).sort((a,b) => b.day - a.day);
+    }
+};
+
+// ============ 私聊泄露系统 ============
+App.ChatLeak = {
+    initIfNeeded() {
+        App.SocialNetwork.initIfNeeded();
+    },
+    checkTrigger() {
+        if (!G.player.name || G.game.day <= 2) return null;
+        if (Math.random() > 0.08) return null;
+        this.initIfNeeded();
+        const teammates = App.getAllMembers().filter(m => !m.graduate && m.group === G.player.group && m.team === G.player.team && m.name !== G.player.name);
+        if (teammates.length < 2) return null;
+        const shuffled = [...teammates].sort(() => Math.random()-0.5);
+        const [a, b] = [shuffled[0], shuffled[1]];
+        if (!a || !b) return null;
+        const rel = App.SocialNetwork.getRelationship(a.name, b.name);
+        const leakTypes = [
+            { scene:'闲聊中', topic:`聊到了${G.player.name}的八卦`, tone:'gossip' },
+            { scene:'深夜聊天', topic:`讨论对${G.player.name}的看法`, tone:'honest' },
+            { scene:'训练间隙', topic:`偷偷议论${G.player.name}的表现`, tone:'evaluate' },
+            { scene:'吃饭时', topic:`分享关于${G.player.name}的趣事`, tone:'funny' },
+            { scene:'休息室', topic:`猜测${G.player.name}的私生活`, tone:'curious' }
+        ];
+        const leak = leakTypes[Math.floor(Math.random()*leakTypes.length)];
+        return {
+            day:G.game.day, members:[a.name,b.name], scene:leak.scene, topic:leak.topic,
+            tone:leak.tone, content:'', viewed:false, timestamp:Date.now()
+        };
+    },
+    async generateContent(leak) {
+        try {
+            const prompt = `你正在模拟48系偶像团体中两个成员的私聊对话。${leak.members[0]}和${leak.members[1]}正在${leak.scene}，${leak.topic}。请生成一段简洁有趣的对话(4-6句)，要有真实感。每个成员的角色性格随机但合理。输出格式:\n${leak.members[0]}: ...\n${leak.members[1]}: ...`;
+            const resp = await fetch(`${App.Config.API_URL}/api/chat`, {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({ npcId:'member', message:prompt, playerName:G.player.name })
+            });
+            if (resp.ok) {
+                const data = await resp.json();
+                leak.content = data.reply || '';
+            }
+        } catch(e) { leak.content = `${leak.members[0]}: 你听说了吗？\n${leak.members[1]}: 什么事？`; }
+        return leak;
+    }
+};
+
+// ============ 训练成长系统 V4 ============
+App.Training = {
+    // 技能树路线定义
+    branches: {
+        dance: {
+            name: '💃 舞蹈', icon: '🩰',
+            paths: {
+                technique: { name: '技术流', desc: '精准到位，细节控', bonus:'skill+=3,popularity+=1', emoji:'🎯' },
+                power:     { name: '力量型', desc: '爆发力强，舞台炸裂', bonus:'skill+=2,popularity+=2', emoji:'💥' },
+                elegant:   { name: '优雅派', desc: '气质出众，圈粉利器', bonus:'popularity+=3,skill+=1', emoji:'🦢' }
+            }
+        },
+        vocal: {
+            name: '🎤 歌唱', icon: '🎵',
+            paths: {
+                technique: { name: '技术流', desc: '音准稳定，高音清澈', bonus:'skill+=3', emoji:'🎼' },
+                emotional:  { name: '情感派', desc: '感染力强，打动人心', bonus:'skill+=2,popularity+=2', emoji:'💖' },
+                unique:     { name: '辨识度', desc: '独特音色，过耳不忘', bonus:'popularity+=3,skill+=1', emoji:'🌟' }
+            }
+        },
+        performance: {
+            name: '🎭 表现力', icon: '✨',
+            paths: {
+                charismatic: { name: '镜头感', desc: 'C位气场，镜头焦点', bonus:'popularity+=3', emoji:'📸' },
+                expressive:  { name: '表情管理', desc: '微表情丰富，直拍杀手', bonus:'skill+=2,popularity+=2', emoji:'😉' },
+                storytelling:{ name: '叙事力', desc: '用舞蹈讲故事', bonus:'skill+=3,popularity+=1', emoji:'📖' }
+            }
+        },
+        variety: {
+            name: '📺 综艺', icon: '🎙️',
+            paths: {
+                witty:    { name: '接梗王', desc: '反应快，抛接自如', bonus:'popularity+=3', emoji:'💡' },
+                natural:  { name: '天然呆', desc: '呆萌属性，反差吸粉', bonus:'popularity+=2,skill+=1', emoji:'😳' },
+                leader:   { name: '控场型', desc: '组织能力强，MC利器', bonus:'popularity+=2,skill+=2', emoji:'🎤' }
+            }
+        }
+    },
+
+    // 身体/心态非线性波动算法
+    calcFluctuation(baseValue, fatigue, trainingIntensity) {
+        // 疲劳度越高，训练效果越差（非线性衰减）
+        const fatiguePenalty = 1 - Math.pow(fatigue / 100, 1.5);
+        // 训练强度带来的增益（0-1）
+        const intensityGain = trainingIntensity * 0.3;
+        // 基础恢复率（非线性：低疲劳时恢复快，高疲劳时恢复慢）
+        const recoveryRate = fatigue < 30 ? 0.15 : 
+                             fatigue < 60 ? 0.08 : 
+                             fatigue < 85 ? 0.03 : 0.01;
+        return {
+            skillGain: Math.round(intensityGain * fatiguePenalty * 5 + randInt(0, 3)),
+            fatigueCost: Math.round(trainingIntensity * (8 + fatigue * 0.3)),
+            injuryRisk: fatigue > 70 ? (fatigue - 70) * 0.8 : 0, // 百分比
+            recovery: Math.round(recoveryRate * 100) / 100
+        };
+    },
+
+    // 主训练方法
+    train(branchId, intensity) {
+        if (!G.stats) return null;
+        const branch = this.branches[branchId];
+        if (!branch) return null;
+
+        // 确定当前路线（如果未选择则自动选第一个）
+        if (!G.trainingTree) G.trainingTree = {};
+        if (!G.trainingTree[branchId]) {
+            G.trainingTree[branchId] = { path: Object.keys(branch.paths)[0], unlocks: [] };
+        }
+        if (!G.trainingSkills) G.trainingSkills = { dance:10, vocal:10, performance:10, variety:5 };
+        if (G.physical === undefined) G.physical = 80;
+        if (G.mental === undefined) G.mental = 75;
+        if (G.fatigue === undefined) G.fatigue = 0;
+
+        const intensityLevels = { light: 0.3, normal: 0.6, heavy: 1.0, extreme: 1.5 };
+        const intensityVal = intensityLevels[intensity] || 0.6;
+
+        const fluct = this.calcFluctuation(G.trainingSkills[branchId], G.fatigue, intensityVal);
+
+        // 检查伤病风险
+        let injury = false;
+        if (Math.random() * 100 < fluct.injuryRisk) {
+            injury = true;
+            G.physical = Math.max(0, G.physical - randInt(15, 30));
+            G.mental = Math.max(0, G.mental - randInt(5, 15));
+        }
+
+        // 更新技能值
+        G.trainingSkills[branchId] = Math.min(100, G.trainingSkills[branchId] + fluct.skillGain);
+
+        // 更新身体/心态
+        G.physical = Math.max(0, Math.min(100, G.physical - fluct.fatigueCost * 0.5));
+        G.mental = Math.max(0, Math.min(100, G.mental - fluct.fatigueCost * 0.2));
+        G.fatigue = Math.min(100, G.fatigue + fluct.fatigueCost);
+
+        // 更新全局skill和mood
+        App.Store.updateStats({
+            skill: Math.round(fluct.skillGain * 0.3),
+            mood: -Math.round(intensityVal * 3),
+            stress: Math.round(intensityVal * 4),
+            training: fluct.skillGain
+        });
+
+        return {
+            branch: branchId,
+            intensity,
+            skillGain: fluct.skillGain,
+            newSkillValue: G.trainingSkills[branchId],
+            fatigue: G.fatigue,
+            physical: G.physical,
+            mental: G.mental,
+            injury,
+            injuryRisk: Math.round(fluct.injuryRisk)
+        };
+    },
+
+    // 休息恢复
+    rest(type) {
+        const restTypes = {
+            sleep:   { fatigue: -25, physical: +12, mental: +8,  desc: '好好睡一觉' },
+            spa:     { fatigue: -35, physical: +18, mental: +12, desc: 'SPA放松身心', cost: 150 },
+            game:    { fatigue: -15, physical: +3,  mental: +20, desc: '打游戏放松' },
+            eat:     { fatigue: -10, physical: +15, mental: +5,  desc: '吃顿好的', cost: 60 },
+            stroll:  { fatigue: -20, physical: +8,  mental: +15, desc: '公园散步' }
+        };
+        const r = restTypes[type];
+        if (!r) return null;
+        if (r.cost && (G.stats.wechatBalance || 0) < r.cost) return { blocked: true, need: r.cost };
+
+        if (r.cost) { G.stats.wechatBalance -= r.cost; }
+        G.fatigue = Math.max(0, G.fatigue + r.fatigue);
+        G.physical = Math.min(100, G.physical + r.physical);
+        G.mental = Math.min(100, G.mental + r.mental);
+        App.Store.updateStats({ mood: 5, stress: -10 });
+        App.Save.autoSave();
+        return { type, desc: r.desc, fatigue: G.fatigue, physical: G.physical, mental: G.mental };
+    },
+
+    // 偷偷加练 → 偶遇AI成员
+    secretTrain() {
+        if (G.fatigue > 85) return { blocked: true, reason: '太累了，还是先休息吧…' };
+        
+        // 增加训练量和疲劳
+        const gain = randInt(3, 8);
+        const branches = ['dance','vocal','performance','variety'];
+        const branch = pick(branches);
+        G.trainingSkills[branch] = Math.min(100, (G.trainingSkills[branch] || 10) + gain);
+        G.fatigue = Math.min(100, G.fatigue + randInt(15, 25));
+        G.physical = Math.max(0, G.physical - randInt(5, 12));
+
+        // 40%概率偶遇同样在加练的AI成员
+        let encounter = null;
+        if (Math.random() < 0.4) {
+            const teammates = App.getTeamMates(G.player.group, G.player.team);
+            if (teammates.length > 0) {
+                const member = pick(teammates);
+                const pers = App.MemberPersonality.getFor(member.name);
+                const encounters = [
+                    `你推开练习室的门，发现${member.name}也在！两人相视一笑，一起练到深夜。`,
+                    `走廊尽头传来音乐声——${member.name}正对着镜子重复一个动作。看到你后，她不好意思地笑了。`,
+                    `凌晨两点的练习室，你和${member.name}不期而遇。她递给你一瓶水："你也睡不着吗？"`,
+                    `${member.name}从背后拍了拍你："我就知道你会来！"——你们默契地开始了合练。`
+                ];
+                if (!G.memberAffection[member.name]) G.memberAffection[member.name] = 50;
+                G.memberAffection[member.name] = Math.min(100, G.memberAffection[member.name] + randInt(2, 5));
+                App.MemberMemory.record(member.name, 'chat', '深夜一起加练');
+                App.MemberMemory.adjustMood(member.name, 5);
+                encounter = {
+                    member: member.name,
+                    emoji: pers.emoji,
+                    text: pick(encounters),
+                    affectionGain: 4
+                };
+            }
+        }
+
+        App.Store.updateStats({ skill: Math.round(gain * 0.4), stress: 8, mood: -3, training: gain });
+        App.Save.autoSave();
+        return { gain, branch, encounter, fatigue: G.fatigue };
+    },
+
+    // 获取训练建议
+    getSuggestion() {
+        const skills = G.trainingSkills || {};
+        const lowest = Object.entries(skills).sort((a,b) => a[1]-b[1])[0];
+        const physStatus = G.physical < 30 ? '需休息' : G.physical < 60 ? '适度训练' : '状态良好';
+        const mentalStatus = G.mental < 30 ? '心态疲惫' : G.mental < 60 ? '需要调节' : '心态稳定';
+        if (G.fatigue > 75) return { action: 'rest', msg: '疲劳值过高，建议先休息恢复！', risk: '继续训练容易受伤' };
+        if (G.physical < 25) return { action: 'rest', msg: '身体状态很差，强烈建议休息！', risk: '伤病风险极高' };
+        return { 
+            action: 'train', 
+            recommend: lowest[0], 
+            recommendName: this.branches[lowest[0]]?.name || '训练',
+            msg: `建议加强${this.branches[lowest[0]]?.name || ''}训练，当前水平最低`,
+            physStatus, mentalStatus
+        };
+    }
+};
+
+// ============ 舞台体验系统 V4 ============
+App.Stage = {
+    // MC 话题库
+    mcTopics: [
+        { q:'最近有什么让你感动的事吗？', type:'warm' },
+        { q:'如果有一天不做偶像了，会做什么？', type:'deep' },
+        { q:'成员当中谁最有趣？为什么？', type:'fun' },
+        { q:'最近一次哭是什么时候？', type:'emotional' },
+        { q:'对十年后的自己说一句话吧！', type:'deep' },
+        { q:'如果拥有超能力，想要什么能力？', type:'fun' },
+        { q:'第一次见粉丝时的心情？', type:'warm' },
+        { q:'最想对同期生说的话？', type:'emotional' },
+        { q:'觉得自己的魅力点是什么？', type:'fun' },
+        { q:'今天公演最难忘的瞬间？', type:'warm' },
+        { q:'如果互换一天人生，想和谁换？', type:'fun' },
+        { q:'目前为止最大的遗憾是什么？', type:'deep' }
+    ],
+
+    // AI成员MC回复库（按性格类型）
+    mcReplies: {
+        '元气少女': ['哈哈哈这个问题好有意思！我觉得是——（做可爱动作）我！','诶~真的要说吗？那我说个秘密哦…'],
+        '温柔治愈': ['嗯…这个问题让我想到很多呢。其实最近有件事特别想和大家分享…','（微笑）我觉得每个人都很好呀，大家都很努力呢~'],
+        '傲娇女王': ['哼，这种问题当然是——（停顿）开玩笑的啦！','这个问题嘛…（傲娇脸）不过我今天心情好，告诉大家吧~'],
+        '冰山美人': ['……（认真思考）这个问题值得好好回答呢。','我倒是有个不同的角度…（酷酷地说完，观众尖叫）'],
+        '文艺少女': ['（托腮）让我想想…这个问题很有诗意呢。','我想用一句话来回答——（文艺地说了一段话）'],
+        '可靠前辈': ['作为前辈我得认真回答呢（笑）','嗯，说到这个我有很多经验可以分享~'],
+        '慵懒猫系': ['诶~要说这个吗？好麻烦…（但还是认真回答了）','（伸懒腰）好吧，那就说说我的想法…']
+    },
+
+    // 站位竞争逻辑
+    positionBattle(playerSkill, opponentSkill, popularity) {
+        const playerScore = playerSkill * 0.5 + popularity * 0.3 + Math.random() * 20;
+        const opponentScore = opponentSkill * 0.5 + 50 * 0.3 + Math.random() * 20;
+        
+        if (playerScore > opponentScore + 10) return { result:'win', margin:'large', position:'前排/C位候选' };
+        if (playerScore > opponentScore + 3) return { result:'win', margin:'close', position:'前排' };
+        if (playerScore > opponentScore - 3) return { result:'draw', margin:'tie', position:'并列' };
+        if (playerScore > opponentScore - 10) return { result:'lose', margin:'close', position:'中排' };
+        return { result:'lose', margin:'large', position:'后排' };
+    },
+
+    // 执行站位争夺
+    competePosition(opponentName) {
+        const pSkill = (G.trainingSkills?.dance || 10) + (G.trainingSkills?.performance || 10);
+        const oPers = App.MemberPersonality.getFor(opponentName);
+        const oSkill = 40 + oPers.traits.competitive * 30 + randInt(-10, 15);
+        const pop = G.stats.popularity || 10;
+        
+        const battle = this.positionBattle(pSkill, oSkill, pop);
+        
+        let outcome = { opponent: opponentName, result: battle.result, position: battle.position };
+        
+        if (battle.result === 'win') {
+            G.stats.popularity = Math.min(100, G.stats.popularity + randInt(1, 3));
+            App.Store.updateStats({ popularity: randInt(1, 3), skill: 1, mood: 5 });
+            if (!G.memberAffection[opponentName]) G.memberAffection[opponentName] = 50;
+            if (battle.margin === 'large') {
+                G.memberAffection[opponentName] = Math.max(0, G.memberAffection[opponentName] - randInt(2, 5));
+                outcome.memberReaction = `${opponentName}虽然输了，但她真心为你高兴~`;
+            } else {
+                G.memberAffection[opponentName] = Math.min(100, G.memberAffection[opponentName] + randInt(1, 3));
+                outcome.memberReaction = `${opponentName}说："下次一定赢回来！"——但看得出来她在笑。`;
+            }
+        } else if (battle.result === 'lose') {
+            G.stats.mood = Math.max(0, G.stats.mood - randInt(3, 8));
+            App.Store.updateStats({ mood: -randInt(3, 8), stress: 5 });
+            if (!G.memberAffection[opponentName]) G.memberAffection[opponentName] = 50;
+            if (battle.margin === 'large') {
+                outcome.memberReaction = `${opponentName}轻松赢了，但她走过来拍拍你："一起加油！"`;
+            } else {
+                G.memberAffection[opponentName] = Math.min(100, G.memberAffection[opponentName] + randInt(2, 4));
+                outcome.memberReaction = `${opponentName}险胜，她松了口气，和你相视而笑。`;
+            }
+        } else {
+            outcome.memberReaction = '两人实力相当，不分伯仲！台下粉丝已经为了你们吵起来了~';
+        }
+        
+        App.MemberMemory.record(opponentName, 'center_deny', '站位竞争');
+        App.Save.autoSave();
+        return outcome;
+    },
+
+    // MC环节动态对话
+    mcSegment(topic, playerChoice, varietySkill) {
+        const topicData = typeof topic === 'string' ? 
+            this.mcTopics.find(t => t.q === topic) || { type:'fun' } : topic;
+        
+        // 根据综艺技能和选择质量评估效果
+        const choiceQuality = { 
+            witty: 0.9, heartfelt: 0.85, safe: 0.5, silly: 0.65, awkward: 0.2, cold: 0.05 
+        };
+        const quality = choiceQuality[playerChoice] || 0.5;
+        const skillBonus = (varietySkill || G.trainingSkills?.variety || 5) / 100;
+        const audienceScore = quality * 0.5 + skillBonus * 0.3 + Math.random() * 0.2;
+
+        let outcome;
+        if (audienceScore > 0.75) {
+            outcome = { 
+                result:'bigHit', 
+                reaction:'🤣 全场爆笑！掌声雷动！',
+                audience:'热烈欢呼',
+                popularityGain: randInt(2, 5),
+                desc: 'MC效果炸裂，观众席笑声不断，你成功控场！'
+            };
+        } else if (audienceScore > 0.5) {
+            outcome = { 
+                result:'warm', 
+                reaction:'😊 观众反应不错，笑声阵阵',
+                audience:'温暖掌声',
+                popularityGain: randInt(0, 2),
+                desc: 'MC表现中规中矩，观众反响良好。'
+            };
+        } else if (audienceScore > 0.3) {
+            outcome = { 
+                result:'mid', 
+                reaction:'😐 气氛一般，有些观众在玩手机',
+                audience:'稀稀拉拉的掌声',
+                popularityGain: 0,
+                desc: 'MC效果平平，但也不算翻车。'
+            };
+        } else {
+            outcome = { 
+                result:'cold', 
+                reaction:'🥶 冷场了…空气突然安静',
+                audience:'尴尬的沉默',
+                popularityGain: -randInt(1, 3),
+                stressGain: randInt(5, 12),
+                desc: 'MC冷场了！台下有人在窃窃私语…需要尽快救场！'
+            };
+            G.stats.popularity = Math.max(0, G.stats.popularity - randInt(1, 3));
+            App.Store.updateStats({ popularity: -randInt(1, 3), stress: randInt(5, 12), mood: -5 });
+        }
+
+        if (outcome.popularityGain > 0) {
+            G.stats.popularity = Math.min(100, G.stats.popularity + outcome.popularityGain);
+            App.Store.updateStats({ popularity: outcome.popularityGain, mood: 3 });
+        }
+
+        // AI成员的MC互动
+        const allMembers = App.getAllMembers?.() || [];
+        const teammates = allMembers.filter(m => m.group === G.player.group && m.team === G.player.team && !m.graduate && m.name !== G.player.name);
+        const stageMember = teammates.length > 0 ? pick(teammates) : null;
+        let memberReply = null;
+        if (stageMember) {
+            const pers = App.MemberPersonality.getFor(stageMember.name);
+            const replies = this.mcReplies[pers.name] || this.mcReplies['温柔治愈'];
+            memberReply = {
+                name: stageMember.name,
+                text: pick(replies),
+                emoji: pers.emoji
+            };
+        }
+
+        App.Save.autoSave();
+        return { ...outcome, memberReply, topic: topicData?.q || topic };
+    },
+
+    // 搭档默契系统
+    partnerSynergy: {
+        // 计算搭档默契值
+        calcSynergy(partnerName) {
+            const aff = G.memberAffection?.[partnerName] || 50;
+            const mem = G.memberMemory?.[partnerName];
+            const events = mem?.significantEvents?.length || 0;
+            const synergy = Math.min(100, aff * 0.5 + events * 5 + 
+                (G.partnerSynergy?.[partnerName] || 0));
+            return synergy;
+        },
+
+        // 搭档演出效果
+        performWithPartner(partnerName, showType) {
+            const synergy = this.calcSynergy(partnerName);
+            const pers = App.MemberPersonality.getFor(partnerName);
+            const partnerSkill = (G.trainingSkills?.performance || 10) * 0.3 + synergy * 0.4 + Math.random() * 30;
+            
+            // 不同性格组合的差异化效果
+            const myPers = G.player.personality;
+            const comboNames = {
+                '元气少女_元气少女': { name:'双倍元气弹💥', bonus:15, desc:'活力四射！全场都跳起来了！' },
+                '温柔治愈_温柔治愈': { name:'温暖盛宴🌸', bonus:10, desc:'观众被你们暖到落泪…' },
+                '傲娇女王_傲娇女王': { name:'王者对决👑', bonus:18, desc:'两个傲娇碰撞出的火花太耀眼！' },
+                '冰山美人_冰山美人': { name:'冰川世纪❄️', bonus:12, desc:'冷酷气场让观众窒息——然后疯狂尖叫！' },
+                '温柔治愈_傲娇女王': { name:'反差萌杀💘', bonus:20, desc:'温柔和傲娇的反差效果拔群！' },
+                '元气少女_冰山美人': { name:'冰火两重天🔥❄️', bonus:16, desc:'一动一静的完美配合！' },
+                default: { name:'默契配合✨', bonus:8, desc:'两人配合默契，舞台效果不错！' }
+            };
+            
+            const comboKey = `${myPers}_${pers.name}`;
+            const revKey = `${pers.name}_${myPers}`;
+            const combo = comboNames[comboKey] || comboNames[revKey] || comboNames.default;
+
+            const totalScore = Math.round(partnerSkill + combo.bonus);
+            let grade, rewards;
+            if (totalScore > 85) { grade = 'S'; rewards = { popularity: randInt(3, 6), affection: randInt(3, 6) }; }
+            else if (totalScore > 70) { grade = 'A'; rewards = { popularity: randInt(1, 3), affection: randInt(2, 4) }; }
+            else if (totalScore > 50) { grade = 'B'; rewards = { popularity: 0, affection: randInt(1, 2) }; }
+            else { grade = 'C'; rewards = { popularity: -1, affection: 0 }; }
+
+            // 更新默契值
+            if (!G.partnerSynergy) G.partnerSynergy = {};
+            G.partnerSynergy[partnerName] = Math.min(100, synergy + randInt(2, 6));
+
+            // 更新好感度
+            if (!G.memberAffection[partnerName]) G.memberAffection[partnerName] = 50;
+            G.memberAffection[partnerName] = Math.min(100, G.memberAffection[partnerName] + rewards.affection);
+            if (rewards.popularity !== 0) {
+                G.stats.popularity = Math.min(100, G.stats.popularity + rewards.popularity);
+            }
+
+            App.MemberMemory.record(partnerName, 'partner_invite', `${showType}舞台搭档`);
+            App.Store.updateStats({ popularity: rewards.popularity, mood: 5 });
+            App.Save.autoSave();
+
+            if (!G.partnerShows) G.partnerShows = [];
+            G.partnerShows.push({ partner: partnerName, showType, score: totalScore, grade, day: G.game.day });
+
+            return {
+                partner: partnerName,
+                synergy: G.partnerSynergy[partnerName],
+                score: totalScore,
+                grade,
+                combo: combo,
+                rewards,
+                pers
+            };
+        }
+    }
+};
+
+// ============ 社交媒体系统 V4 ============
+App.SocialMedia = {
+    // 措辞风险词库
+    riskWords: {
+        high: [
+            { word:'黑幕', penalty:'scandal+=10,popularity-=3', response:'粉丝质疑你影射行业潜规则' },
+            { word:'讨厌', penalty:'popularity-=2', response:'被解读为针对某位成员' },
+            { word:'烦死了', penalty:'popularity-=2,scandal+=5', response:'被批评为"偶像失格"' },
+            { word:'恶心', penalty:'scandal+=8,popularity-=4', response:'引发大规模粉丝抗议' },
+            { word:'垃圾', penalty:'popularity-=3', response:'被曲解为贬低同行' },
+            { word:'凭什么', penalty:'scandal+=6,popularity-=2', response:'被质疑在抱怨资源分配' }
+        ],
+        medium: [
+            { word:'累', penalty:'popularity-=1', response:'部分粉丝心疼，部分批评"矫情"' },
+            { word:'不想', penalty:'popularity-=1', response:'被断章取义报道' },
+            { word:'随便', penalty:'', response:'粉丝解读为态度敷衍' },
+            { word:'呵呵', penalty:'', response:'被质疑在阴阳怪气' }
+        ]
+    },
+
+    // 发布微博
+    postWeibo(content, day) {
+        if (!G.socialMediaPosts) G.socialMediaPosts = [];
+        
+        // 检测风险词
+        let riskLevel = 'safe', riskDetail = '', penalty = {};
+        for (const lvl of ['high','medium']) {
+            for (const rw of this.riskWords[lvl]) {
+                if (content.includes(rw.word)) {
+                    riskLevel = lvl;
+                    riskDetail = rw.response;
+                    // 解析penalty
+                    if (rw.penalty) {
+                        rw.penalty.split(',').forEach(p => {
+                            const [key, val] = p.split(/[+-]=/);
+                            if (key && val) {
+                                penalty[key.trim()] = parseInt((p.includes('-')?'-':'') + val);
+                            }
+                        });
+                    }
+                    break;
+                }
+            }
+            if (riskLevel !== 'safe') break;
+        }
+
+        // 负面放大效应：措辞不当的连锁反应
+        let backlash = null;
+        if (riskLevel === 'high') {
+            const amplify = randInt(2, 5);
+            penalty.popularity = (penalty.popularity || 0) * amplify;
+            penalty.scandal = (penalty.scandal || 0) * amplify;
+            backlash = {
+                type: 'backlash',
+                desc: `你的发言引发热议，负面效应被放大${amplify}倍！热搜已安排…`,
+                popularityLoss: Math.abs(penalty.popularity || 0),
+                scandalGain: Math.abs(penalty.scandal || 0)
+            };
+        }
+
+        // 应用惩罚
+        Object.entries(penalty).forEach(([key, val]) => {
+            if (key === 'popularity') G.stats.popularity = Math.max(0, G.stats.popularity + val);
+            if (key === 'scandal') G.stats.scandal = Math.min(200, (G.stats.scandal || 0) + Math.abs(val));
+            if (key === 'stress') G.stats.stress = Math.min(200, (G.stats.stress || 10) + Math.abs(val));
+        });
+
+        if (Object.keys(penalty).length > 0) {
+            App.Store.updateStats(penalty);
+        }
+
+        const post = {
+            day: day || G.game.day,
+            content,
+            riskLevel,
+            riskDetail,
+            likes: Math.max(0, randInt(50, 500) + (G.stats.popularity || 10) * 3 - (riskLevel === 'high' ? 200 : 0)),
+            comments: randInt(5, 50),
+            backlash,
+            time: getTimeStr()
+        };
+        G.socialMediaPosts.push(post);
+        App.Save.autoSave();
+        return post;
+    },
+
+    // AI成员发布争议内容 → 玩家两难抉择
+    controversyEvent() {
+        const conts = [
+            {
+                member: null, // 动态分配
+                content: '"有些前辈仗着资历就欺负新人呢…" 这条秒删的微博被截图了！',
+                choiceA: { text:'公开力挺她', effect:'affection+8,popularity-2,scandal+3', desc:'够义气！但你也惹上了麻烦…' },
+                choiceB: { text:'私下安慰但不公开站队', effect:'affection+2,popularity+0', desc:'明哲保身，理智的选择。' },
+                choiceC: { text:'劝她道歉', effect:'affection-5,popularity+2', desc:'理性但可能伤了她的心…' }
+            },
+            {
+                member: null,
+                content: '"今天的粉丝握手会好累…有些人手好冰" ——争议发言引发粉丝不满！',
+                choiceA: { text:'发微博帮她解释', effect:'affection+5,popularity-1', desc:'患难见真情！' },
+                choiceB: { text:'保持沉默', effect:'affection-1,popularity+1', desc:'沉默是金，但可能会被误解…' },
+                choiceC: { text:'在口袋房间里说"大家互相理解"', effect:'affection+3,popularity+3', desc:'高情商处理！但有点假…' }
+            },
+            {
+                member: null,
+                content: '"这次的C位…说实话我不服" ——深夜秒删但已被传播！',
+                choiceA: { text:'私聊倾听她的烦恼', effect:'affection+10,popularity+0', desc:'成为她最信任的人！' },
+                choiceB: { text:'建议她专注提升自己', effect:'affection+3,popularity+2', desc:'既是好友也是好前辈。' },
+                choiceC: { text:'和她一起吐槽', effect:'affection+8,scandal+5', desc:'太爽了！但小心隔墙有耳…' }
+            }
+        ];
+
+        // 分配一个同队AI成员
+        const teammates = App.getTeamMates?.(G.player.group, G.player.team) || [];
+        if (teammates.length < 1) return null;
+        const cont = pick(conts);
+        cont.member = pick(teammates).name;
+        
+        if (!G.controversyLog) G.controversyLog = [];
+        G.controversyLog.push({ day: G.game.day, source: cont.member, resolved: false });
+        return cont;
+    },
+
+    // 处理争议抉择
+    resolveControversy(memberName, choiceKey, choiceData) {
+        // 解析效果
+        const effects = {};
+        choiceData.effect.split(',').forEach(p => {
+            const m = p.trim().match(/(\w+)([+-]\d+)/);
+            if (m) effects[m[1]] = parseInt(m[2]);
+        });
+
+        // 应用效果
+        if (effects.affection) {
+            if (!G.memberAffection[memberName]) G.memberAffection[memberName] = 50;
+            G.memberAffection[memberName] = clamp(
+                G.memberAffection[memberName] + effects.affection, 0, 100
+            );
+        }
+        if (effects.popularity) {
+            G.stats.popularity = clamp(G.stats.popularity + effects.popularity, 0, 100);
+        }
+        if (effects.scandal) {
+            G.stats.scandal = clamp((G.stats.scandal || 0) + effects.scandal, 0, 200);
+        }
+
+        App.MemberMemory.record(memberName, 'comfort', '争议事件');
+        
+        // 标记已解决
+        if (G.controversyLog) {
+            const log = G.controversyLog.find(l => l.source === memberName && !l.resolved);
+            if (log) {
+                log.resolved = true;
+                log.choice = choiceKey;
+                log.day = G.game.day;
+            }
+        }
+
+        App.Store.updateStats({
+            ...(effects.popularity ? { popularity: effects.popularity } : {}),
+            ...(effects.scandal ? { scandal: effects.scandal } : {}),
+            mood: effects.affection > 0 ? 5 : -3
+        });
+        App.Save.autoSave();
+        return { effects, memberName };
+    },
+
+    // 无心之言上热搜 → 随机不可控事件
+    randomTrending() {
+        if (!G.trendingEvents) G.trendingEvents = [];
+        
+        const events = [
+            {
+                type: 'slipOfTongue',
+                trigger: '你在握手会上随口说的一句话被粉丝录下来发到网上',
+                title: '#成员发言争议#',
+                severity: randInt(0, 10) > 5 ? 'major' : 'minor',
+                effect() {
+                    const popLoss = randInt(2, 8);
+                    G.stats.popularity = Math.max(0, G.stats.popularity - popLoss);
+                    G.stats.scandal = Math.min(200, (G.stats.scandal || 0) + randInt(3, 10));
+                    return { popularity: -popLoss, scandal: randInt(3, 10) };
+                }
+            },
+            {
+                type: 'photoLeak',
+                trigger: '你在练习室的素颜照被工作人员泄露',
+                title: '#偶像真实面貌#',
+                severity: 'neutral',
+                effect() {
+                    const change = randInt(-5, 8);
+                    G.stats.popularity = clamp(G.stats.popularity + change, 0, 100);
+                    return { popularity: change };
+                }
+            },
+            {
+                type: 'misunderstanding',
+                trigger: '你在微博发了一个表情，被粉丝过度解读',
+                title: '#xx表情门#',
+                severity: 'major',
+                effect() {
+                    const popLoss = randInt(5, 12);
+                    const scGain = randInt(5, 15);
+                    G.stats.popularity = Math.max(0, G.stats.popularity - popLoss);
+                    G.stats.scandal = Math.min(200, (G.stats.scandal || 0) + scGain);
+                    return { popularity: -popLoss, scandal: scGain, stress: randInt(5, 15) };
+                }
+            },
+            {
+                type: 'viralPositive',
+                trigger: '你在公演上的一个动作被做成gif，意外走红！',
+                title: '#神级直拍#',
+                severity: 'positive',
+                effect() {
+                    const popGain = randInt(3, 10);
+                    G.stats.popularity = Math.min(100, G.stats.popularity + popGain);
+                    return { popularity: popGain, mood: randInt(5, 10) };
+                }
+            },
+            {
+                type: 'fanWar',
+                trigger: '你的粉丝和另一位成员粉丝在超话吵起来了',
+                title: '#粉丝互撕#',
+                severity: 'major',
+                effect() {
+                    const targets = (App.getTeamMates?.(G.player.group, G.player.team) || []).slice(0, 3);
+                    const target = targets.length > 0 ? pick(targets).name : '其他成员';
+                    const popLoss = randInt(2, 5);
+                    G.stats.popularity = Math.max(0, G.stats.popularity - popLoss);
+                    G.stats.scandal = Math.min(200, (G.stats.scandal || 0) + randInt(5, 15));
+                    if (!G.memberAffection[target]) G.memberAffection[target] = 50;
+                    G.memberAffection[target] = Math.max(0, G.memberAffection[target] - randInt(3, 8));
+                    return { popularity: -popLoss, scandal: randInt(5, 15), stress: randInt(5, 10), target };
+                }
+            }
+        ];
+
+        const event = pick(events);
+        const effects = event.effect();
+        
+        G.trendingEvents.push({
+            day: G.game.day,
+            type: event.type,
+            title: event.title,
+            trigger: event.trigger,
+            severity: event.severity,
+            effects,
+            time: getTimeStr()
+        });
+
+        App.Store.updateStats({
+            ...(effects.popularity ? { popularity: effects.popularity } : {}),
+            ...(effects.scandal ? { scandal: effects.scandal } : {}),
+            ...(effects.mood ? { mood: effects.mood } : {}),
+            ...(effects.stress ? { stress: effects.stress } : {})
+        });
+        App.Save.autoSave();
+
+        return { ...event, effects };
+    },
+
+    // 连锁反应：热搜引发后续事件
+    chainReaction(lastTrending) {
+        if (!lastTrending || lastTrending.severity !== 'major') return null;
+        const chainEvents = [
+            { 
+                desc:'经纪人找你谈话，要求你注意言行', 
+                effects: { agent_satisfaction: -randInt(5,15), stress: randInt(5,10) } 
+            },
+            { 
+                desc:'粉丝团发布联合声明，要求公司澄清', 
+                effects: { popularity: randInt(1,3), scandal: randInt(2,5) }
+            },
+            {
+                desc:'被娱乐媒体约访，可以借此澄清',
+                effects: { popularity: randInt(2,5), stress: randInt(3,8), scandal: -randInt(2,5) }
+            }
+        ];
+        const chain = pick(chainEvents);
+        Object.entries(chain.effects).forEach(([k,v]) => {
+            if (k === 'agent_satisfaction') G.stats.agent_satisfaction = clamp((G.stats.agent_satisfaction||50) + v,0,100);
+            if (k === 'popularity') G.stats.popularity = clamp(G.stats.popularity + v,0,100);
+            if (k === 'scandal') G.stats.scandal = clamp((G.stats.scandal||0) + v,0,200);
+            if (k === 'stress') G.stats.stress = clamp((G.stats.stress||10) + v,0,200);
+        });
+        App.Store.updateStats(chain.effects);
+        App.Save.autoSave();
+        return chain;
+    }
+};
 App.UI = {
     currentPage: 'lockScreen',
     pwdInput: '',
@@ -1112,12 +2798,44 @@ App.UI = {
     goHome() {
         this.showPage('homeScreen');
         this.updateTimeBar();
+        // 修复：仅在玩家已创建角色后才执行随机事件，避免初次进入主页时弹窗堆叠
+        if (!G.player.name) {
+            App.Sound.play('Click');
+            return;
+        }
         App.Store.updateStats({});
+        App.SocialNetwork.initIfNeeded();
         if (Math.random() < 0.15) App.Events.showRandom();
         if (G.player.name) App.Events.triggerTeamEvent();
         if (G.player.name && Math.random() < 0.08) this.receiveRandomSms();
         if (G.player.name && Math.random() < 0.05) this.receiveRandomCall();
+        // 成员主动性触发
+        if (G.player.name && Math.random() < 0.12) {
+            const event = App.Proactivity.checkTrigger();
+            if (event) this.showProactiveEvent(event);
+        }
+        // 私聊泄露触发
+        if (G.player.name && Math.random() < 0.06) {
+            const leak = App.ChatLeak.checkTrigger();
+            if (leak) this.showChatLeakNotification(leak);
+        }
+        // V4 社交媒体随机热搜事件 (6%)
+        if (G.player.name && Math.random() < 0.06 && G.game.day > 3) {
+            this.handleRandomTrending();
+        }
         App.Sound.play('Click');
+    },
+    handleRandomTrending() {
+        const event = App.SocialMedia.randomTrending();
+        if (!event) return;
+        this.showNotification(`🔥 ${event.title}：${event.trigger.substring(0,30)}…`, 5000);
+        // 重度事件有连锁反应
+        if (event.severity === 'major') {
+            setTimeout(() => {
+                const chain = App.SocialMedia.chainReaction(event);
+                if (chain) this.showNotification(`🔄 ${chain.desc}`, 4000);
+            }, 3000);
+        }
     },
     openApp(app) {
         App.Sound.play('Click');
@@ -1135,7 +2853,28 @@ App.UI = {
             case 'outdoor': this.showPage('outdoorPage'); this.renderOutdoor(); break;
             case 'calendar': this.showPage('calendarPage'); this.renderCalendar(); break;
             case 'backpack': this.showPage('backpackPage'); this.renderBackpack(); break;
+            case 'diary': this.showPage('diaryPage'); this.renderDiaryList(); break;
+            case 'chatleak': this.showPage('chatLeakPage'); this.renderChatLeak(); break;
+            case 'training': this.showPage('trainingPage'); this.renderTraining(); break;
+            case 'stage': this.showPage('stagePage'); this.renderStage(); break;
         }
+    },
+    // 统一弹窗辅助：所有弹窗追加到phone-screen内（不超出手机边框）
+    phoneModal(innerHTML, id) {
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.pointerEvents = 'auto';
+        if (id) modal.id = id;
+        modal.innerHTML = innerHTML;
+        document.getElementById('phoneModals').appendChild(modal);
+        // 追踪弹窗，保留关闭能力
+        App.ModalManager.track(modal);
+        return modal;
+    },
+
+    /** 关闭所有弹窗（兜底机制：清理遗留 modal，避免页面被拦截） */
+    closeAllModals() {
+        App.ModalManager.closeAll();
     },
     updateTimeBar() {
         const phaseNames = {morning:'🌅早晨',daytime:'☀️白天',evening:'🌆傍晚',night:'🌙夜晚'};
@@ -1157,10 +2896,18 @@ App.UI = {
         G.game.day += 1;
         G.game.phase = 'morning';
         G.game.handshake_this_month = false;
-        
+
+        // 翻牌每日重置：清空当日已翻牌状态
+        if (G.flipState) G.flipState = { day: G.game.day, replied: {} };
+
         this.updateTimeBar();
         App.Save.autoSave();
         this.showNotification(`⏰ 进入第${G.game.day}天`);
+        
+        // 首日构建社交圈
+        if (G.game.day === 2) App.SocialNetwork.buildCircles();
+        // 每日生成日记
+        if (G.game.day > 1) App.Diary.generateToday();
         
         const dayInMonth = G.game.day % 30 || 30;
         
@@ -1182,8 +2929,7 @@ App.UI = {
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
         modal.style.cssText = `
-            position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;
-            display:flex;align-items:center;justify-content:center;padding:20px
+            display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,0.7)
         `;
         modal.innerHTML = `
             <div style="background:#fff;border-radius:20px;padding:30px;width:100%;max-width:320px;text-align:center">
@@ -1196,7 +2942,7 @@ App.UI = {
                 </button>
             </div>
         `;
-        document.body.appendChild(modal);
+        document.getElementById('phoneModals').appendChild(modal);
         modal.addEventListener('click', (e) => { if(e.target === modal) this.showElectionModal(); });
     },
     showElectionReportModal(type) {
@@ -1222,8 +2968,7 @@ App.UI = {
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
         modal.style.cssText = `
-            position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;
-            display:flex;align-items:center;justify-content:center;padding:16px
+            display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,0.7)
         `;
         modal.innerHTML = `
             <div style="background:#fff;border-radius:16px;padding:20px;width:calc(100% - 32px);max-width:340px;box-sizing:border-box">
@@ -1268,7 +3013,7 @@ App.UI = {
                 </div>
             </div>
         `;
-        document.body.appendChild(modal);
+        document.getElementById('phoneModals').appendChild(modal);
     },
     calculateVotes() {
         // 人气值决定票数：1人气 = 1000票
@@ -1877,7 +3622,7 @@ App.UI = {
                             else if (aff >= 50) { nameColor = '#ff69b4'; }
                             else if (aff >= 30) { nameColor = '#999'; }
                             else { nameColor = '#bbb'; }
-                            h += `<div class="contact-item" onclick="App.UI.startChatWithMember('${name}','${groupKey}')"><div class="avatar">👤</div><div class="info"><div class="name" style="color:${nameColor};font-weight:${nameWeight}">${name}</div></div></div>`;
+                            h += `<div class="contact-item" onclick="App.UI.startChatWithMember('${name}','${groupKey}')"><div class="avatar">👤</div><div class="info"><div class="name" style="color:${nameColor};font-weight:${nameWeight}">${name} <span style="font-size:10px">${App.MemberPersonality.getFor(name).emoji}</span></div></div></div>`;
                         });
                     });
                 }
@@ -1896,8 +3641,46 @@ App.UI = {
     openWechatChat(id) {
         this.currentChatId = id;
         const data = G.chatHistory[id];
+        const pers = App.MemberPersonality.getFor(id);
+        const mood = App.MemberPersonality.getMemberMood(id);
+        const mem = G.memberMemory?.[id];
+        // 构建上下文记忆池：显示AI能感知到的记忆
+        let memHTML = '';
+        const eventLabels = { gift:'🎁送礼', dinner:'🍽️请吃饭', birthday:'🎂庆生', date:'💕约会', 
+            transfer:'💰转账', comfort:'🤗安慰', center_deny:'😔未站C', center_give:'⭐站C', 
+            partner_invite:'🤝搭档邀约', chat:'💬聊天', positive_response:'👍积极回应',
+            neutral_response:'😐中立回应', negative_response:'👎消极回应' };
+        const events = mem ? (mem.significantEvents || []).slice(-8).reverse() : [];
+        const chatMsgs = data?.messages ? data.messages.length : 0;
+        if (chatMsgs > 0 || events.length > 0) {
+            memHTML = `
+            <div id="memPool_${id}" style="background:linear-gradient(135deg,#f0f7ff,#e8f0fe);border-bottom:1px solid #c8ddf8;padding:6px 14px;font-size:11px;color:#668;max-height:72px;overflow-y:auto;transition:max-height .3s">
+                <div style="display:flex;gap:12px;align-items:center">
+                    <span style="color:#4a90d9">🧠 上下文感知</span>
+                    <span>💬 ${chatMsgs}条对话</span>
+                    ${mem && mem.totalInteractions > 0 ? `<span>❤️ ${G.memberAffection?.[id]||50}</span>` : ''}
+                    <span style="cursor:pointer;margin-left:auto;color:#8899aa;font-size:10px" onclick="
+                        const p=document.getElementById('memPool_${id}');
+                        const s=p.style.maxHeight==='320px'?'72px':'320px';
+                        p.style.maxHeight=s;
+                        this.textContent=s==='320px'?'▲ 收起':'▼ 展开';
+                    ">▼ 展开</span>
+                </div>`;
+            if (events.length > 0) {
+                memHTML += `<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:4px">`;
+                events.forEach(e => {
+                    memHTML += `<span style="background:#dce8f5;border-radius:6px;padding:1px 6px;font-size:10px;white-space:nowrap">${eventLabels[e.event]||e.event}</span>`;
+                });
+                memHTML += `</div>`;
+            }
+            memHTML += `</div>`;
+        }
         const el = document.getElementById('wechatChatPage');
-        el.innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.backToWechatList()">←</span><span class="title">${id}</span><span class="back-btn" style="margin-left:auto" onclick="App.UI.showChatOptions()">⋮</span></div>
+        el.innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.backToWechatList()">←</span><span class="title">${id}</span><span style="font-size:11px;color:#999;margin-left:4px">${mood.emoji}</span><span class="back-btn" style="margin-left:auto" onclick="App.UI.showChatOptions()">⋮</span></div>
+        <div style="background:#f8f8f8;padding:4px 16px;font-size:10px;color:#999;border-bottom:1px solid #f0f0f0;display:flex;gap:8px">
+            <span class="personality-badge ${pers.fanAttitude}">${pers.emoji}</span>
+        </div>
+        ${memHTML}
         <div class="chat-messages" id="wechatChatMsgs"></div>
         <div class="wechat-input-bar">
             <button class="wechat-plus-btn" onclick="App.UI.showWechatPlusMenu()">+</button>
@@ -1911,8 +3694,7 @@ App.UI = {
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay';
         overlay.style.cssText = `
-            position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;
-            display:flex;align-items:flex-end;justify-content:center;
+            display:flex;align-items:flex-end;justify-content:center;background:rgba(0,0,0,0.5)
         `;
         
         const menu = document.createElement('div');
@@ -1957,7 +3739,8 @@ App.UI = {
         `;
         
         overlay.appendChild(menu);
-        document.body.appendChild(overlay);
+        document.getElementById('phoneModals').appendChild(overlay);
+
         
         overlay.addEventListener('click', (e) => {
             if (e.target === overlay) {
@@ -1968,7 +3751,7 @@ App.UI = {
     showHangoutModal() {
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
-        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5)';
         modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
             <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">🚶 邀请出去玩</div>
             <div style="font-size:12px;color:#666;margin-bottom:8px">选择地点</div>
@@ -1986,7 +3769,7 @@ App.UI = {
                 <button style="flex:1;padding:10px;border:none;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;border-radius:8px" onclick="App.UI.sendHangout()">发送邀请</button>
             </div>
         </div>`;
-        document.body.appendChild(modal);
+        document.getElementById('phoneModals').appendChild(modal);
     },
     sendHangout() {
         const place = document.getElementById('hangoutPlace')?.value;
@@ -2012,13 +3795,13 @@ App.UI = {
     showChatOptions() {
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
-        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:flex-end';
+        modal.style.cssText = 'display:flex;align-items:flex-end;background:rgba(0,0,0,0.5)';
         modal.innerHTML = `<div style="background:#fff;width:100%;border-radius:16px 16px 0 0;padding:16px">
             <div style="text-align:center;font-size:14px;color:#999;margin-bottom:16px">和 ${this.currentChatId} 的聊天</div>
             <button style="width:100%;padding:12px;border:none;background:#f5f5f5;border-radius:8px;margin-bottom:8px" onclick="App.UI.clearChatHistory();this.closest('.modal-overlay').remove()">🗑️ 清空聊天记录</button>
             <button style="width:100%;padding:12px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
         </div>`;
-        document.body.appendChild(modal);
+        document.getElementById('phoneModals').appendChild(modal);
         modal.addEventListener('click', (e) => { if(e.target === modal) modal.remove(); });
     },
     clearChatHistory() {
@@ -2031,7 +3814,7 @@ App.UI = {
     showTransferModal() {
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
-        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5)';
         modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
             <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">💰 微信转账</div>
             <div style="font-size:12px;color:#666;margin-bottom:8px">转账金额 (元)</div>
@@ -2043,7 +3826,7 @@ App.UI = {
                 <button style="flex:1;padding:10px;border:none;background:#07c160;color:#fff;border-radius:8px" onclick="App.UI.sendTransfer()">转账</button>
             </div>
         </div>`;
-        document.body.appendChild(modal);
+        document.getElementById('phoneModals').appendChild(modal);
     },
     sendTransfer() {
         const amount = parseInt(document.getElementById('transferAmount')?.value);
@@ -2053,6 +3836,8 @@ App.UI = {
         App.Store.updateStats({wechatBalance:-amount});
         const affGain = Math.floor(amount / 10);
         G.memberAffection[this.currentChatId] = (G.memberAffection[this.currentChatId]||50) + affGain;
+        App.MemberMemory.record(this.currentChatId, 'transfer', `¥${amount}`);
+        App.MemberMemory.adjustMood(this.currentChatId, 5);
         const msg = {from:'player',text:`💰 转账 ¥${amount}`,transfer:amount,time:getTimeStr()};
         if (!G.chatHistory[this.currentChatId]) G.chatHistory[this.currentChatId] = {type:'member',avatar:'👤',messages:[]};
         G.chatHistory[this.currentChatId].messages.push(msg);
@@ -2074,14 +3859,14 @@ App.UI = {
         const photos = ['📸', '🌸', '🎤', '💄', '🎀', '✨', '🌟', '💖', '🎬', '📷'];
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
-        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5)';
         let photosHtml = photos.map(p => `<button style="width:60px;height:60px;font-size:32px;border:none;background:#f5f5f5;border-radius:8px;cursor:pointer" onclick="App.UI.sendPhoto('${p}')">${p}</button>`).join('');
         modal.innerHTML = `<div style="background:#fff;width:320px;border-radius:16px;padding:20px">
             <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">📷 发送图片</div>
             <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:16px">${photosHtml}</div>
             <button style="width:100%;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
         </div>`;
-        document.body.appendChild(modal);
+        document.getElementById('phoneModals').appendChild(modal);
     },
     sendPhoto(emoji) {
         const msg = {from:'player',text:`${emoji} [图片]`,photo:emoji,time:getTimeStr()};
@@ -2093,7 +3878,7 @@ App.UI = {
     showMealModal() {
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
-        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5)';
         modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
             <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">🍽️ 请吃饭</div>
             <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">
@@ -2103,7 +3888,7 @@ App.UI = {
             </div>
             <button style="width:100%;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
         </div>`;
-        document.body.appendChild(modal);
+        document.getElementById('phoneModals').appendChild(modal);
     },
     inviteMealInChat(level) {
         const costs = {cheap:50, normal:200, expensive:500};
@@ -2113,6 +3898,8 @@ App.UI = {
         App.Store.updateStats({wechatBalance:-cost, mood:3});
         const affGain = level==='cheap'?5:level==='normal'?15:30;
         G.memberAffection[member] = (G.memberAffection[member]||50) + affGain;
+        App.MemberMemory.record(member, 'dinner', level);
+        App.MemberMemory.adjustMood(member, 8);
         const msg = {from:'player',text:`🍽️ 请${member}吃了顿饭`,meal:level,cost,time:getTimeStr()};
         if (!G.chatHistory[member]) G.chatHistory[member] = {type:'member',avatar:'👤',messages:[]};
         G.chatHistory[member].messages.push(msg);
@@ -2133,7 +3920,7 @@ App.UI = {
     showBirthdayModal() {
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
-        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5)';
         modal.innerHTML = `<div style="background:#fff;width:300px;border-radius:16px;padding:20px">
             <div style="font-size:16px;font-weight:600;text-align:center;margin-bottom:16px">🎂 过生日</div>
             <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">
@@ -2143,7 +3930,7 @@ App.UI = {
             </div>
             <button style="width:100%;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
         </div>`;
-        document.body.appendChild(modal);
+        document.getElementById('phoneModals').appendChild(modal);
     },
     celebrateBirthdayInChat(level) {
         const costs = {small:100, medium:300, big:800};
@@ -2153,6 +3940,8 @@ App.UI = {
         App.Store.updateStats({wechatBalance:-cost, mood:5});
         const affGain = level==='small'?10:level==='medium'?25:50;
         G.memberAffection[member] = (G.memberAffection[member]||50) + affGain;
+        App.MemberMemory.record(member, 'birthday', level);
+        App.MemberMemory.adjustMood(member, 15);
         const msg = {from:'player',text:`🎂 为${member}庆祝生日`,birthday:level,cost,time:getTimeStr()};
         if (!G.chatHistory[member]) G.chatHistory[member] = {type:'member',avatar:'👤',messages:[]};
         G.chatHistory[member].messages.push(msg);
@@ -2183,7 +3972,7 @@ App.UI = {
         
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
-        modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+        modal.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5)';
         
         let itemsHtml = items.map(([id, count]) => 
             `<button onclick="App.UI.sendGiftInChat('${id}')" style="padding:12px;background:#fff;border:1px solid #ddd;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:8px">
@@ -2199,7 +3988,7 @@ App.UI = {
             <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">${itemsHtml}</div>
             <button style="width:100%;padding:10px;border:none;background:#f5f5f5;border-radius:8px" onclick="this.closest('.modal-overlay').remove()">取消</button>
         </div>`;
-        document.body.appendChild(modal);
+        document.getElementById('phoneModals').appendChild(modal);
     },
     sendGiftInChat(type) {
         const member = this.currentChatId;
@@ -2212,6 +4001,8 @@ App.UI = {
         const giftNames = {flower:'🌸 鲜花', perfume:'🌷 香水', bag:'👜 名牌包'};
         const affGain = {flower:8, perfume:20, bag:50};
         G.memberAffection[member] = (G.memberAffection[member]||50) + affGain[type];
+        App.MemberMemory.record(member, 'gift', type);
+        App.MemberMemory.adjustMood(member, 10);
         App.Store.updateStats({mood:2});
         
         const msg = {from:'player',text:`🎁 送给${member}一份${giftNames[type]}`,gift:type,time:getTimeStr()};
@@ -2266,18 +4057,67 @@ App.UI = {
         if (!text) return;
         input.value = '';
         const data = G.chatHistory[this.currentChatId];
+        
+        // 构建AI上下文（在推送当前消息之前，避免重复）
+        const memberName = this.currentChatId;
+        // 排除当前消息，只传历史对话（最后12条，不含当前）
+        const historyMsgs = (data.messages || []).slice(-12).map(m => `${m.from==='player'?G.player.name:memberName}: ${m.text}`).join('\n');
+        // 重点：提取最近2轮对话作为短期记忆锚点
+        const lastExchanges = (data.messages || []).slice(-4).map(m => `${m.from==='player'?'玩家':memberName}: ${m.text}`).join('\n');
+        const mem = G.memberMemory?.[memberName];
+        const pers = App.MemberPersonality.getFor(memberName);
+        const mood = App.MemberPersonality.getMemberMood(memberName);
+        const aff = G.memberAffection?.[memberName] || 50;
+        
+        // 查找该成员所属的分团和分队
+        let memberGroup = '', memberTeam = '';
+        const allM = App.getAllMembers().find(m => m.name === memberName && !m.graduate);
+        if (allM) { memberGroup = allM.group; memberTeam = allM.team; }
+        
+        // 构建记忆摘要
+        let memSummary = '';
+        if (mem && mem.significantEvents && mem.significantEvents.length > 0) {
+            const recent = mem.significantEvents.slice(-5);
+            const labels = { gift:'送礼', dinner:'请吃饭', birthday:'庆生', date:'约会', transfer:'转账', comfort:'安慰', center_deny:'未站C', center_give:'站C', partner_invite:'搭档邀约' };
+            memSummary = recent.map(e => `Day${e.day}:${labels[e.event]||e.event}`).join(', ');
+        }
+        
+        const ctx = {
+            npcType: data.type, 
+            personality: data.personality,
+            memberName: memberName,
+            memberGroup: memberGroup,
+            memberTeam: memberTeam,
+            memberPersEmoji: pers.emoji,
+            memberPersName: pers.name,
+            memberPersStyle: pers.speakStyle,
+            playerName: G.player.name,
+            playerTeam: G.player.team,
+            playerGroup: G.player.group,
+            affection: aff,
+            moodLabel: mood.label,
+            moodEmoji: mood.emoji,
+            recentChat: historyMsgs,
+            lastExchanges: lastExchanges,
+            memorySummary: memSummary,
+            chatHistoryLength: (data.messages || []).length
+        };
+        
+        // 推送当前消息
         data.messages.push({from:'player', text, time:getTimeStr()});
         this.renderWechatMessages();
         App.Sound.play('Msg');
         const quality = evaluateReply(text);
         App.Store.applyChatStress(quality);
-        const ctx = {npcType: data.type, personality: data.personality};
+        
         App.AI.reply(this.currentChatId, ctx, text).then(reply => {
             data.messages.push({from:'npc', text:reply, time:getTimeStr()});
             this.renderWechatMessages();
             const aff = quality==='heartfelt'?3:quality==='normal'?1:-2;
             if (!G.memberAffection[this.currentChatId]) G.memberAffection[this.currentChatId] = 50;
             G.memberAffection[this.currentChatId] = clamp(G.memberAffection[this.currentChatId]+aff, 0, 100);
+            App.MemberMemory.record(this.currentChatId, 'chat', text.substring(0,30));
+            App.MemberMemory.adjustMood(this.currentChatId, quality==='heartfelt'?3:0);
             // 刷新好感度页面
             const affectionPage = document.getElementById('affectionPage');
             if (affectionPage && affectionPage.classList.contains('active')) {
@@ -2286,14 +4126,59 @@ App.UI = {
         });
     },
     showWechatMoments() {
-        const grp = App.NPCData[G.player.group];
-        const memberPosts = [
-            {name:'小圆', emoji:'🎤', text:'今天排练好累但是很开心！新舞步终于拿下了💪', likes:23},
-            {name:'星星', emoji:'⭐', text:'粉丝们晚安~明天见！❤️', likes:45},
-            {name:'豆豆', emoji:'🌸', text:'吃到了好吃的蛋糕！甜甜的一天~', likes:31},
-            {name:'默默', emoji:'💫', text:'新歌的MV拍摄花絮，好期待播出呀！', likes:56},
-            {name:'小鱼', emoji:'🐟', text:'今天的公演圆满成功！谢谢大家的支持！', likes:78}
+        // 收集所有真实成员的 avatar 映射（来自各团 core 数组）
+        const avatarMap = {};
+        Object.values(App.NPCData || {}).forEach(g => {
+            (g.core || []).forEach(c => { if (c && c.name) avatarMap[c.name] = c.avatar || '👤'; });
+        });
+        // 选取与玩家同团（最相关）的成员，作为朋友圈展示
+        const sameGroup = App.getAllMembers().filter(m => m.group === G.player.group && m.team === G.player.team && m.name !== G.player.name && !m.graduate);
+        // 如果同团成员不足，补充同团其他队，再不足补充其他团
+        let memberPool = sameGroup.slice();
+        if (memberPool.length < 6) {
+            const sameGroupOtherTeam = App.getAllMembers().filter(m => m.group === G.player.group && m.name !== G.player.name && !m.graduate);
+            memberPool = memberPool.concat(sameGroupOtherTeam).slice(0, 8);
+        }
+        if (memberPool.length < 4) {
+            const others = App.getAllMembers().filter(m => m.name !== G.player.name && !m.graduate);
+            memberPool = memberPool.concat(others).slice(0, 6);
+        }
+        // 池子去重（按 name）
+        const seen = new Set();
+        memberPool = memberPool.filter(m => { if (seen.has(m.name)) return false; seen.add(m.name); return true; });
+        // 为每个成员随机分配一条朋友圈文案
+        const memberPostTexts = [
+            '今天排练好累但是很开心！新舞步终于拿下了💪',
+            '新歌好好听，录音一次就过～🎤',
+            '吃到了好吃的蛋糕！甜甜的一天~🍰',
+            '新歌的MV拍摄花絮，好期待播出呀！',
+            '今天的公演圆满成功！谢谢大家的支持！',
+            '刚结束训练，洗完澡太舒服了🛁',
+            '和队友一起吃饭，聊了好多八卦哈哈哈😂',
+            '练习室到深夜，今天也是努力的一天！',
+            '收到粉丝的小礼物，开心到转圈圈💝',
+            '拍了一组新照片，摄影师说我状态超好📸',
+            '今天和家人视频了，爸妈让我好好吃饭~',
+            '新学的舞步卡了好几天，今天终于顺了！',
+            '队友生日聚会，吃了好多好吃的🎂',
+            '刚做完发型，下周公演期待一下～',
+            '读完一本好书，推荐给大家📚',
+            '雨天的训练室，安静又惬意☔'
         ];
+        // shuffle helper
+        const shuffled = (arr) => arr.slice().sort(() => Math.random() - 0.5);
+        const memberPosts = memberPool.map((m, i) => ({
+            name: m.name,
+            emoji: avatarMap[m.name] || '🎤',
+            text: memberPostTexts[i % memberPostTexts.length],
+            likes: randInt(15, 90),
+            isMember: true
+        }));
+        // 如果池子为空，插入一个"暂无队友动态"的占位
+        const memberPostsOrFallback = memberPosts.length > 0 ? memberPosts : [
+            {name:'(本团暂无其他成员)', emoji:'🌟', text:'快去认识更多队友吧！', likes:0, isMember:false}
+        ];
+
         
         let h = '';
         h += `<div style="padding:12px 16px;background:#fff;display:flex;align-items:center;gap:10px;cursor:pointer;border-bottom:1px solid #f0f0f0" onclick="App.UI.openPostMoment()">
@@ -2303,7 +4188,7 @@ App.UI = {
         
         const allPosts = [
             {name:G.player.name, emoji:G.player.personalityEmoji||'🎤', text:`${G.player.name}：${G.moments[G.moments.length-1]?.text || '今天也要加油！'}`, likes:G.moments[G.moments.length-1]?.likes || 0, isMe:true, time:G.moments[G.moments.length-1]?.time || ''},
-            ...memberPosts.map(p => ({...p, isMe:false}))
+            ...memberPostsOrFallback.map(p => ({...p, isMe:false}))
         ];
         
         allPosts.forEach(m => {
@@ -2410,7 +4295,22 @@ App.UI = {
                 <div style="text-align:center;color:#666;margin:8px 0">— 或者发布普通微博 —</div>
             `;
         }
-        document.getElementById('weiboContent').innerHTML = `<div class="post-area">${optionsHtml}<textarea id="weiboInput" placeholder="分享你的动态..."></textarea><button class="post-btn" onclick="App.UI.submitWeibo()">发布</button></div>`;
+        let trendingAlert = '';
+        if (G.trendingEvents && G.trendingEvents.length > 0) {
+            const last = G.trendingEvents[G.trendingEvents.length - 1];
+            const sev = last.severity === 'major' ? '🔴' : last.severity === 'positive' ? '🟢' : '🟡';
+            trendingAlert = `<div style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:8px;margin-bottom:8px;font-size:11px">${sev} 最近热搜：${last.title} · ${last.trigger.substring(0,25)}…</div>`;
+        }
+        if (G.controversyLog && G.controversyLog.filter(l=>!l.resolved).length > 0) {
+            trendingAlert += `<div style="background:#fdedec;border:1px solid #e74c3c;border-radius:8px;padding:8px;margin-bottom:8px;font-size:11px;cursor:pointer" onclick="App.UI.showControversyFromWeibo()">⚠️ 有${G.controversyLog.filter(l=>!l.resolved).length}个争议事件待处理 →</div>`;
+        }
+        document.getElementById('weiboContent').innerHTML = `<div class="post-area">
+            ${optionsHtml}
+            ${trendingAlert}
+            <div style="font-size:11px;color:#e74c3c;margin-bottom:6px">⚠️ 注意措辞！黑幕/讨厌/恶心等词会引发负面效应</div>
+            <textarea id="weiboInput" placeholder="分享你的动态..."></textarea>
+            <button class="post-btn" onclick="App.UI.submitWeibo()">发布</button>
+        </div>`;
     },
     showClarifyForm() {
         const form = document.getElementById('clarifyForm');
@@ -2429,10 +4329,18 @@ App.UI = {
     submitWeibo() {
         const text = document.getElementById('weiboInput')?.value.trim();
         if (!text) return;
-        G.weiboPosts.push({text, likes:randInt(10,200), time:getTimeStr()});
-        G.game.weibo_followers += randInt(5,50);
-        App.Store.updateStats({popularity:1,starlight:1});
-        this.showNotification('微博发布成功！👥 +粉丝');
+        // 使用SocialMedia风险检测
+        const result = App.SocialMedia.postWeibo(text);
+        // 同步到原有weiboPosts
+        G.weiboPosts.push({text, likes:result.likes, time:getTimeStr()});
+        G.game.weibo_followers += result.likes > 100 ? randInt(50,200) : randInt(5,50);
+        if (result.riskLevel === 'high') {
+            this.showNotification(`⚠️ 高风险发言！${result.backlash?.desc}\\n📸绯闻+${result.backlash?.scandalGain} ⭐人气-${result.backlash?.popularityLoss}`, 5000);
+        } else if (result.riskLevel === 'medium') {
+            this.showNotification(`⚠️ 发言引起讨论：${result.riskDetail}`, 3500);
+        } else {
+            this.showNotification(`微博发布成功！👥 ❤️${result.likes}`, 2000);
+        }
         this.renderWeiboHot();
     },
 
@@ -2877,26 +4785,38 @@ App.UI = {
     renderPocketRoom() {
         if (!G.pocketRoomMessages.length) {
             G.pocketRoomMessages = [
-                {sender:'粉丝001',avatar:'🧸',text:'姐姐好！',isMe:false},
+                {sender:'粉丝001',avatar:'🧸',text:'姐姐好！',isMe:false, personaId:'lively_xiaoyuan'},
                 {sender:G.player.name,text:'大家好~',isMe:true}
             ];
         }
-        
-        let chatHtml = G.pocketRoomMessages.map((m, idx) => `
+        // 记录房间进入时间，用于自动触发判断
+        if (!G.pocketRoomEnterTime || G.pocketRoomLastDay !== (G.game?.day || 1)) {
+            G.pocketRoomEnterTime = Date.now();
+            G.pocketRoomLastDay = G.game?.day || 1;
+            G.pocketRoomAutoTriggered = false;
+        }
+
+        let chatHtml = G.pocketRoomMessages.map((m, idx) => {
+            const persona = m.personaId ? App.FanAI.personas.find(p => p.id === m.personaId) : null;
+            const senderColor = persona ? persona.color : '#999';
+            return `
             <div style="display:flex;justify-content:${m.isMe?'flex-end':'flex-start'};margin-bottom:16px">
                 ${!m.isMe ? `<div class="avatar" style="width:36px;height:36px;border-radius:50%;background:#f0f0f0;margin-right:10px;display:flex;align-items:center;justify-content:center;font-size:16px">${m.avatar || '👤'}</div>` : ''}
                 <div style="max-width:70%">
-                    ${!m.isMe ? `<div style="font-size:11px;color:#999;margin-bottom:4px;padding-left:4px">${m.sender}</div>` : ''}
+                    ${!m.isMe ? `<div style="font-size:11px;color:${senderColor};margin-bottom:4px;padding-left:4px;font-weight:${persona ? '600' : 'normal'}">${m.sender}</div>` : ''}
                     <div style="${m.isMe?'background:#07c160;color:#fff;border-radius:18px 18px 4px 18px':'background:#fff;border-radius:18px 18px 18px 4px;border:1px solid #eee'};padding:10px 14px;font-size:14px;box-shadow:0 1px 2px rgba(0,0,0,0.05)">
                         ${m.text}
                     </div>
                 </div>
                 ${m.isMe ? `<div class="avatar" style="width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;margin-left:10px;display:flex;align-items:center;justify-content:center;font-size:12px">我</div>` : ''}
             </div>
-        `).join('');
-        
+        `}).join('');
+        // AI 状态条
+        const aiBar = `<div style="background:linear-gradient(90deg,#e3f2fd,#f3e5f5);padding:8px 12px;font-size:11px;color:#555;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e0e0e0"><span>🤖 AI 粉丝已上线（${App.FanAI.personas.length} 个独立人设）</span><span style="color:#999">${G.pocketRoomAutoTriggered ? '✅ 已自动欢迎' : '⏳ 等待 AI 主动发消息'}</span></div>`;
+
         let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">房间</span></div>
-        <div style="flex:1;overflow-y:auto;padding:12px;background:#f5f5f5">
+        ${aiBar}
+        <div id="roomChatArea" style="flex:1;overflow-y:auto;padding:12px;background:#f5f5f5">
             <div style="max-width:400px;margin:0 auto">
                 ${chatHtml || '<div style="text-align:center;color:#999;padding:60px 20px">暂无消息，快来和粉丝互动吧~</div>'}
             </div>
@@ -2907,109 +4827,83 @@ App.UI = {
         </div>`;
         document.getElementById('pocketPage').innerHTML = h;
         setTimeout(() => {
-            const chatArea = document.getElementById('pocketPage').querySelector('[style*="flex:1"]');
+            const chatArea = document.getElementById('roomChatArea');
             if (chatArea) chatArea.scrollTop = chatArea.scrollHeight;
         }, 100);
+
+        // 触发 AI 主动消息（仅首次进入房间时）
+        if (!G.pocketRoomAutoTriggered) {
+            this.triggerPocketRoomAIMsgs();
+        }
     },
+
+    // AI 主动发消息（1-3 个不同人设，按各自延迟触发）
+    triggerPocketRoomAIMsgs() {
+        if (G.pocketRoomAutoTriggered) return;
+        G.pocketRoomAutoTriggered = true;
+        const count = 1 + Math.floor(Math.random() * 3); // 1-3 条
+        const msgs = App.FanAI.autoTriggerMessages(count);
+        msgs.forEach((m, idx) => {
+            const delay = 3000 + idx * 4000 + Math.random() * 3000; // 3-15s 错开
+            setTimeout(() => {
+                if (this.currentPage !== 'pocketPage') return; // 离开房间就不发
+                G.pocketRoomMessages.push(m);
+                this.renderPocketRoom();
+                const chatArea = document.getElementById('roomChatArea');
+                if (chatArea) chatArea.scrollTop = chatArea.scrollHeight;
+            }, delay);
+        });
+    },
+
     sendPocketMessage() {
         const input = document.getElementById('pocketInput');
         const text = input?.value.trim();
         if (!text) return;
-        
+        input.value = '';
+
         G.pocketRoomMessages.push({ sender: G.player.name, text, isMe: true });
-        
-        // 增加更丰富的NPC粉丝词库
-        const replies = [
-            // 普通粉丝回复
-            '姐姐好可爱！',
-            '支持你！',
-            '加油！',
-            '今天也要努力哦~',
-            '期待你的新舞台！',
-            '你真的很棒！',
-            '爱你哦~❤️',
-            '永远支持你！',
-            '姐姐最棒了！',
-            '今天也要元气满满！',
-            '翻我翻我~',
-            '好想看姐姐公演！',
-            '姐姐在干嘛呀',
-            '今天辛苦啦~',
-            '新歌好好听！',
-            '期待下次直播！',
-            // 铁粉回复
-            '铁粉报到！姐姐我来了！',
-            '每天都来打卡！',
-            '姐姐的每场公演我都在！',
-            '什么时候来我们城市！',
-            '已经买了下次公演的票！',
-            // 热情粉丝
-            '天哪天哪！！姐姐！！',
-            '啊啊啊啊姐姐！！好激动！！',
-            '妈妈我看到偶像了！！',
-            '太幸福了！！',
-            // 好奇粉丝
-            '姐姐最近在练什么舞呀',
-            '新公演什么时候上线呀',
-            '姐姐吃饭了吗~',
-            '姐姐住哪里呀',
-            '姐姐喜欢吃什么',
-            // 活跃粉丝
-            '哈哈哈笑死我了😂',
-            '姐姐好幽默！',
-            '这也太可爱了吧！',
-            '姐姐瘦了吗？',
-            '新衣服好好看！',
-            '今天的妆容好美！',
-            // 关心粉丝
-            '姐姐要好好休息哦',
-            '不要太累了！',
-            '注意身体呀姐姐',
-            '多喝水多休息！',
-            // 追星粉丝
-            '❤️❤️❤️❤️❤️',
-            '💖💖💖💖💖',
-            '🌟🌟🌟🌟🌟',
-            '今天的造型绝绝子！',
-            '姐姐是我的光！',
-            // 调皮粉丝
-            '姐姐偷走了我的心！',
-            '要请我吃饭哦~',
-            '什么时候开演唱会！',
-            '翻牌翻牌！',
-            // 鼓励粉丝
-            '姐姐最厉害了！',
-            '加油加油！我们一直都在！',
-            '不要有压力！我们支持你！',
-            '相信自己！你最棒！',
-        ];
-        
-        // 不同类型粉丝的专属回复
-        const fanTypes = [
-            // 普通粉丝
-            { prefix:'粉丝', avatars:['🧸','🐰','🐱','🐶','🦄','🌸','🌟','💖','🎀','✨'], replies:replies },
-            // 铁粉
-            { prefix:'铁粉', avatars:['⭐','💪','🔥','🎖️','👑'], replies:['铁粉报到！永远支持姐姐！','每天必来报到！','姐姐的每条消息我都看！','铁粉永远追随！','姐姐最棒！'] },
-            // 狂热粉丝
-            { prefix:'狂热粉', avatars:['💥','🌈','🎉','🎊','💝'], replies:['天哪天哪！！太激动了！！','姐姐我爱死你了！！','啊啊啊啊要晕倒了！！','最爱你了姐姐！！','永远追随你！！'] },
-            // 好奇宝宝
-            { prefix:'好奇', avatars:['🤔','💭','❓','🧐','👀'], replies:['姐姐最近在忙什么呀？','新公演是什么主题呀？','下次直播是什么时候呀？','姐姐有什么想对我们说的吗？','可以多发点日常吗~'] },
-            // 温暖粉丝
-            { prefix:'暖心粉', avatars:['🌻','🌺','💐','🌷','🪻'], replies:['姐姐要照顾好自己哦','不要太累了，我们会心疼的','注意休息多喝水呀','我们永远支持你！','加油！我们相信你！'] },
-        ];
-        
+
+        // AI 人设驱动回复：根据玩家消息上下文选人设
+        const reply = App.FanAI.pickReply(text);
+        const persona = reply.persona;
+        const delay = App.FanAI.replyDelay(persona);
+        const senderName = (persona.prefix || '') + persona.name + (persona.prefix ? Math.floor(Math.random() * 900 + 100) : '');
+
         setTimeout(() => {
-            const fanType = pick(fanTypes);
             G.pocketRoomMessages.push({
-                sender: fanType.prefix + randInt(1, 999),
-                avatar: pick(fanType.avatars),
-                text: pick(fanType.replies),
-                isMe: false
+                sender: senderName,
+                avatar: persona.avatar,
+                text: reply.text,
+                isMe: false,
+                personaId: persona.id
             });
             this.renderPocketRoom();
-        }, 1000);
-        
-        input.value = '';
+            const chatArea = document.getElementById('roomChatArea');
+            if (chatArea) chatArea.scrollTop = chatArea.scrollHeight;
+        }, delay);
+
+        // 30% 概率追加一个不同人设的回复
+        if (Math.random() < 0.3) {
+            const otherReply = App.FanAI.pickReply(text);
+            if (otherReply.persona.id !== persona.id) {
+                const otherDelay = delay + 1500 + Math.random() * 2000;
+                setTimeout(() => {
+                    if (this.currentPage !== 'pocketPage') return;
+                    const otherName = (otherReply.persona.prefix || '') + otherReply.persona.name;
+                    G.pocketRoomMessages.push({
+                        sender: otherName,
+                        avatar: otherReply.persona.avatar,
+                        text: otherReply.text,
+                        isMe: false,
+                        personaId: otherReply.persona.id
+                    });
+                    this.renderPocketRoom();
+                    const chatArea = document.getElementById('roomChatArea');
+                    if (chatArea) chatArea.scrollTop = chatArea.scrollHeight;
+                }, otherDelay);
+            }
+        }
+
         this.renderPocketRoom();
     },
     sendRoomMsg() {
@@ -3037,26 +4931,151 @@ App.UI = {
         setTimeout(sendFanMsg, 2000);
     },
     renderPocketFlip() {
+        const settings = (G && G.settings) || { flipPrice: 0, flipPriceEnabled: false };
+        const curPrice = settings.flipPrice || 0;
+        // 付费输入卡：玩家输入价格，0 表示免费
+        const priceCard = `
+        <div style="background:#fff;border-radius:12px;padding:14px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.06)">
+            <div style="font-size:13px;font-weight:600;color:#333;margin-bottom:8px">💸 翻牌付费设置（玩家自行定价）</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                <span style="font-size:13px;color:#666;flex:1">每次翻牌价格（🍗 鸡腿）</span>
+                <input id="flipPagePriceInput" type="number" min="0" max="500" value="${curPrice}" placeholder="0-500" style="width:90px;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:14px;text-align:center" oninput="App.UI.setFlipPrice(this.value)" onchange="App.UI.setFlipPrice(this.value)">
+                <button onclick="App.UI.setFlipPrice(document.getElementById('flipPagePriceInput').value);App.UI.renderPocketFlip();" style="padding:8px 14px;background:#ff9500;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer">保存</button>
+            </div>
+            <div id="flipPagePriceHint" style="font-size:12px;color:${curPrice > 0 ? '#ff9500' : '#27ae60'};line-height:1.5">
+                ${curPrice > 0
+                    ? `✅ 当前定价：每次翻牌粉丝需付 <b>${curPrice}</b> 🍗（你将获得 ${curPrice} 🍗，回复质量高时还有奖励）`
+                    : '🆓 当前翻牌免费（输入 1-500 启用收费）'}
+            </div>
+        </div>`;
+        // 翻牌状态：每日重置
+        if (!G.flipState || G.flipState.day !== (G.game?.day || 1)) {
+            G.flipState = { day: G.game?.day || 1, replied: {} };
+        }
+        const replied = G.flipState.replied || {};
+        const fans = ['小圆','星星','默默','阿花','小鱼','小月','琪琪','豆豆','花花','小雪','小满','小月月','木木','糖糖','糖小咪','豆芽','小诺','阿璃','雪球','小杰','阿白','小米','糖宝','小月兔','小倩','小饼干','小星','阿果','小蝶','小白'];
         const fanMsgs = [
-            '姐姐今天公演超棒！','新歌好好听啊！','每天都来看姐姐','姐姐要好好休息哦','太甜了吧姐姐！','加油我们支持你','什么时候出周边啊','公演票好难抢...','姐姐广州人吗？','期待下次见面！','想看姐姐拍广告','姐姐笑容好治愈'
+            '姐姐今天公演超棒！','新歌好好听啊！','每天都来看姐姐','姐姐要好好休息哦','太甜了吧姐姐！','加油我们支持你','什么时候出周边啊','公演票好难抢...','姐姐广州人吗？','期待下次见面！','想看姐姐拍广告','姐姐笑容好治愈',
+            '姐姐今天在干嘛呀～','我刚下班就来刷动态了','今天姐姐好好看啊！','这首新歌我单曲循环了！','姐姐加油，我们都在～','姐姐什么时候出单曲呀','刚抢到公演票好开心！','今天的直播太精彩了','姐姐的舞跳得太好了！','姐姐的歌声让我一整天都开心',
+            '想看姐姐拍杂志！','姐姐的穿搭好好看','姐姐今天有没有好好吃饭','今天好累但是看到姐姐就开心了','姐姐的舞蹈进步好大','姐姐发的新歌好好听','刚下班就想看姐姐','今天的姐姐好飒！','姐姐有没有新照片','姐姐生快快乐～',
+            '姐姐什么时候开见面会呀','想给姐姐写信！','姐姐下次公演什么时候','姐姐记得多喝水哦','今天穿得好好看','姐姐的演技好棒','姐姐的笑容治愈了我一整天','想和姐姐合影！','姐姐什么时候来我们城市','姐姐的 MV 太美了',
+            '姐姐的嗓音好特别','姐姐保重身体哦～','刚看到姐姐的签名好开心','姐姐是我的动力','今天给姐姐投票了','想和姐姐喝咖啡','姐姐的新发型好可爱','姐姐的腿好长啊','姐姐在哪里吃饭呀','想看姐姐的日常',
+            '姐姐最近心情怎么样？','姐姐今天有什么计划','刚看完姐姐的舞台哭了','姐姐的综艺感好强','姐姐什么时候直播','想和姐姐一起去游乐园','姐姐的手好漂亮','姐姐的眼睛会说话','姐姐的身高是多少呀','姐姐喜欢什么颜色',
+            '姐姐的最爱是什么','姐姐有没有养宠物','姐姐的房间是什么样的','姐姐的家人支持你吗','姐姐喜欢什么食物','想给姐姐寄礼物','姐姐的签名怎么练的','姐姐的粉丝叫什么','姐姐的应援色是什么','姐姐有没有喜欢的小动物'
         ];
-        const fans = ['小圆','星星','默默','阿花','小鱼','小月','琪琪','豆豆','花花','小雪'];
-        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">翻牌</span></div><div style="flex:1;overflow-y:auto;padding:8px">`;
-        fans.forEach((f,i) => {
-            h += `<div class="flip-card"><div class="flip-fan">🧸 ${f}</div><div class="flip-msg">${fanMsgs[i % fanMsgs.length]}</div><div class="flip-reply"><input id="flipInput${i}" placeholder="回复粉丝..."><button onclick="App.UI.sendFlip(${i})">翻牌</button></div></div>`;
+        const fanEmojis = ['🧸','🐱','🐶','🐰','🐻','🦊','🐼','🦁','🐯','🐨','🐸','🐵','🐔','🐧','🦄'];
+        // 选 10 个粉丝（每天基于人气 randomize）
+        const seed = (G.game?.day || 1) * 7 + Math.floor((G.stats?.popularity || 0) / 10);
+        const shuffledFans = fans.slice().sort((a,b) => ((a.charCodeAt(0)+seed) % 97) - ((b.charCodeAt(0)+seed) % 97)).slice(0, 10);
+        const shuffledMsgs = fanMsgs.slice().sort(() => Math.random() - 0.5);
+        const today = G.game?.day || 1;
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">翻牌</span></div>${priceCard}
+        <div style="background:#e3f2fd;color:#0d47a1;padding:8px 12px;font-size:12px;border-radius:8px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+            <span>📅 第 ${today} 天 · 今日翻牌 <b>${Object.keys(replied).length}/10</b></span>
+            <span style="font-size:11px;color:#666">${Object.keys(replied).length >= 10 ? '🌙 今日翻完，明日 0:00 刷新' : '剩余 ' + (10 - Object.keys(replied).length) + ' 条'}</span>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:8px">`;
+        shuffledFans.forEach((f, i) => {
+            const isReplied = !!replied[i];
+            const msg = shuffledMsgs[i % shuffledMsgs.length];
+            const emoji = fanEmojis[i % fanEmojis.length];
+            if (isReplied) {
+                // 已翻牌：显示灰色 + 标记
+                h += `<div class="flip-card" style="opacity:0.55;background:#f5f5f5">
+                    <div class="flip-fan">${emoji} ${f}</div>
+                    <div class="flip-msg" style="color:#999">${msg}</div>
+                    <div style="text-align:center;padding:10px;background:#d4edda;color:#155724;border-radius:6px;font-size:12px;margin-top:6px">✅ 已回复 · 等待明日刷新</div>
+                </div>`;
+            } else {
+                h += `<div class="flip-card">
+                    <div class="flip-fan">${emoji} ${f}</div>
+                    <div class="flip-msg">${msg}</div>
+                    <div class="flip-reply"><input id="flipInput${i}" placeholder="回复粉丝..."><button onclick="App.UI.sendFlip(${i})">翻牌</button></div>
+                </div>`;
+            }
         });
         h += '</div>';
         document.getElementById('pocketPage').innerHTML = h;
+    },
+    toggleFlipPrice() {
+        if (!G.settings) G.settings = { flipPrice: 0, flipPriceEnabled: false };
+        G.settings.flipPriceEnabled = !G.settings.flipPriceEnabled;
+        App.Save.autoSave();
+        this.showNotification(G.settings.flipPriceEnabled ? '💰 已启用翻牌收费：粉丝每次翻牌需付费' : '🆓 已关闭翻牌收费');
+        this.renderSettings();
+    },
+    setFlipPrice(val) {
+        if (!G.settings) G.settings = { flipPrice: 0, flipPriceEnabled: false };
+        const raw = parseInt(val);
+        const safe = (isNaN(raw) ? 0 : raw);
+        const n = Math.max(0, Math.min(500, safe));
+        G.settings.flipPrice = n;
+        G.settings.flipPriceEnabled = n > 0;
+        App.Save.autoSave();
+        // 同步翻牌页输入框（防止用户输入超过 500）
+        const flipInp = document.getElementById('flipPagePriceInput');
+        if (flipInp && parseInt(flipInp.value) !== n) flipInp.value = n;
+        // 更新翻牌页提示（不重渲染以免丢失焦点）
+        const hint = document.getElementById('flipPagePriceHint');
+        if (hint) {
+            hint.style.color = n > 0 ? '#ff9500' : '#27ae60';
+            hint.innerHTML = n > 0
+                ? `✅ 当前定价：每次翻牌粉丝需付 <b>${n}</b> 🍗（你将额外获得 ${n} 🍗）`
+                : '🆓 当前翻牌免费（输入 1-500 启用收费）';
+        }
+        // 同步设置页输入框
+        const setInp = document.getElementById('flipPriceInput');
+        if (setInp && parseInt(setInp.value) !== n) setInp.value = n;
     },
     sendFlip(idx) {
         const input = document.getElementById('flipInput'+idx);
         const text = input?.value.trim();
         if (!text) return;
+        const settings = (G && G.settings) || { flipPrice: 0, flipPriceEnabled: false };
+        const price = settings.flipPriceEnabled ? (settings.flipPrice || 0) : 0;
         input.value = '';
+        // 玩家获得 = 粉丝付费（玩家设置的价格）
+        // 若回复质量高，可触发额外奖励（不影响基础价格）
         const quality = evaluateReply(text);
-        const earn = quality==='heartfelt'?randInt(15,30):quality==='normal'?randInt(5,15):randInt(1,5);
-        App.Store.updateStats({drumstick:earn});
-        this.showNotification(`🍗 +${earn}`);
+        const bonus = (price > 0)
+            ? (quality === 'heartfelt' ? Math.floor(price * 0.5)
+                : quality === 'normal' ? Math.floor(price * 0.2)
+                : 0)
+            : (quality === 'heartfelt' ? randInt(15, 30)
+                : quality === 'normal' ? randInt(5, 15)
+                : randInt(1, 5));
+        const totalEarn = price + bonus;
+        App.Store.updateStats({drumstick: totalEarn});
+        if (price > 0) {
+            const bonusTxt = bonus > 0 ? `（回复质量高 +${bonus}）` : '';
+            this.showNotification(`🍗 +${price}（粉丝付费）${bonusTxt}`, 2500);
+        } else {
+            this.showNotification(`🍗 +${totalEarn}`);
+        }
+        // 标记此条已翻牌：加入当日已翻牌集合
+        if (!G.flipState) G.flipState = { day: G.game?.day || 1, replied: {} };
+        // 如果跨天，重置
+        if (G.flipState.day !== (G.game?.day || 1)) {
+            G.flipState = { day: G.game?.day || 1, replied: {} };
+        }
+        G.flipState.replied[idx] = true;
+        // 隐藏该条翻牌卡片
+        const card = input.closest('.flip-card');
+        if (card) {
+            card.style.transition = 'opacity 0.3s, transform 0.3s';
+            card.style.opacity = '0.3';
+            card.style.transform = 'scale(0.98)';
+            const btn = card.querySelector('button');
+            if (btn) { btn.disabled = true; btn.textContent = '✓ 已翻牌'; btn.style.background = '#999'; btn.style.cursor = 'default'; }
+            // 替换为已翻牌标记
+            setTimeout(() => {
+                const banner = document.createElement('div');
+                banner.style.cssText = 'background:#d4edda;color:#155724;padding:8px;border-radius:6px;font-size:12px;text-align:center;margin-top:6px';
+                banner.textContent = '✅ 本条已回复，等待明日刷新';
+                card.appendChild(banner);
+            }, 300);
+        }
+        App.Save.autoSave();
     },
     renderPocketLive() {
         if (this.liveActive) { this.renderLiveStream(); return; }
@@ -3308,6 +5327,22 @@ App.UI = {
             App.Save.autoSave();
         }
     },
+    dissolvePartner() {
+        if (!G.bestPartner) { this.showNotification('还没有最佳拍档，无需解除'); return; }
+        const name = (typeof G.bestPartner === 'string') ? G.bestPartner : G.bestPartner.name;
+        if (!confirm(`确定要与 ${name} 解除最佳拍档关系吗？\n\n解除后：\n• 本周期的双人舞台奖励将作废\n• 好感度会下降 20 点（最低 30）\n• 下次需重新邀请才能组队`)) return;
+        // 降低好感度
+        const cur = G.memberAffection[name] || 50;
+        G.memberAffection[name] = Math.max(30, cur - 20);
+        // 清空关系
+        G.bestPartner = null;
+        G.partnerStageUsed = false;
+        this.showNotification(`💔 已与 ${name} 解除最佳拍档关系`);
+        App.Save.autoSave();
+        // 刷新当前页（如果显示的是 profile / affection / pocket）
+        try { this.renderProfile(); } catch(e) {}
+        try { this.renderAffection(); } catch(e) {}
+    },
     startPartnerStage() {
         if (!G.bestPartner) { this.showNotification('还没有最佳拍档'); return; }
         if (G.partnerStageUsed) { this.showNotification('本周期已进行过双人舞台'); return; }
@@ -3373,7 +5408,8 @@ App.UI = {
         }
         if (G.bestPartner) {
             h += `<div style="margin-top:12px;font-weight:600">💞 最佳拍档：${G.bestPartner.name} (自Day${G.bestPartner.sinceDay})</div>
-                  ${G.partnerStageUsed ? '<span style="color:#999">(本周期已演出)</span>' : '<button class="best-partner-btn" onclick="App.UI.startPartnerStage()">🎶 双人舞台</button>'}`;
+                  ${G.partnerStageUsed ? '<span style="color:#999">(本周期已演出)</span>' : '<button class="best-partner-btn" onclick="App.UI.startPartnerStage()">🎶 双人舞台</button>'}
+                  <button class="best-partner-btn" onclick="App.UI.dissolvePartner()" style="background:#ff4757;color:#fff;margin-left:8px">💔 解除拍档</button>`;
         }
         if (this.checkMoveGroupAvailable()) {
             h += `<div style="margin-top:12px"><button class="create-btn" onclick="App.UI.renderMoveGroupPanel()">🚄 移籍/换队</button></div>`;
@@ -3428,6 +5464,18 @@ App.UI = {
             h += '<div class="empty-hint">暂无成员数据</div>';
         }
         
+        // 社交圈展示
+        App.SocialNetwork.initIfNeeded();
+        if (G.socialCircles.length > 0) {
+            h += '<div class="contact-group-title" style="background:linear-gradient(135deg,#e8d5b7,#c8a96e);color:#8b7355">🕸️ 关系网</div>';
+            G.socialCircles.forEach(c => {
+                h += `<div style="padding:8px 16px;font-size:12px;color:#666;border-bottom:1px solid #f0f0f0">
+                    <span style="font-weight:600">${c.emoji} ${c.name}</span>
+                    <span style="color:#999;margin-left:8px">${c.members.join(' · ')}</span>
+                </div>`;
+            });
+        }
+        
         h += `</div>`;
         document.getElementById('affectionPage').innerHTML = h;
     },
@@ -3445,6 +5493,156 @@ App.UI = {
             App.Store.updateStats({popularity: 20, mood: 10});
             this.renderAffection();
         }
+    },
+
+    // ---------- 日记本 ----------
+    renderDiaryList() {
+        App.SocialNetwork.initIfNeeded();
+        App.Diary.initIfNeeded();
+        const teammates = App.getAllMembers().filter(m => !m.graduate && m.group === G.player.group && m.team === G.player.team);
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">📔 ${G.player.group} Team ${G.player.team} 日记本</span></div>
+        <div style="flex:1;overflow-y:auto;padding:12px">
+            <div style="background:linear-gradient(135deg,#f5e6d3,#e8d5b7);border-radius:12px;padding:12px;margin-bottom:12px;font-size:12px;color:#8b7355;text-align:center">
+                👁️ 偷看成员们的真实想法（每日23:00自动更新）
+            </div>`;
+        teammates.forEach(m => {
+            const pers = App.MemberPersonality.getFor(m.name);
+            const entries = App.Diary.getEntries(m.name);
+            const latest = entries[0];
+            const hasToday = latest && latest.day === G.game.day;
+            h += `<div style="background:#fff;border-radius:12px;margin-bottom:10px;overflow:hidden;cursor:pointer" onclick="App.UI.showMemberDiary('${m.name}')">
+                <div style="display:flex;align-items:center;padding:12px;gap:10px">
+                    <span style="font-size:28px">👧</span>
+                    <div style="flex:1">
+                        <div style="font-weight:600;font-size:14px;color:#333">${m.name} <span style="font-size:11px;color:#999">${pers.emoji}</span></div>
+                        <div style="font-size:11px;color:#999">${entries.length}篇日记</div>
+                    </div>
+                    <div style="text-align:right">
+                        ${hasToday ? '<span style="background:#ff69b4;color:#fff;border-radius:8px;padding:2px 8px;font-size:10px">今日已更新</span>' : '<span style="color:#ccc;font-size:10px">等待更新...</span>'}
+                    </div>
+                </div>
+                ${latest && hasToday ? `<div style="border-top:1px solid #f0f0f0;padding:10px 12px;font-size:12px;color:#666;line-height:1.6;max-height:60px;overflow:hidden">${latest.mood} ${latest.content.substring(0, 80)}${latest.content.length>80?'...':''}</div>` : ''}
+            </div>`;
+        });
+        h += '</div>';
+        document.getElementById('diaryPage').innerHTML = h;
+    },
+    showMemberDiary(name) {
+        const entries = App.Diary.getEntries(name);
+        const pers = App.MemberPersonality.getFor(name);
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.renderDiaryList()">←</span><span class="title">📔 ${name}的日记</span></div>
+        <div style="flex:1;overflow-y:auto;padding:16px">
+            <div style="text-align:center;margin-bottom:16px">
+                <span style="font-size:40px">👧</span>
+                <div style="font-weight:600;font-size:16px">${name}</div>
+                <div style="font-size:12px;color:#999">${pers.emoji}</div>
+            </div>`;
+        if (entries.length === 0) {
+            h += '<div style="text-align:center;padding:40px;color:#999">还没有日记哦~</div>';
+        } else {
+            entries.forEach(e => {
+                h += `<div style="background:#fdf8f0;border-left:3px solid #c8a96e;border-radius:0 12px 12px 0;padding:14px;margin-bottom:12px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                        <span style="font-weight:600;font-size:12px;color:#8b7355">Day ${e.day}</span>
+                        <span style="font-size:16px">${e.mood||'😐'}</span>
+                    </div>
+                    <div style="font-size:13px;color:#555;line-height:1.8">${e.content||'今天没什么想记录的...'}</div>
+                </div>`;
+            });
+        }
+        h += '</div>';
+        document.getElementById('diaryPage').innerHTML = h;
+    },
+
+    // ---------- 成员主动性弹窗 ----------
+    showProactiveEvent(event) {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);padding:20px';
+        // 修复：避免任何转义问题，直接用 JSON.stringify 处理数据
+        const eventData = {
+            member: String(event.member || ''),
+            type: String(event.type || ''),
+            responded: false,
+            text: String(event.text || ''),
+            emoji: String(event.emoji || '💬')
+        };
+        // 用 JSON 序列化保证安全（onclick 字符串用 base64 编码防注入）
+        const eventDataB64 = btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(eventData))));
+        overlay.innerHTML = [
+            '<div style="background:#fff;border-radius:20px;padding:24px;width:100%;max-width:320px;text-align:center">',
+            '<div style="font-size:48px;margin-bottom:12px">', eventData.emoji, '</div>',
+            '<div style="font-weight:600;font-size:16px;color:#333;margin-bottom:4px">', eventData.member, ' 主动找你</div>',
+            '<div style="font-size:13px;color:#666;margin-bottom:20px;line-height:1.6">', eventData.text, '</div>',
+            '<div style="display:flex;gap:8px">',
+            '<button data-r="', eventDataB64, '" data-c="positive" style="flex:1;padding:12px;border:none;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer">积极回应</button>',
+            '<button data-r="', eventDataB64, '" data-c="negative" style="flex:1;padding:12px;border:1px solid #ddd;background:#fff;color:#666;border-radius:10px;font-size:13px;cursor:pointer">婉拒</button>',
+            '</div></div>'
+        ].join('');
+        document.getElementById('phoneModals').appendChild(overlay);
+        // 事件代理：从 data-r 解码数据，从 data-c 读取选择
+        overlay.querySelectorAll('button[data-r]').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                try {
+                    const b64 = btn.getAttribute('data-r');
+                    const json = new TextDecoder().decode(Uint8Array.from(atob(b64), c => c.charCodeAt(0)));
+                    const data = JSON.parse(json);
+                    const choice = btn.getAttribute('data-c');
+                    App.Proactivity.respond(data, choice);
+                    App.UI.showNotification(choice === 'positive' ? '好感度 +8' : '好感度 -5');
+                } catch (err) {
+                    console.error('showProactiveEvent click error:', err);
+                }
+                overlay.remove();
+            });
+        });
+        overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
+    },
+
+    // ---------- 私聊泄露 ----------
+    showChatLeakNotification(leak) {
+        const n = document.getElementById('notification');
+        n.innerHTML = `🔍 发现了一段私聊记录！来自 ${leak.members.join(' & ')}`;
+        n.style.display = 'block';
+        n.style.background = 'linear-gradient(135deg,#ff6b6b,#ff4757)';
+        n.style.cursor = 'pointer';
+        n.onclick = () => {
+            n.style.display = 'none';
+            App.UI.openApp('chatleak');
+            App.UI.currentLeak = leak;
+        };
+        setTimeout(() => { if (n.style.background.includes('ff6b6b')) n.style.display = 'none'; }, 5000);
+        if (!G.chatLeaks) G.chatLeaks = [];
+        G.chatLeaks.push(leak);
+        App.Save.autoSave();
+    },
+    renderChatLeak() {
+        const leak = App.UI.currentLeak || (G.chatLeaks?.[G.chatLeaks.length-1]);
+        if (!leak) { App.UI.goHome(); return; }
+        document.getElementById('chatLeakPage').innerHTML = `<div class="app-header" style="background:#ff4757;border-color:#ff4757"><span class="back-btn" style="color:#fff" onclick="App.UI.goHome()">←</span><span class="title" style="color:#fff">🔍 私聊泄露</span></div>
+        <div style="flex:1;overflow-y:auto;padding:16px;background:linear-gradient(180deg,#2d2d2d,#1a1a1a)">
+            <div style="background:rgba(255,255,255,0.05);border-radius:12px;padding:12px;margin-bottom:12px;text-align:center;color:#ff6b6b;font-size:12px">
+                ⚠️ Day ${leak.day} · ${leak.scene} · ${leak.topic}
+            </div>
+            <div id="leakContent" style="color:#ddd;font-size:13px;line-height:2">
+                ${leak.content ? leak.content.split('\\n').map(l => {
+                    const colon = l.indexOf(':');
+                    if (colon > -1) { const who = l.substring(0,colon); const what = l.substring(colon+1);
+                        return `<div style="margin-bottom:8px"><span style="color:#ffb347;font-weight:600">${who}:</span> <span style="color:#ddd">${what}</span></div>`; }
+                    return `<div style="color:#888;font-size:12px">${l}</div>`;
+                }).join('') : '<div style="text-align:center;color:#888;padding:40px">加载中...</div>'}
+            </div>
+            <div style="padding:10px;text-align:center">
+                <button onclick="App.UI.loadLeakContent()" style="padding:12px 30px;border:none;background:linear-gradient(135deg,#ff4757,#ff6b81);color:#fff;border-radius:20px;font-size:13px;cursor:pointer;font-weight:600">🔄 生成对话内容</button>
+            </div>
+        </div>`;
+        if (!leak.content) this.loadLeakContent(leak);
+    },
+    async loadLeakContent(leak) {
+        if (!leak) leak = App.UI.currentLeak || (G.chatLeaks?.[G.chatLeaks.length-1]);
+        if (!leak || leak.content) return;
+        await App.ChatLeak.generateContent(leak);
+        this.renderChatLeak();
     },
 
     // ---------- 选举、握手、设置 ----------
@@ -3560,12 +5758,27 @@ App.UI = {
         this.showNotification('握手完成');
     },
     renderOutdoor() {
+        if (G.physical === undefined) G.physical = 80;
+        if (G.mental === undefined) G.mental = 75;
+        if (G.fatigue === undefined) G.fatigue = 0;
         let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🚗 外出</span></div>
         <div style="flex:1;overflow-y:auto;padding:16px">
             <div style="background:linear-gradient(135deg,#e74c3c,#c0392b);color:#fff;padding:20px;border-radius:16px;margin-bottom:16px;text-align:center">
                 <div style="font-size:14px;margin-bottom:8px">💰 微信支付余额</div>
                 <div style="font-size:32px;font-weight:700">¥${(G.stats.wechatBalance||0).toLocaleString()}</div>
-                <div style="font-size:12px;opacity:0.8;margin-top:4px">当前压力值: ${G.stats.stress}</div>
+                <div style="font-size:12px;opacity:0.8;margin-top:4px">压力:${G.stats.stress} 身体:${G.physical}</div>
+            </div>
+            
+            <!-- 身体恢复 -->
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+                <div style="font-size:15px;font-weight:600;margin-bottom:4px">💪 身体恢复</div>
+                <div style="font-size:11px;color:#999;margin-bottom:10px">身体${G.physical} · 疲劳${G.fatigue} · 心态${G.mental}</div>
+                <div style="display:flex;flex-direction:column;gap:8px">
+                    <button onclick="App.UI.doOutdoorRest('sleep')" style="padding:12px;background:#4caf50;color:#fff;border:none;border-radius:8px;cursor:pointer">😴 好好睡觉 (疲劳-25 身体+12)</button>
+                    <button onclick="App.UI.doOutdoorRest('stroll')" style="padding:12px;background:#8bc34a;color:#fff;border:none;border-radius:8px;cursor:pointer">🚶 公园散步 (疲劳-20 心态+15)</button>
+                    <button onclick="App.UI.doOutdoorRest('eat')" style="padding:12px;background:#ff9800;color:#fff;border:none;border-radius:8px;cursor:pointer">🍜 吃顿好的 ¥60 (疲劳-10 身体+15)</button>
+                    <button onclick="App.UI.doOutdoorRest('game')" style="padding:12px;background:#e91e63;color:#fff;border:none;border-radius:8px;cursor:pointer">🎮 打游戏 (疲劳-15 心态+20)</button>
+                </div>
             </div>
             
             <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:16px">
@@ -3573,12 +5786,35 @@ App.UI = {
                 <div style="display:flex;flex-direction:column;gap:8px">
                     <button onclick="App.UI.reduceStress('massage')" style="padding:12px;background:#27ae60;color:#fff;border:none;border-radius:8px;cursor:pointer">💆 按摩 ¥80 (压力-15)</button>
                     <button onclick="App.UI.reduceStress('movie')" style="padding:12px;background:#3498db;color:#fff;border:none;border-radius:8px;cursor:pointer">🎬 看电影 ¥50 (压力-10)</button>
-                    <button onclick="App.UI.reduceStress('spa')" style="padding:12px;background:#9b59b6;color:#fff;border:none;border-radius:8px;cursor:pointer">🛁 SPA ¥150 (压力-25)</button>
+                    <button onclick="App.UI.reduceStress('spa')" style="padding:12px;background:#9b59b6;color:#fff;border:none;border-radius:8px;cursor:pointer">🛁 SPA ¥150 (压力-25 疲劳-35)</button>
                     <button onclick="App.UI.reduceStress('cafe')" style="padding:12px;background:#e67e22;color:#fff;border:none;border-radius:8px;cursor:pointer">☕ 咖啡厅 ¥30 (压力-5)</button>
+                </div>
+            </div>
+
+            <!-- 高消费 / 奢华享受 -->
+            <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:12px;padding:16px;margin-bottom:16px;color:#fff">
+                <div style="font-size:15px;font-weight:600;margin-bottom:4px">💎 奢华享受</div>
+                <div style="font-size:11px;color:#aaa;margin-bottom:10px">高消费选项：花钱多但能大幅改善状态</div>
+                <div style="display:flex;flex-direction:column;gap:8px">
+                    <button onclick="App.UI.luxurySpend('finedining')" style="padding:12px;background:linear-gradient(135deg,#f39c12,#e74c3c);color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600">🍽️ 米其林餐厅 ¥800 (心情+25 压力-15 体力+10)</button>
+                    <button onclick="App.UI.luxurySpend('shopping')" style="padding:12px;background:linear-gradient(135deg,#e84393,#fd79a8);color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600">🛍️ 奢侈品购物 ¥1500 (心情+30 压力-20)</button>
+                    <button onclick="App.UI.luxurySpend('medicalBeauty')" style="padding:12px;background:linear-gradient(135deg,#00b894,#00cec9);color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600">💉 医美护理 ¥2000 (体力+25 心情+20)</button>
+                    <button onclick="App.UI.luxurySpend('privateYoga')" style="padding:12px;background:linear-gradient(135deg,#6c5ce7,#a29bfe);color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600">🧘‍♀️ 私教瑜伽 ¥600 (疲劳-30 心态+25 压力-10)</button>
+                    <button onclick="App.UI.luxurySpend('travel')" style="padding:12px;background:linear-gradient(135deg,#0984e3,#74b9ff);color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600">✈️ 周末短途游 ¥3000 (压力-40 体力+20 心情+30)</button>
+                    <button onclick="App.UI.luxurySpend('concert')" style="padding:12px;background:linear-gradient(135deg,#e17055,#fdcb6e);color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600">🎤 VIP 演唱会 ¥1200 (心情+35 压力-25)</button>
                 </div>
             </div>
         </div>`;
         document.getElementById('outdoorPage').innerHTML = h;
+    },
+    doOutdoorRest(type) {
+        const result = App.Training.rest(type);
+        if (result?.blocked) {
+            this.showNotification(`💰 余额不足！需要¥${result.need}`, 2500);
+            return;
+        }
+        this.showNotification(`🛌 ${result?.desc || '已休息'} · 疲劳:${result.fatigue}`, 2000);
+        this.renderOutdoor();
     },
     reduceStress(type) {
         const costs = {massage:80, movie:50, spa:150, cafe:30};
@@ -3587,7 +5823,41 @@ App.UI = {
         const reduce = stressReduce[type];
         if (G.stats.wechatBalance < cost) { this.showNotification('余额不足'); return; }
         App.Store.updateStats({wechatBalance:-cost, stress:-reduce, mood:3});
+        // SPA 额外恢复疲劳和身体
+        if (type === 'spa' && G.fatigue !== undefined) {
+            G.fatigue = Math.max(0, G.fatigue - 35);
+            G.physical = Math.min(100, G.physical + 12);
+        }
         this.showNotification(`放松完成，压力-${reduce}，心情+3`);
+        this.renderOutdoor();
+    },
+    luxurySpend(type) {
+        // 高消费选项配置
+        const cfg = {
+            finedining:    {cost:800,  mood:25, stress:-15, physical:10, desc:'🍽️ 米其林餐厅'},
+            shopping:      {cost:1500, mood:30, stress:-20, physical:0,  desc:'🛍️ 奢侈品购物'},
+            medicalBeauty: {cost:2000, mood:20, stress:0,   physical:25, desc:'💉 医美护理'},
+            privateYoga:   {cost:600,  mood:0,  stress:-10, physical:0,  desc:'🧘‍♀️ 私教瑜伽', fatigue:-30, mental:25},
+            travel:        {cost:3000, mood:30, stress:-40, physical:20, desc:'✈️ 周末短途游'},
+            concert:       {cost:1200, mood:35, stress:-25, physical:0,  desc:'🎤 VIP 演唱会'}
+        };
+        const c = cfg[type];
+        if (!c) return;
+        if ((G.stats.wechatBalance || 0) < c.cost) {
+            this.showNotification(`💰 余额不足！${c.desc}需要 ¥${c.cost}（当前 ¥${G.stats.wechatBalance || 0}）`, 2500);
+            return;
+        }
+        const updates = {wechatBalance: -c.cost};
+        if (c.mood) updates.mood = c.mood;
+        if (c.stress) updates.stress = c.stress;
+        if (c.physical) updates.skill = c.physical;  // 体力→通过 skill 字段增长（见 G.stats）
+        App.Store.updateStats(updates);
+        // 物理属性
+        if (G.physical !== undefined && c.physical) G.physical = Math.min(100, G.physical + c.physical);
+        if (G.fatigue !== undefined && c.fatigue) G.fatigue = Math.max(0, G.fatigue + c.fatigue);
+        if (G.mental !== undefined && c.mental) G.mental = Math.min(100, G.mental + c.mental);
+        this.showNotification(`${c.desc} 完成！花费 ¥${c.cost}`, 2500);
+        App.Save.autoSave();
         this.renderOutdoor();
     },
     exchangeDrumstickFromPocket() {
@@ -3665,6 +5935,33 @@ App.UI = {
                     当前状态：${soundEnabled?'已开启' :'已关闭'}
                 </div>
             </div>
+
+            <div style="background:#fff;border-radius:16px;overflow:hidden;margin-bottom:16px">
+                <div style="padding:16px;font-size:14px;font-weight:600;color:#333;border-bottom:1px solid #f0f0f0">💸 翻牌价格设置</div>
+                <div style="padding:12px 14px;background:#fff8e1;font-size:12px;color:#856404;border-bottom:1px solid #f0f0f0;line-height:1.5">
+                    💡 翻牌页顶部已提供输入框，<b>直接输入价格更便捷</b>。
+                </div>
+                <button onclick="App.UI.openApp('pocket');setTimeout(()=>App.UI.renderPocketFlip(),100);" style="width:100%;padding:14px;border:none;background:#fff;text-align:left;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:12px;border-top:1px solid #f0f0f0">
+                    <span style="font-size:20px">🎴</span><span style="flex:1">前往翻牌页设置</span><span style="color:#999">→</span>
+                </button>
+                <div style="padding:14px;display:flex;align-items:center;gap:12px;cursor:pointer;border-top:1px solid #f0f0f0" onclick="App.UI.toggleFlipPrice()">
+                    <span style="font-size:20px">${(G.settings && G.settings.flipPriceEnabled) ? '💰' : '🆓'}</span>
+                    <span style="flex:1;font-size:14px">启用翻牌收费</span>
+                    <div style="width:50px;height:28px;border-radius:14px;background:${(G.settings && G.settings.flipPriceEnabled) ? '#ff9500' : '#ccc'};position:relative;transition:.3s">
+                        <div style="width:24px;height:24px;background:#fff;border-radius:50%;position:absolute;top:2px;${(G.settings && G.settings.flipPriceEnabled) ? 'right:2px' : 'left:2px'};transition:.3s"></div>
+                    </div>
+                </div>
+                <div style="padding:14px;display:flex;align-items:center;gap:8px;border-top:1px solid #f0f0f0">
+                    <span style="font-size:14px;flex:1">每次翻牌价格（🍗鸡腿）<br><span style="font-size:11px;color:#999">0-500 鸡腿</span></span>
+                    <input id="flipPriceInput" type="number" min="0" max="500" value="${(G.settings && G.settings.flipPrice) || 0}" style="width:80px;padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:14px;text-align:center" onchange="App.UI.setFlipPrice(this.value)" onkeyup="App.UI.setFlipPrice(this.value)">
+                </div>
+                <div style="padding:0 14px 14px;font-size:12px;color:#999;line-height:1.6">
+                    ${(G.settings && G.settings.flipPriceEnabled)
+                        ? `✅ 已启用：粉丝每次翻牌需付 <b style="color:#ff9500">${(G.settings && G.settings.flipPrice) || 0}</b> 🍗（你获得基础收益 + 付费）`
+                        : '🆓 当前翻牌免费（粉丝无需付费，你仅获得基础收益）'
+                    }
+                </div>
+            </div>
             
             <div style="background:#fff;border-radius:16px;overflow:hidden;margin-bottom:16px">
                 <div style="padding:16px;font-size:14px;font-weight:600;color:#333;border-bottom:1px solid #f0f0f0">🎮 游戏数据</div>
@@ -3724,7 +6021,9 @@ App.UI = {
             game: { day:1, phase:'morning', interaction_count:0, rank:150, weibo_followers:100, pocket_fans:50, handshake_this_month:false, fan_letters_this_week:0, electionInProgress:false, electionPhase:null, firstReportVotes:0, secondReportVotes:0, firstReportPulls:0, secondReportPulls:0 },
             flags: { hasFirstShow:false, hasFirstElection:false, hasStalker:false, hasCenterBattle:false, hasCrisis:false, hasEmo:false, hasZeroStress:false, hasMoved:false },
             achievements: [], chatHistory: {}, weiboPosts: [], moments: [], smsMessages: [], callHistory: [], fanLetters: [], electionResults: [],
-            memberAffection: {}, blockedContacts: [], pocketRoomMessages: [], bestPartner: null, partnerStageUsed: false
+            memberAffection: {}, blockedContacts: [], pocketRoomMessages: [], bestPartner: null, partnerStageUsed: false,
+            settings: { flipPrice: 0, flipPriceEnabled: false },
+            flipState: { day: 1, replied: {} }
         });
         App.Save.autoSave();
         // 显示邀请码页面，重新验证
@@ -3794,6 +6093,370 @@ App.UI = {
         requestAnimationFrame(() => { el.classList.add('show'); });
         setTimeout(() => { el.remove(); }, 5000);
         App.Sound.play('Notif');
+    },
+
+    // ============ V4 训练页面 ============
+    renderTraining() {
+        App.Training; // 确保模块已加载
+        if (!G.trainingSkills) G.trainingSkills = { dance:10, vocal:10, performance:10, variety:5 };
+        if (G.physical === undefined) G.physical = 80;
+        if (G.mental === undefined) G.mental = 75;
+        if (G.fatigue === undefined) G.fatigue = 0;
+
+        const suggestion = App.Training.getSuggestion();
+        const skills = [
+            { id:'dance', name:'💃 舞蹈', val: G.trainingSkills.dance, color:'#e74c3c' },
+            { id:'vocal', name:'🎤 歌唱', val: G.trainingSkills.vocal, color:'#9b59b6' },
+            { id:'performance', name:'🎭 表现力', val: G.trainingSkills.performance, color:'#f39c12' },
+            { id:'variety', name:'📺 综艺', val: G.trainingSkills.variety, color:'#3498db' }
+        ];
+
+        let skillBars = skills.map(s => {
+            const path = G.trainingTree?.[s.id]?.path || '';
+            const pathInfo = App.Training.branches[s.id]?.paths?.[path];
+            const pathLabel = pathInfo ? ` · ${pathInfo.emoji}${pathInfo.name}` : '';
+            return `<div style="margin-bottom:10px" onclick="App.Training.showBranchDetail('${s.id}')">
+                <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+                    <span>${s.name}${pathLabel}</span><span style="color:${s.color};font-weight:600">${s.val}</span>
+                </div>
+                <div class="stat-bar"><div class="stat-fill" style="width:${s.val}%;background:linear-gradient(90deg,${s.color},${s.color}88)"></div></div>
+            </div>`;
+        }).join('');
+
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">💪 训练中心</span></div>
+        <div style="flex:1;overflow-y:auto;padding:16px">
+            <!-- 身体状态 -->
+            <div style="display:flex;gap:8px;margin-bottom:16px">
+                <div style="flex:1;background:linear-gradient(135deg,#e8f5e9,#c8e6c9);border-radius:12px;padding:12px;text-align:center">
+                    <div style="font-size:24px">${G.physical > 60 ? '💪' : G.physical > 30 ? '😐' : '🤒'}</div>
+                    <div style="font-size:11px;color:#666">身体 ${G.physical}</div>
+                    <div class="stat-bar" style="margin-top:4px"><div class="stat-fill" style="width:${G.physical}%;background:#4caf50"></div></div>
+                </div>
+                <div style="flex:1;background:linear-gradient(135deg,#e8eaf6,#c5cae9);border-radius:12px;padding:12px;text-align:center">
+                    <div style="font-size:24px">${G.mental > 60 ? '😊' : G.mental > 30 ? '😟' : '😵'}</div>
+                    <div style="font-size:11px;color:#666">心态 ${G.mental}</div>
+                    <div class="stat-bar" style="margin-top:4px"><div class="stat-fill" style="width:${G.mental}%;background:#3f51b5"></div></div>
+                </div>
+                <div style="flex:1;background:linear-gradient(135deg,#fff3e0,#ffe0b2);border-radius:12px;padding:12px;text-align:center">
+                    <div style="font-size:24px">${G.fatigue > 75 ? '😫' : G.fatigue > 40 ? '😑' : '⚡'}</div>
+                    <div style="font-size:11px;color:#666">疲劳 ${G.fatigue}</div>
+                    <div class="stat-bar" style="margin-top:4px"><div class="stat-fill" style="width:${G.fatigue}%;background:#ff9800"></div></div>
+                </div>
+            </div>
+
+            ${suggestion ? `<div style="background:${suggestion.action==='rest'?'#fff3cd':'#d4edda'};border:1px solid ${suggestion.action==='rest'?'#ffc107':'#28a745'};border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12px">
+                ${suggestion.action==='rest'?'⚠️':'💡'} <b>建议：</b>${suggestion.msg}${suggestion.risk?`<br/><span style="color:#e74c3c">⚠️ ${suggestion.risk}</span>`:''}
+            </div>` : ''}
+
+            <!-- 技能树 -->
+            <div style="background:#fff;border-radius:16px;padding:14px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:10px">📈 技能树</div>
+                ${skillBars}
+            </div>
+
+            <!-- 训练按钮 -->
+            <div style="background:#fff;border-radius:16px;padding:14px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:10px">🏋️ 开始训练</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+                    ${['dance','vocal','performance','variety'].map(b => {
+                        const br = App.Training.branches[b];
+                        return `<button onclick="App.UI.doTraining('${b}')" style="width:100%;padding:12px;border:none;border-radius:10px;background:linear-gradient(135deg,var(--c1),var(--c2));color:#fff;font-size:13px;cursor:pointer"
+                            ${b==='dance'?'style="background:linear-gradient(135deg,#e74c3c,#c0392b)"':
+                              b==='vocal'?'style="background:linear-gradient(135deg,#9b59b6,#8e44ad)"':
+                              b==='performance'?'style="background:linear-gradient(135deg,#f39c12,#e67e22)"':
+                              'style="background:linear-gradient(135deg,#3498db,#2980b9)"'}>
+                            ${br.icon} ${br.name}
+                        </button>`;
+                    }).join('')}
+                </div>
+            </div>
+
+            <!-- 深夜加练 -->
+            <div style="background:#fff;border-radius:16px;padding:14px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:4px">🌙 深夜加练</div>
+                <div style="font-size:11px;color:#999;margin-bottom:10px">独自练习，可能偶遇同样努力的队友（40%概率）</div>
+                <button onclick="App.UI.doSecretTrain()" style="width:100%;padding:14px;border:none;border-radius:10px;background:linear-gradient(135deg,#2d3436,#636e72);color:#fff;font-size:14px;cursor:pointer">
+                    🌙 偷偷加练
+                </button>
+            </div>
+        </div>`;
+        document.getElementById('trainingPage').innerHTML = h;
+    },
+
+    doTraining(branchId) {
+        const intensities = [
+            { id:'light', label:'轻松练习 (30%)' },
+            { id:'normal', label:'正常训练 (60%)' },
+            { id:'heavy', label:'高强度 (100%)' },
+            { id:'extreme', label:'极限挑战 (150% ⚠️)' }
+        ];
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.innerHTML = `<div class="event-card" style="max-width:320px;padding:20px;text-align:center">
+            <div style="font-size:32px;margin-bottom:8px">${App.Training.branches[branchId]?.icon}</div>
+            <div style="font-size:16px;font-weight:600;margin-bottom:16px">选择训练强度</div>
+            ${intensities.map(i => `
+                <button onclick="document.querySelector('.modal-overlay')?.remove();App.UI.executeTraining('${branchId}','${i.id}')"
+                    style="width:100%;padding:12px;margin-bottom:6px;border:none;border-radius:8px;background:${i.id==='extreme'?'linear-gradient(135deg,#e74c3c,#c0392b)':'#f5f5f5'};color:${i.id==='extreme'?'#fff':'#333'};font-size:13px;cursor:pointer">
+                    ${i.label}${i.id==='extreme'?' ⚠️ 高风险受伤':''}
+                </button>
+            `).join('')}
+            <button onclick="document.querySelector('.modal-overlay')?.remove()" style="width:100%;padding:10px;margin-top:4px;border:none;background:none;color:#999;font-size:13px;cursor:pointer">取消</button>
+        </div>`;
+        document.getElementById('phoneModals').appendChild(modal);
+    },
+
+    executeTraining(branchId, intensity) {
+        const result = App.Training.train(branchId, intensity);
+        if (result.injury) {
+            this.showNotification(`🤕 训练过度导致受伤！身体-15 心态-10`, 4000);
+        }
+        this.showNotification(`✅ ${App.Training.branches[branchId]?.name} +${result.skillGain} | 疲劳:${result.fatigue}`, 2500);
+        this.renderTraining();
+    },
+
+    doSecretTrain() {
+        if (G.fatigue > 85) {
+            this.showNotification('😫 太累了！先休息吧', 2500);
+            return;
+        }
+        const result = App.Training.secretTrain();
+        if (result.blocked) {
+            this.showNotification(result.reason, 2500);
+            return;
+        }
+        let msg = `🌙 深夜加练！${App.Training.branches[result.branch]?.name}+${result.gain}`;
+        if (result.encounter) {
+            msg += `\n💫 偶遇${result.encounter.member}！${result.encounter.text}`;
+            this.showNotification(msg, 5000);
+        } else {
+            this.showNotification(msg, 2500);
+        }
+        this.renderTraining();
+    },
+
+    // ============ V4 舞台/公演页面 ============
+    renderStage() {
+        if (!G.stageHistory) G.stageHistory = [];
+        if (!G.partnerSynergy) G.partnerSynergy = {};
+        if (!G.partnerShows) G.partnerShows = [];
+
+        const teammates = App.getTeamMates(G.player.group, G.player.team);
+        const lastShow = G.stageHistory.length > 0 ? G.stageHistory[G.stageHistory.length - 1] : null;
+
+        // 搭档列表
+        let partnerList = '';
+        if (teammates.length > 0) {
+            partnerList = teammates.slice(0, 5).map(t => {
+                const syn = App.Stage.partnerSynergy.calcSynergy(t.name);
+                const synLabel = syn > 80 ? '🔥绝配' : syn > 60 ? '⭐很好' : syn > 40 ? '👍不错' : syn > 20 ? '🤝一般' : '💤生疏';
+                const pers = App.MemberPersonality.getFor(t.name);
+                return `<div onclick="App.UI.doStageWith('${t.name}')" style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:#f8f9fa;border-radius:10px;cursor:pointer;margin-bottom:6px">
+                    <span style="font-size:18px">${pers.emoji}</span>
+                    <span style="flex:1;font-size:13px">${t.name}</span>
+                    <span style="font-size:11px;color:#e74c3c">${synLabel} ${syn}</span>
+                </div>`;
+            }).join('');
+        }
+
+        // 最近舞台记录
+        let historyHTML = '';
+        if (G.partnerShows && G.partnerShows.length > 0) {
+            historyHTML = `<div style="font-size:14px;font-weight:600;margin-bottom:8px;margin-top:16px">📜 最近演出</div>`;
+            historyHTML += G.partnerShows.slice(-5).reverse().map(s => {
+                const gradeColor = { S:'#ffd700', A:'#c0c0c0', B:'#cd7f32', C:'#999' };
+                return `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #f0f0f0;font-size:12px">
+                    <span style="font-size:18px">${s.grade}</span>
+                    <span style="color:${gradeColor[s.grade]};font-weight:600">${s.score}分</span>
+                    <span>Day${s.day} 与${s.partner}</span>
+                    <span style="color:#999">${s.showType}</span>
+                </div>`;
+            }).join('');
+        }
+
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🎭 公演舞台</span></div>
+        <div style="flex:1;overflow-y:auto;padding:16px">
+            ${lastShow ? `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px;font-size:12px;text-align:center;color:#666">
+                上次公演：Day${lastShow.day} · 位置：${lastShow.position || '中排'} · 评分：<b>${lastShow.score || '-'}分</b>
+            </div>` : ''}
+
+            <!-- 站位争夺 -->
+            <div style="background:linear-gradient(135deg,#fff5f5,#ffe0e0);border-radius:16px;padding:14px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:10px">⚔️ 站位争夺</div>
+                <div style="font-size:12px;color:#666;margin-bottom:10px">挑战队友争夺更好的舞台站位！舞蹈+表现力决定站位。</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                    ${teammates.slice(0, 6).map(t => {
+                        const pers = App.MemberPersonality.getFor(t.name);
+                        const aff = G.memberAffection?.[t.name] || 50;
+                        return `<button onclick="App.UI.doPositionBattle('${t.name}')" style="padding:10px;border:1px solid #fcc;border-radius:10px;background:#fff;font-size:12px;cursor:pointer;text-align:left">
+                            ${pers.emoji} ${t.name}<br/>
+                            <span style="font-size:10px;color:#999">❤️${aff}</span>
+                        </button>`;
+                    }).join('')}
+                </div>
+            </div>
+
+            <!-- MC环节 -->
+            <div style="background:linear-gradient(135deg,#fff8e1,#ffecb3);border-radius:16px;padding:14px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:10px">🎤 MC环节练习</div>
+                <div style="font-size:12px;color:#666;margin-bottom:10px">随机MC话题，你的回答将影响观众反响！</div>
+                <button onclick="App.UI.doMCTraining()" style="width:100%;padding:12px;border:none;border-radius:10px;background:linear-gradient(135deg,#ff9800,#f57c00);color:#fff;font-size:14px;cursor:pointer">
+                    🎤 开始MC挑战
+                </button>
+            </div>
+
+            <!-- 搭档演出 -->
+            <div style="background:#fff;border-radius:16px;padding:14px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:4px">🤝 搭档演出</div>
+                <div style="font-size:11px;color:#999;margin-bottom:10px">不同搭档组合产生差异化演出效果（好感度越高默契越好）</div>
+                ${partnerList || '<div style="color:#999;font-size:12px;text-align:center;padding:10px">暂无可搭档的队友</div>'}
+            </div>
+
+            ${historyHTML}
+        </div>`;
+        document.getElementById('stagePage').innerHTML = h;
+    },
+
+    doPositionBattle(opponent) {
+        const result = App.Stage.competePosition(opponent);
+        const emoji = result.result === 'win' ? '🎉' : result.result === 'draw' ? '🤝' : '💪';
+        this.showNotification(`${emoji} ${result.position}！${result.memberReaction}`, 4000);
+        this.renderStage();
+    },
+
+    doMCTraining() {
+        const topic = pick(App.Stage.mcTopics);
+        const choices = [
+            { id:'witty', label:'😆 幽默接梗', desc:'反应快，金句频出' },
+            { id:'heartfelt', label:'💝 真情流露', desc:'真诚感动，走心回答' },
+            { id:'safe', label:'😊 安全回复', desc:'中规中矩，不出错' },
+            { id:'silly', label:'🤪 搞笑卖萌', desc:'装傻充愣，萌混过关' },
+            { id:'awkward', label:'😅 紧张结巴', desc:'发挥失常，略显尴尬' }
+        ];
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.id = 'mcModal';
+        modal.innerHTML = `<div class="event-card" style="max-width:360px;padding:20px">
+            <div style="font-size:28px;text-align:center;margin-bottom:8px">🎤 MC环节</div>
+            <div style="background:#f5f5f5;border-radius:10px;padding:12px;margin-bottom:14px;font-size:13px;text-align:center">
+                MC话题：<b>"${topic.q}"</b>
+            </div>
+            <div style="font-size:12px;color:#999;margin-bottom:8px">选择你的回答方式：</div>
+            ${choices.map(c => `
+                <button onclick="document.getElementById('mcModal').remove();App.UI.executeMC('${topic.q}','${c.id}')"
+                    style="width:100%;padding:10px;margin-bottom:5px;border:1px solid #eee;border-radius:8px;background:#fff;font-size:12px;cursor:pointer;text-align:left">
+                    <b>${c.label}</b> · ${c.desc}
+                </button>
+            `).join('')}
+        </div>`;
+        document.getElementById('phoneModals').appendChild(modal);
+    },
+
+    executeMC(topic, choice) {
+        const varietySkill = G.trainingSkills?.variety || 5;
+        const result = App.Stage.mcSegment(topic, choice, varietySkill);
+        let msg = `${result.reaction}\n${result.desc}`;
+        if (result.memberReply) {
+            msg += `\n\n${result.memberReply.emoji} ${result.memberReply.name}：${result.memberReply.text}`;
+        }
+        if (result.popularityGain > 0) msg += `\n⭐人气+${result.popularityGain}`;
+        if (result.result === 'cold') msg += `\n🥶冷场惩罚！人气-${Math.abs(result.popularityGain)}`;
+        this.showNotification(msg, 5000);
+        if (!G.stageHistory) G.stageHistory = [];
+        G.stageHistory.push({ day: G.game.day, event: 'MC', result: result.result, topic });
+        this.renderStage();
+    },
+
+    doStageWith(partnerName) {
+        const showTypes = [
+            { id:'unit_song', label:'Unit曲', desc:'双人合唱+舞蹈' },
+            { id:'dance_battle', label:'Dance Battle', desc:'舞蹈对决PK' },
+            { id:'duet', label:'对唱', desc:'情歌对唱' },
+            { id:'variety_stage', label:'特别舞台', desc:'搞笑/创意表演' }
+        ];
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.id = 'stageModal';
+        const pers = App.MemberPersonality.getFor(partnerName);
+        modal.innerHTML = `<div class="event-card" style="max-width:320px;padding:20px;text-align:center">
+            <div style="font-size:32px">🤝 ${pers.emoji}</div>
+            <div style="font-size:16px;font-weight:600;margin-bottom:4px">与${partnerName}搭档演出</div>
+            <div style="font-size:12px;color:#999;margin-bottom:14px">选择演出类型</div>
+            ${showTypes.map(s => `
+                <button onclick="document.getElementById('stageModal').remove();App.UI.executeStageShow('${partnerName}','${s.id}')"
+                    style="width:100%;padding:12px;margin-bottom:6px;border:1px solid #eee;border-radius:10px;background:#fff;font-size:13px;cursor:pointer;text-align:left">
+                    <b>${s.label}</b><br/><span style="font-size:11px;color:#999">${s.desc}</span>
+                </button>
+            `).join('')}
+            <button onclick="document.getElementById('stageModal').remove()" style="width:100%;padding:10px;border:none;background:none;color:#999;cursor:pointer">取消</button>
+        </div>`;
+        document.getElementById('phoneModals').appendChild(modal);
+    },
+
+    executeStageShow(partnerName, showType) {
+        const showLabels = { unit_song:'Unit曲', dance_battle:'Dance Battle', duet:'对唱', variety_stage:'特别舞台' };
+        const result = App.Stage.partnerSynergy.performWithPartner(partnerName, showLabels[showType] || showType);
+        const gradeStars = { S:'⭐⭐⭐⭐⭐', A:'⭐⭐⭐⭐', B:'⭐⭐⭐', C:'⭐⭐' };
+        let msg = `${gradeStars[result.grade] || ''}\n评级：${result.grade} (${result.score}分)\n${result.combo.name}：${result.combo.desc}`;
+        if (result.rewards.popularity > 0) msg += `\n⭐人气+${result.rewards.popularity}`;
+        if (result.rewards.affection > 0) msg += `\n❤️与${partnerName}好感+${result.rewards.affection}`;
+        msg += `\n默契度：${result.synergy}/100`;
+        this.showNotification(msg, 6000);
+        if (!G.stageHistory) G.stageHistory = [];
+        G.stageHistory.push({ day: G.game.day, position: '搭档舞台', partner: partnerName, score: result.score, grade: result.grade });
+        this.renderStage();
+    },
+
+
+    // ============ V4 争议/热搜事件（从微博入口触发）============
+    showControversyFromWeibo() {
+        const event = App.SocialMedia.controversyEvent();
+        if (!event) { this.showNotification('暂无可触发的事件', 2000); return; }
+        const inner = `<div class="event-card" style="max-width:340px;padding:20px;text-align:center">
+            <div style="font-size:32px;margin-bottom:8px">⚠️</div>
+            <div style="font-size:14px;font-weight:600;margin-bottom:12px">争议事件</div>
+            <div style="background:#fff8e1;border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px;text-align:left">
+                <b>${event.member}</b>：${event.content}
+            </div>
+            <div style="font-size:12px;color:#666;margin-bottom:10px">你如何回应？</div>
+            <button onclick="document.getElementById('controversyModal')?.remove();App.UI.doControversyChoice('${event.member}','A',${JSON.stringify(event.choiceA).replace(/'/g,"\\'")})"
+                style="width:100%;padding:10px;margin-bottom:5px;border:2px solid #3498db;border-radius:8px;background:#eaf2f8;font-size:12px;cursor:pointer;text-align:left">
+                <b>A. ${event.choiceA.text}</b><br/><span style="font-size:10px;color:#999">→ ${event.choiceA.desc}</span>
+            </button>
+            <button onclick="document.getElementById('controversyModal')?.remove();App.UI.doControversyChoice('${event.member}','B',${JSON.stringify(event.choiceB).replace(/'/g,"\\'")})"
+                style="width:100%;padding:10px;margin-bottom:5px;border:2px solid #95a5a6;border-radius:8px;background:#f5f5f5;font-size:12px;cursor:pointer;text-align:left">
+                <b>B. ${event.choiceB.text}</b><br/><span style="font-size:10px;color:#999">→ ${event.choiceB.desc}</span>
+            </button>
+            <button onclick="document.getElementById('controversyModal')?.remove();App.UI.doControversyChoice('${event.member}','C',${JSON.stringify(event.choiceC).replace(/'/g,"\\'")})"
+                style="width:100%;padding:10px;margin-bottom:5px;border:2px solid #e74c3c;border-radius:8px;background:#fdedec;font-size:12px;cursor:pointer;text-align:left">
+                <b>C. ${event.choiceC.text}</b><br/><span style="font-size:10px;color:#999">→ ${event.choiceC.desc}</span>
+            </button>
+        </div>`;
+        this.phoneModal(inner, 'controversyModal');
+    },
+
+    doControversyChoice(memberName, choiceKey, choiceData) {
+        const result = App.SocialMedia.resolveControversy(memberName, choiceKey, choiceData);
+        this.showNotification(`✅ 已做出选择！与${memberName}好感${result.effects.affection > 0 ? '+' : ''}${result.effects.affection}`, 3500);
+        // 如果微博页打开着就刷新
+        if (document.getElementById('weiboPage').classList.contains('active')) {
+            this.renderWeiboPost();
+        }
+    },
+
+    doRandomTrending() {
+        const event = App.SocialMedia.randomTrending();
+        let msg = `🔥 ${event.title}\n${event.trigger}`;
+        if (event.effects.popularity) msg += `\n⭐人气${event.effects.popularity > 0 ? '+' : ''}${event.effects.popularity}`;
+        if (event.effects.scandal) msg += `\n📸绯闻+${event.effects.scandal}`;
+        if (event.effects.target) msg += `\n与${event.effects.target}关系恶化！`;
+        this.showNotification(msg, 6000);
+        if (event.severity === 'major') {
+            setTimeout(() => {
+                const chain = App.SocialMedia.chainReaction(event);
+                if (chain) this.showNotification(`🔄 连锁反应：${chain.desc}`, 4000);
+            }, 2000);
+        }
     }
 };
 
@@ -3852,16 +6515,40 @@ function assignTeam(personality, group, quizScores) {
 }
 
 // ============ 初始化 ============
-document.addEventListener('DOMContentLoaded', () => {
+(function initApp() {
+    // URL 参数 reset=1：清除验证状态，强制显示验证码页面
+    try {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('reset') === '1') {
+            localStorage.removeItem('inviteCode');
+            localStorage.removeItem('inviteUserId');
+            console.log('[Init] reset=1: 已清除验证状态');
+        }
+    } catch(e) {}
+
     App.Sound.init();
     App.Save.load();
     App.Network.init();
 
-    // 先检查是否已经验证过邀请码
+
+    // 1. 兜底清理：移除可能拦截页面的遗留弹窗（修复页面卡死）
+    if (App.ModalManager) {
+        App.ModalManager.cleanupOrphans();
+        App.ModalManager.initGlobalListeners();
+    }
+
+    // 2. 启动实时时钟（每秒更新，与设备系统时间完全同步）
+    if (App.Time) {
+        App.Time.startClock();
+    }
+
+    // 3. 先检查是否已经验证过邀请码（必须在任意渲染前）
     if (App.Invite.checkAlreadyValidated()) {
-        // 已经验证过，直接隐藏邀请码页面
-        document.getElementById('inviteScreen').classList.remove('active');
-        document.getElementById('lockScreen').classList.add('active');
+        // 已经验证过，直接隐藏邀请码页面，显示锁屏
+        const inviteEl = document.getElementById('inviteScreen');
+        const lockEl = document.getElementById('lockScreen');
+        if (inviteEl) inviteEl.classList.remove('active');
+        if (lockEl) lockEl.classList.add('active');
     }
 
     let keypadHTML = '';
@@ -3881,14 +6568,22 @@ document.addEventListener('DOMContentLoaded', () => {
         <div class="app-icon" onclick="App.UI.openApp('profile')"><div class="icon" style="background:linear-gradient(135deg,#a55eea,#8854d0)">👤</div><div class="label">档案</div></div>
         <div class="app-icon" onclick="App.UI.openApp('election')"><div class="icon" style="background:linear-gradient(135deg,#ffd700,#f39c12)">🏆</div><div class="label">总选举</div></div>
         <div class="app-icon" onclick="App.UI.openApp('affection')"><div class="icon" style="background:linear-gradient(135deg,#ff69b4,#ff1493)">💕</div><div class="label">好感度</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('diary')"><div class="icon" style="background:linear-gradient(135deg,#c8a96e,#b8935a)">📔</div><div class="label">日记本</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('training')"><div class="icon" style="background:linear-gradient(135deg,#6c5ce7,#a855f7)">💪</div><div class="label">训练</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('stage')"><div class="icon" style="background:linear-gradient(135deg,#f97316,#ef4444)">🎭</div><div class="label">公演</div></div>
         <div class="app-icon" onclick="App.UI.openApp('settings')"><div class="icon" style="background:linear-gradient(135deg,#95a5a6,#7f8c8d)">⚙️</div><div class="label">设置</div></div>`;
 
     function updateClock() {
-        const n = new Date();
-        const t = n.getHours().toString().padStart(2,'0') + ':' + n.getMinutes().toString().padStart(2,'0');
-        document.getElementById('statusTime').textContent = t;
-        document.getElementById('lockTime').textContent = t;
-        document.getElementById('lockDate').textContent = n.getFullYear()+'/'+(n.getMonth()+1)+'/'+n.getDate()+' 周'+['日','一','二','三','四','五','六'][n.getDay()];
+        // 使用 App.Time 统一接口（修复：与设备系统时间完全一致）
+        if (App.Time) {
+            App.Time.updateAll();
+        } else {
+            const n = new Date();
+            const t = n.getHours().toString().padStart(2,'0') + ':' + n.getMinutes().toString().padStart(2,'0');
+            document.getElementById('statusTime').textContent = t;
+            document.getElementById('lockTime').textContent = t;
+            document.getElementById('lockDate').textContent = n.getFullYear()+'/'+(n.getMonth()+1)+'/'+n.getDate()+' 周'+['日','一','二','三','四','五','六'][n.getDay()];
+        }
     }
     updateClock();
     setInterval(updateClock, 60000);
@@ -3938,4 +6633,4 @@ document.addEventListener('DOMContentLoaded', () => {
             App.UI.showPage('lockScreen');
         }
     }
-});
+})();

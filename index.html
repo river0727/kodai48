@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -10,6 +10,7 @@
 <div class="phone-frame"><div class="phone-screen">
 <div class="status-bar"><span class="time" id="statusTime">9:41</span><div class="icons"><span>📶</span><span>🔋</span></div></div>
 <div class="screen-content">
+<div id="phoneModals" style="position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:1000"></div>
 <div class="invite-screen page active" id="inviteScreen">
     <div class="invite-title">🌟 星光48·爱豆模拟器</div>
     <div class="invite-subtitle">请输入邀请码解锁游戏</div>
@@ -41,7 +42,12 @@
 <div class="page" id="showEvalPage" style="flex-direction:column;justify-content:center;align-items:center"></div>
 <div class="page" id="profilePage" style="flex-direction:column"></div>
         <div class="page" id="affectionPage" style="flex-direction:column"></div>
+        <div class="page" id="diaryPage" style="flex-direction:column;background:#fdf8f0"></div>
+        <div class="page" id="chatLeakPage" style="flex-direction:column;background:#1a1a1a;color:#fff"></div>
         <div class="page" id="settingsPage" style="flex-direction:column"></div>
+        <!-- V4 新增页面 -->
+        <div class="page" id="trainingPage" style="flex-direction:column"></div>
+        <div class="page" id="stagePage" style="flex-direction:column"></div>
 </div>
 <div class="bottom-nav" id="bottomNav" style="display:none"><div class="nav-item active" onclick="App.UI.goHome()"><span class="nav-icon">🏠</span>主页</div><div class="nav-item" onclick="App.UI.openApp('wechat')"><span class="nav-icon">💬</span>微信</div><div class="nav-item" onclick="App.UI.openApp('pocket')"><span class="nav-icon">📱</span>口袋48</div><div class="nav-item" onclick="App.UI.openApp('profile')"><span class="nav-icon">👤</span>我的</div></div>
 <div class="phone-notification" id="phoneNotifContainer"></div>
@@ -56,5 +62,6 @@
 <audio id="soundError" preload="auto"></audio>
 <audio id="soundClick" preload="auto"></audio>
 <audio id="soundCheer" preload="auto"></audio>
+<script src="app_diag.js"></script>
 <script src="app.js"></script>
 </body></html>

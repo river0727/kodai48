@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>check</title></head>
+<body>
+<div id="r">loading</div>
+<script>
+(async()=>{
+  const r=document.getElementById('r');
+  try {
+    const code = await fetch('app.js?_='+Date.now()).then(x=>x.text());
+    r.textContent = 'size='+code.length+'\n';
+    try {
+      new Function(code);
+      r.textContent += 'OK\n';
+    } catch(e) {
+      r.textContent += 'SYNTAX_ERR: '+e.message+'\n'+(e.stack||'')+'\n';
+    }
+  } catch(e) {
+    r.textContent = 'fetch fail: '+e.message;
+  }
+})();
+</script>
+</body></html>

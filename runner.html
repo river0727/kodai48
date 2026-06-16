@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<pre id="out">Loading...</pre>
+<script src="app.js" onerror="document.getElementById('out').textContent='LOAD ERR';"></script>
+<script>
+setTimeout(function() {
+  var out = document.getElementById('out');
+  out.textContent = '';
+  if (typeof App === 'undefined') {
+    out.appendChild(document.createTextNode('FAIL: App UNDEFINED\n'));
+    return;
+  }
+  out.appendChild(document.createTextNode('OK\n'));
+  // Test 1: sender name format
+  var msgs = App.FanAI.autoTriggerMessages(3);
+  msgs.forEach(function(m) {
+    out.appendChild(document.createTextNode('  SENDER: ' + m.sender + ' | ' + m.text + '\n'));
+  });
+  out.appendChild(document.createTextNode('---\n'));
+  // Test 2: no-repeat on player input
+  var tests = ['收什么图', '???/', '你们在干什么呢', '哈哈', '我随便说点什么吧', '【新歌】好听到爆', '今天好累啊', '你真搞笑'];
+  tests.forEach(function(t) {
+    var r = App.FanAI.pickReply(t);
+    var echoed = r.text.includes(t);
+    out.appendChild(document.createTextNode('IN: ' + t + ' (len=' + t.length + ')\n'));
+    out.appendChild(document.createTextNode('   [' + r.persona.name + '] ' + r.text + (echoed ? '  <-- ECHOED!' : '') + '\n'));
+  });
+}, 300);
+window.onerror = function(msg, src, line, col) {
+  document.getElementById('out').appendChild(document.createTextNode('JS ERR: ' + msg + ' @ ' + line + ':' + col + '\n'));
+};
+</script>
+</body>
+</html>

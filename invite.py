@@ -6,7 +6,10 @@ import json
 import logging
 import os
 import random
+import tempfile
+import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Optional
 
 logger = logging.getLogger("starlight48.invite")
@@ -20,6 +23,9 @@ CODE_PREFIX = "PLAY48-"
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_LENGTH = 8
 
+# 线程锁：保护 invite_data 并发读写
+_invite_lock = threading.Lock()
+
 
 def _generate_invite_code() -> str:
     """生成一个邀请码"""
@@ -31,49 +37,93 @@ def init_invite_codes(count: int = 2000) -> Dict:
     """
     初始化邀请码系统，强制生成指定数量的邀请码。
     如果已有旧数据，保留已使用的邀请码记录。
+    线程安全。
     """
-    invite_data = {
-        "codes": {},
-        "generated_at": datetime.now().isoformat(),
-        "total_count": count,
-        "used_count": 0
-    }
-
-    # 如果有旧文件，保留已使用的邀请码记录
-    if os.path.exists(INVITE_CODE_FILE):
-        try:
-            with open(INVITE_CODE_FILE, 'r', encoding='utf-8') as f:
-                old_data = json.load(f)
-            for code, info in old_data.get("codes", {}).items():
-                if info.get("used"):
-                    invite_data["codes"][code] = info
-                    invite_data["used_count"] += 1
-        except (json.JSONDecodeError, IOError):
-            pass
-
-    # 生成新邀请码，直到达到 count 个
-    while len(invite_data["codes"]) < count:
-        code = _generate_invite_code()
-        while code in invite_data["codes"]:
-            code = _generate_invite_code()
-        invite_data["codes"][code] = {
-            "used": False,
-            "created_at": datetime.now().isoformat(),
-            "used_at": None,
-            "user_id": None
+    with _invite_lock:
+        invite_data = {
+            "codes": {},
+            "generated_at": datetime.now().isoformat(),
+            "total_count": count,
+            "used_count": 0
         }
 
-    with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(invite_data, f, ensure_ascii=False, indent=2)
+        # 如果有旧文件，保留已使用的邀请码记录
+        if os.path.exists(INVITE_CODE_FILE):
+            try:
+                with open(INVITE_CODE_FILE, 'r', encoding='utf-8') as f:
+                    old_data = json.load(f)
+                for code, info in old_data.get("codes", {}).items():
+                    if info.get("used"):
+                        invite_data["codes"][code] = info
+                        invite_data["used_count"] += 1
+                logger.info("从旧文件恢复 %d 个已使用邀请码", invite_data["used_count"])
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning("读取旧邀请码文件失败: %s，将重新生成", e)
+                # 损坏文件备份
+                backup_path = INVITE_CODE_FILE + ".corrupted_backup"
+                try:
+                    os.rename(INVITE_CODE_FILE, backup_path)
+                    logger.info("已备份损坏文件到 %s", backup_path)
+                except OSError:
+                    pass
 
-    logger.info("成功生成/更新 %d 个邀请码，其中已使用 %d 个", count, invite_data['used_count'])
-    return invite_data
+        # 生成新邀请码，直到达到 count 个
+        # 添加最大尝试次数保护，防止极端情况下的无限循环
+        max_attempts = count * 10
+        attempts = 0
+        while len(invite_data["codes"]) < count and attempts < max_attempts:
+            code = _generate_invite_code()
+            # 碰撞重试（概率极低但安全处理）
+            retry = 0
+            while code in invite_data["codes"] and retry < 100:
+                code = _generate_invite_code()
+                retry += 1
+            if retry >= 100:
+                logger.error("邀请码生成碰撞次数过多，可能字符集过小")
+                break
+            invite_data["codes"][code] = {
+                "used": False,
+                "created_at": datetime.now().isoformat(),
+                "used_at": None,
+                "user_id": None
+            }
+            attempts += 1
+
+        if attempts >= max_attempts:
+            logger.error("邀请码生成达到最大尝试次数 %d，当前数量: %d", max_attempts, len(invite_data["codes"]))
+
+        try:
+            _save_invite_data(invite_data)
+        except OSError as e:
+            logger.critical("无法写入邀请码文件: %s，服务可能无法正常工作", e)
+
+        logger.info("成功生成/更新 %d 个邀请码，其中已使用 %d 个", count, invite_data['used_count'])
+        return invite_data
 
 
 def _save_invite_data(invite_data: Dict) -> None:
-    """保存邀请码数据到文件"""
-    with open(INVITE_CODE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(invite_data, f, ensure_ascii=False, indent=2)
+    """原子写入：先写临时文件，再重命名，防止崩溃损坏数据"""
+    file_path = Path(INVITE_CODE_FILE)
+    try:
+        # 写入临时文件
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            suffix=".json",
+            prefix=".invite_tmp_",
+            dir=file_path.parent or "."
+        )
+        try:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                json.dump(invite_data, f, ensure_ascii=False, indent=2)
+            # 原子重命名（同一文件系统内是原子操作）
+            os.replace(tmp_path, INVITE_CODE_FILE)
+        except Exception:
+            # 清理临时文件
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+    except OSError as e:
+        logger.error("保存邀请码数据失败: %s", e)
+        raise
 
 
 def _find_code_case_insensitive(invite_data: Dict, code: str) -> Optional[str]:
@@ -87,93 +137,112 @@ def _find_code_case_insensitive(invite_data: Dict, code: str) -> Optional[str]:
 
 def validate_invite_code(invite_data: Dict, code: str) -> Dict:
     """
-    验证邀请码是否有效。
+    验证邀请码是否有效（线程安全读）。
     返回: {"valid": bool, "message": str, ...}
     """
     if code.upper() == ADMIN_PASSWORD.upper():
         return {"valid": True, "is_admin": True, "user_id": "admin"}
 
-    found_code = _find_code_case_insensitive(invite_data, code)
-    if found_code is None:
-        return {"valid": False, "message": "邀请码不存在"}
+    with _invite_lock:
+        found_code = _find_code_case_insensitive(invite_data, code)
+        if found_code is None:
+            return {"valid": False, "message": "邀请码不存在"}
 
-    if invite_data["codes"][found_code].get("used"):
-        return {"valid": False, "message": "这个邀请码已经被使用了"}
+        if invite_data["codes"][found_code].get("used"):
+            return {"valid": False, "message": "这个邀请码已经被使用了"}
 
-    return {"valid": True, "is_admin": False, "code": found_code}
+        return {"valid": True, "is_admin": False, "code": found_code}
 
 
 def use_invite_code(invite_data: Dict, code: str, user_id: str) -> bool:
     """
-    使用邀请码。
+    使用邀请码（线程安全）。
     返回: True 表示使用成功，False 表示失败。
     """
     if code.upper() == ADMIN_PASSWORD.upper():
         return True
 
-    found_code = _find_code_case_insensitive(invite_data, code)
-    if found_code is not None and not invite_data["codes"][found_code].get("used"):
+    with _invite_lock:
+        found_code = _find_code_case_insensitive(invite_data, code)
+        if found_code is None:
+            return False
+        if invite_data["codes"][found_code].get("used"):
+            return False
+
         invite_data["codes"][found_code]["used"] = True
         invite_data["codes"][found_code]["used_at"] = datetime.now().isoformat()
         invite_data["codes"][found_code]["user_id"] = user_id
         invite_data["used_count"] = invite_data.get("used_count", 0) + 1
-        _save_invite_data(invite_data)
+
+        try:
+            _save_invite_data(invite_data)
+        except OSError:
+            # 写入失败，回滚内存状态
+            invite_data["codes"][found_code]["used"] = False
+            invite_data["codes"][found_code]["used_at"] = None
+            invite_data["codes"][found_code]["user_id"] = None
+            invite_data["used_count"] = invite_data.get("used_count", 1) - 1
+            raise
+
         return True
-    return False
 
 
 def get_invite_stats(invite_data: Dict) -> Dict:
-    """获取邀请码统计数据"""
-    total = len(invite_data.get("codes", {}))
-    used = sum(1 for cd in invite_data.get("codes", {}).values() if cd.get("used"))
-    return {
-        "total": total,
-        "used": used,
-        "unused": total - used
-    }
+    """获取邀请码统计数据（线程安全）"""
+    with _invite_lock:
+        total = len(invite_data.get("codes", {}))
+        used = sum(1 for cd in invite_data.get("codes", {}).values() if cd.get("used"))
+        return {
+            "total": total,
+            "used": used,
+            "unused": total - used
+        }
 
 
 def get_unused_codes(invite_data: Dict, limit: int = 100) -> list:
-    """获取未使用的邀请码列表"""
-    unused = []
-    for code, data in invite_data.get("codes", {}).items():
-        if not data.get("used"):
-            unused.append(code)
-            if len(unused) >= limit:
-                break
-    return unused
+    """获取未使用的邀请码列表（线程安全）"""
+    with _invite_lock:
+        unused = []
+        for code, data in invite_data.get("codes", {}).items():
+            if not data.get("used"):
+                unused.append(code)
+                if len(unused) >= limit:
+                    break
+        return unused
 
 
 def get_used_codes(invite_data: Dict, limit: int = 100) -> list:
-    """获取已使用的邀请码列表（含详细信息）"""
-    used = []
-    for code, data in invite_data.get("codes", {}).items():
-        if data.get("used"):
-            used.append({
+    """获取已使用的邀请码列表（含详细信息，线程安全）"""
+    with _invite_lock:
+        used = []
+        for code, data in invite_data.get("codes", {}).items():
+            if data.get("used"):
+                used.append({
+                    "code": code,
+                    "user_id": data.get("user_id"),
+                    "used_at": data.get("used_at"),
+                    "created_at": data.get("created_at")
+                })
+                if len(used) >= limit:
+                    break
+        return used
+
+
+def get_all_codes(invite_data: Dict, limit: int = 100) -> list:
+    """获取所有邀请码列表（含状态信息，线程安全）"""
+    with _invite_lock:
+        all_codes = []
+        for code, data in invite_data.get("codes", {}).items():
+            all_codes.append({
                 "code": code,
+                "used": data.get("used", False),
                 "user_id": data.get("user_id"),
                 "used_at": data.get("used_at"),
                 "created_at": data.get("created_at")
             })
-            if len(used) >= limit:
+            if len(all_codes) >= limit:
                 break
-    return used
-
-
-def get_all_codes(invite_data: Dict, limit: int = 100) -> list:
-    """获取所有邀请码列表（含状态信息）"""
-    all_codes = []
-    for code, data in invite_data.get("codes", {}).items():
-        all_codes.append({
-            "code": code,
-            "used": data.get("used", False),
-            "user_id": data.get("user_id"),
-            "used_at": data.get("used_at"),
-            "created_at": data.get("created_at")
-        })
-        if len(all_codes) >= limit:
-            break
-    return all_codes
+        return all_codes
 
 
 def verify_admin(password: str) -> bool:

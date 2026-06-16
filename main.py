@@ -137,8 +137,13 @@ MAX_SAVE_SIZE = 500 * 1024  # 500KB 上限
 
 
 # ======================== NPC 性格映射 ========================
-def get_npc_prompt(npc_id: str, context: Optional[dict] = None) -> str:
-    """根据 NPC 名字和类型生成系统提示词"""
+def get_npc_prompt(npc_id: str, role_prompt: str = "", context: Optional[dict] = None) -> str:
+    """根据 NPC 名字和类型生成系统提示词，优先使用客户端传来的增强提示词"""
+    # 如果客户端传了增强的 rolePrompt，直接使用（包含人设、OOC禁令、上下文）
+    if role_prompt and len(role_prompt) > 50:
+        return role_prompt
+    
+    # 降级：使用简单的人设提示
     context = context or {}
     npc_type = context.get("npcType", "member")
     personality = context.get("personality", "")
@@ -243,7 +248,7 @@ async def chat(data: ChatMessage, request: Request):
     if not check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
 
-    system_prompt = get_npc_prompt(data.npcId, data.context)
+    system_prompt = get_npc_prompt(data.npcId, data.rolePrompt, data.context)
     logger.info("Chat request: npcId=%s, message=%.30s...", data.npcId, data.message)
 
     try:
@@ -276,21 +281,42 @@ async def chat(data: ChatMessage, request: Request):
 # ======================== 邀请码 API ========================
 
 @app.post("/api/invite/validate")
-async def api_validate_invite(data: InviteValidateRequest):
+async def api_validate_invite(data: InviteValidateRequest, request: Request):
     """验证邀请码是否有效"""
-    result = validate_invite_code(invite_data, data.code)
-    return result
+    # 速率限制
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
+    try:
+        result = validate_invite_code(invite_data, data.code)
+        return result
+    except Exception as e:
+        logger.error("邀请码验证异常: %s", e)
+        raise HTTPException(status_code=500, detail="服务器内部错误，请稍后重试")
 
 
 @app.post("/api/invite/use")
-async def api_use_invite(data: InviteUseRequest):
+async def api_use_invite(data: InviteUseRequest, request: Request):
     """使用邀请码"""
-    success = use_invite_code(invite_data, data.code, data.userId)
-    if success:
-        logger.info("Invite code used: user=%s", data.userId)
-        return {"success": True, "message": "邀请码使用成功！"}
-    else:
-        return {"success": False, "message": "邀请码无效或已被使用"}
+    # 速率限制
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
+    try:
+        success = use_invite_code(invite_data, data.code, data.userId)
+        if success:
+            logger.info("Invite code used: user=%s", data.userId)
+            return {"success": True, "message": "邀请码使用成功！"}
+        else:
+            return {"success": False, "message": "邀请码无效或已被使用"}
+    except OSError as e:
+        logger.critical("邀请码存储写入失败: %s", e)
+        raise HTTPException(status_code=500, detail="邀请码系统存储异常，请联系管理员")
+    except Exception as e:
+        logger.error("邀请码使用异常: %s", e)
+        raise HTTPException(status_code=500, detail="服务器内部错误，请稍后重试")
 
 
 @app.get("/api/invite/stats")

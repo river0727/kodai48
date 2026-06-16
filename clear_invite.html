@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>清除邀请码验证状态</title>
+<style>
+body{font-family:sans-serif;padding:40px;background:#f5f5f5}
+.box{background:#fff;padding:30px;border-radius:8px;max-width:500px;margin:0 auto;box-shadow:0 2px 8px rgba(0,0,0,0.1)}
+h1{color:#333;font-size:20px;margin:0 0 20px}
+button{background:#ff4757;color:#fff;border:none;padding:12px 24px;border-radius:6px;cursor:pointer;font-size:14px;margin-right:8px}
+button:hover{background:#ff6b81}
+.ok{color:#27ae60;margin-top:20px}
+</style>
+</head>
+<body>
+<div class="box">
+<h1>清除邀请码验证状态</h1>
+<p>点击下方按钮清除 localStorage 中的 <code>inviteCode</code> 和 <code>inviteUserId</code>，然后重新打开 index.html 即可看到验证码页面。</p>
+<button onclick="clearLS()">清除验证状态</button>
+<button onclick="window.location.href='index.html'">清除并打开游戏</button>
+<button onclick="window.location.href='index.html?reset=1'">用 reset 参数打开</button>
+<div id="r"></div>
+</div>
+<script>
+function clearLS() {
+    localStorage.removeItem('inviteCode');
+    localStorage.removeItem('inviteUserId');
+    document.getElementById('r').innerHTML = '<p class="ok">已清除！现在可以打开 index.html 查看验证码页面了。</p>';
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+﻿Full: NONE
+Iter 0: [0-173221]=NONE | [173221-346443]=NONE
+UNEXPECTED
+
+Error at: [0, 346443]
+Content:
+\ufeff/* ============ \u661f\u514948\u00b7\u7231\u8c46\u6a21\u62df\u5668 V2 - \u4e3b\u811a\u672c ============ */\u000a\u000a// ============ \u5168\u5c40\u547d\u540d\u7a7a\u95f4 ============\u000aconst
+python : Traceback (most recent call last):
+所在位置 行:1 字符: 219
++ ... ents\trae_projects\48moniqi\deploy; python _push_auto.py 2>&1 | Out-F ...
++                                         ~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "C:\Users\姚\Documents\trae_projects\48moniqi\deploy\_push_auto.py", line 9, in <module>
+    import os, base64, json, requests
+  File "C:\Users\姚\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\requests\__init__.py", line 45, in <module
+>
+    import urllib3
+  File "C:\Users\姚\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\__init__.py", line 15, in <module>
+    from ._base_connection import _TYPE_BODY
+  File "C:\Users\姚\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\_base_connection.py", line 5, in <
+module>
+    from .util.connection import _TYPE_SOCKET_OPTIONS
+  File "C:\Users\姚\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\util\__init__.py", line 7, in <mod
+ule>
+    from .retry import Retry
+  File "C:\Users\姚\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\util\retry.py", line 5, in <module
+>
+    import random
+  File "C:\Users\姚\AppData\Local\Python\pythoncore-3.14-64\Lib\random.py", line 61, in <module>
+    from bisect import bisect as _bisect
+ImportError: cannot import name 'bisect' from 'bisect' (consider renaming 'C:\\Users\\姚\\Documents\\trae_projects\\48mo
+niqi\\deploy\\bisect.py' since it has the same name as the standard library module named 'bisect' and prevents importin
+g that standard library module)

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>App.js 诊断</title>
+<style>body{font-family:monospace;padding:20px;background:#1a1a2e;color:#fff;font-size:14px}pre{background:#000;padding:15px;overflow:auto;max-height:600px;color:#0f0;white-space:pre-wrap}.ok{color:#0f0}.err{color:#f44}.warn{color:#fa0}</style>
+</head>
+<body>
+<h1>🔍 App.js 诊断报告</h1>
+<div id="out">检查中...</div>
+<script>
+async function run() {
+    const out = document.getElementById('out');
+    const log = (m, c='ok') => out.innerHTML += `<span class="${c}">${m}</span>\n`;
+    const logPre = (m) => out.innerHTML += `<pre>${m}</pre>`;
+
+    try {
+        // 1. 获取 app.js（带防缓存参数）
+        const url = 'app.js?_=' + Date.now();
+        log('1️⃣ 加载 app.js: ' + url);
+        const code = await fetch(url).then(r => r.text());
+        log('   ✓ 加载成功，大小: ' + code.length + ' 字符');
+
+        // 2. 语法检查
+        log('\n2️⃣ 语法检查...');
+        try {
+            new Function(code);
+            log('   ✓ 语法正确', 'ok');
+        } catch (e) {
+            log('   ✗ 语法错误: ' + e.message, 'err');
+            logPre(e.stack);
+            return;
+        }
+
+        // 3. 在隔离环境中执行（不污染全局），检查模块定义
+        log('\n3️⃣ 模块完整性检查...');
+        const fakeWindow = { location: { protocol: 'file:', hostname: 'localhost' }, addEventListener: () => {} };
+        const fakeDocument = {
+            getElementById: () => null,
+            querySelector: () => null,
+            querySelectorAll: () => [],
+            addEventListener: () => {},
+            createElement: () => ({ style: {}, classList: { add: () => {}, remove: () => {}, toggle: () => {} } }),
+            body: { contains: () => false }
+        };
+        const fakeLocalStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+
+        try {
+            const fn = new Function('window', 'document', 'localStorage', 'fetch', 'setTimeout', 'setInterval', 'clearTimeout', 'MutationObserver',
+                'console', code);
+            const fakeMO = function() { return { observe: () => {}, disconnect: () => {} }; };
+            const fakeConsole = { log: () => {}, warn: () => {}, error: () => {} };
+            fn(fakeWindow, fakeDocument, fakeLocalStorage, () => {}, () => {}, () => {}, () => {}, fakeMO, fakeConsole);
+            log('   ✓ JS 完整执行成功', 'ok');
+        } catch (e) {
+            log('   ✗ 运行时错误: ' + e.message, 'err');
+            logPre(e.stack);
+        }
+
+    } catch (e) {
+        log('加载失败: ' + e.message, 'err');
+    }
+}
+run();
+</script>
+</body>
+</html>

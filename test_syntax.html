@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>语法检查</title>
+<style>body{font-family:monospace;padding:20px;background:#1a1a2e;color:#0f0;font-size:14px}pre{background:#000;padding:15px;white-space:pre-wrap;word-break:break-all}.ok{color:#0f0}.err{color:#f44}</style>
+</head>
+<body>
+<h1>app.js 语法测试</h1>
+<div id="out">加载中...</div>
+<script>
+(async function() {
+    const out = document.getElementById('out');
+    const url = 'app.js?_=' + Date.now();
+    try {
+        const code = await fetch(url).then(r => r.text());
+        out.innerHTML += '<br>✓ 加载成功, ' + code.length + ' 字符<br>';
+        try {
+            new Function(code);
+            out.innerHTML += '<span class="ok">✓✓✓ 语法正确! ✓✓✓</span>';
+        } catch (e) {
+            out.innerHTML += '<br><span class="err">✗ 语法错误: ' + e.message + '</span>';
+            out.innerHTML += '<pre>' + (e.stack || '') + '</pre>';
+        }
+    } catch (e) {
+        out.innerHTML += '<span class="err">加载失败: ' + e.message + '</span>';
+    }
+})();
+</script>
+</body>
+</html>

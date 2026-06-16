@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>JS Check</title>
+</head>
+<body>
+<div id="result" style="font-size:30px;color:red;padding:30px;background:#fff"></div>
+<script>
+fetch('app.js?_=' + Date.now())
+  .then(r => r.text())
+  .then(code => {
+    try {
+      new Function(code);
+      document.getElementById('result').textContent = 'SYNTAX OK - size ' + code.length;
+      document.title = 'OK';
+    } catch (e) {
+      document.getElementById('result').textContent = 'ERR: ' + e.message;
+      document.title = 'ERR';
+    }
+  })
+  .catch(e => {
+    document.getElementById('result').textContent = 'fetch fail';
+  });
+</script>
+</body>
+</html>
