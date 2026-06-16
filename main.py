@@ -69,6 +69,19 @@ app.add_middleware(
 # 静态文件
 app.mount("/static", StaticFiles(directory="."), name="static")
 
+# 顶层静态资源（让 index.html 的相对路径 app.js / style.css / app_diag.js 能找到）
+@app.get("/app.js", include_in_schema=False)
+async def _serve_app_js():
+    return FileResponse("app.js", media_type="application/javascript")
+
+@app.get("/style.css", include_in_schema=False)
+async def _serve_style_css():
+    return FileResponse("style.css", media_type="text/css")
+
+@app.get("/app_diag.js", include_in_schema=False)
+async def _serve_app_diag():
+    return FileResponse("app_diag.js", media_type="application/javascript")
+
 # AI 客户端
 client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL) if API_KEY else None
 
