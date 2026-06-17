@@ -667,6 +667,7 @@ App.Store = {
         pocketRoomMessages: [],
         bestPartner: null,
         partnerStageUsed: false,
+        romance: { relationships:{}, cooldown:0, crisisLog:[], dateHistory:[] },
         memberMemory: {},
         memberEvents: [],
         socialCircles: [],
@@ -717,6 +718,13 @@ App.Store = {
         App.Events.checkEvents();
         App.Save.autoSave();
         if (text) App.UI.showStatChange(text.trim());
+    },
+    // 根据所有队友好感度自动重算 stats.affection
+    recalcAffection() {
+        const vals = Object.values(this.G.memberAffection || {});
+        if (vals.length === 0) return;
+        const avg = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+        this.G.stats.affection = clamp(avg, 0, 100);
     },
     applyChatStress(quality) {
         if (quality === 'heartfelt') this.updateStats({ stress: -5, mood: 2 });
@@ -1717,8 +1725,19 @@ App.EventPool = {
 
 // ============ 总选举系统 V2 ============
 // 优化：推手选择/竞敌雷达/拉票活动/三报节奏/翻盘机制/玩家感言
+// ============ 总选系统 V3（粉丝投票 + 私联 + 塌房） ============
 App.Election = {
-    // 拉票活动目录
+    // ----- 粉丝类型定义 -----
+    fanCategories: {
+        soloKing:   { name:'单推王', emoji:'👑', votePower:5.0, initRatio:0.02, loyaltyRange:[90,100], desc:'全力砸票，随叫随到' },
+        fanHead:    { name:'饭头',   emoji:'🎖️', votePower:3.0, initRatio:0.05, loyaltyRange:[70,90],  desc:'组织应援，带节奏' },
+        cpFan:      { name:'CP粉',   emoji:'💕', votePower:2.0, initRatio:0.15, loyaltyRange:[50,70],  desc:'关注你和CP对象' },
+        soloFan:    { name:'单推',   emoji:'❤️', votePower:1.5, initRatio:0.28, loyaltyRange:[60,80],  desc:'稳定投票' },
+        toxicFan:   { name:'毒唯',   emoji:'😤', votePower:1.0, initRatio:0.10, loyaltyRange:[30,90],  desc:'攻击其他成员，可能反噬' },
+        casualFan:  { name:'散粉',   emoji:'🐟', votePower:0.5, initRatio:0.40, loyaltyRange:[20,40],  desc:'随大流，需饭头引导' },
+    },
+
+    // ----- 拉票活动目录 -----
     activities: [
         { id:'sns',        name:'SNS 投放',        emoji:'📱', cost:  100, votes:  500, desc:'在微博/B站投放广告', risk:0.05 },
         { id:'media',      name:'媒体采访',        emoji:'📰', cost:  300, votes: 2000, desc:'接受娱乐采访增加曝光', risk:0.08 },
@@ -1727,319 +1746,529 @@ App.Election = {
         { id:'concert',    name:'粉丝见面会',      emoji:'🎤', cost: 2000, votes:20000, desc:'小规模 livehouse', risk:0.20 },
         { id:'dark',       name:'黑公关(打压竞敌)', emoji:'🕵️', cost: 2000, votes:    0, desc:'对竞敌放黑料,被发现反噬', risk:0.40, hostile:true },
     ],
-    // 拉票活动每日效果加成(随报名期天数线性增长)
-    getActivityMultiplier: function(phase, activity) {
+
+    // ----- 私联目标定义 -----
+    // 私联不消耗鸡腿，获得票数+财产奖励；触发受阶段/冷却/概率限制
+    privateContactTargets: {
+        soloKing: { name:'单推王', emoji:'👑', votesMin:8000,  votesMax:15000, riskAdd:25, wealthMin:800,  wealthMax:2000, dailyLimit:1 },
+        fanHead:  { name:'饭头',   emoji:'🎖️', votesMin:3000,  votesMax:8000,  riskAdd:15, wealthMin:400,  wealthMax:1200, dailyLimit:1 },
+        toxicFan: { name:'毒唯',   emoji:'😤', votesMin:2000,  votesMax:5000,  riskAdd:20, wealthMin:200,  wealthMax:800,  dailyLimit:1 },
+    },
+
+    // ----- 阶段倍率 -----
+    getActivityMultiplier: function(phase) {
         if (phase === 'first_pull')  return 1.0;
         if (phase === 'second_pull') return 1.2;
         if (phase === 'final_pull')  return 1.5;
-        return 0.5;  // 报名期内活动效果减半
+        return 0.5;
     },
-    // 计算推手贡献(根据推手好感度+性格)
-    calcPromoterContrib: function() {
-        const me = G.election;
-        if (!me.promoters || me.promoters.length === 0) return { votes:0, multiplier:1.0, breakdown:[] };
-        let totalVotes = 0;
-        let cpBonus = 0;
-        const breakdown = [];
-        for (const pname of me.promoters) {
-            const aff = G.memberAffection?.[pname] ?? 50;
-            const personality = App.MemberPersonality.getFor?.(pname) || null;
-            const traitName = personality?.name || '温柔治愈';
-            // 好感度 30 以下推手摆烂
-            if (aff < 30) {
-                breakdown.push({ name:pname, votes:0, reason:`好感度低(${aff}),摆烂` });
-                continue;
+
+    // ----- 初始化粉丝群体（基于当前 G.game.pocket_fans） -----
+    initFanbase: function() {
+        const total = G.game.pocket_fans || 50;
+        const cats = {};
+        let assigned = 0;
+        const keys = Object.keys(this.fanCategories);
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            const def = this.fanCategories[key];
+            let count;
+            if (i === keys.length - 1) {
+                count = total - assigned;
+            } else {
+                count = Math.floor(total * def.initRatio);
+                assigned += count;
             }
-            // 基础贡献 = 好感度 * 80
-            let contrib = aff * 80;
-            // 性格修正
-            if (traitName.includes('温柔')) contrib *= 1.20;       // 握手会效率高
-            else if (traitName.includes('元气')) contrib *= 1.15;  // SNS 传播广
-            else if (traitName.includes('冰山')) contrib *= 1.10;  // 话题度高
-            else if (traitName.includes('慵懒')) contrib *= 1.25;  // 粉丝心疼
-            else if (traitName.includes('可靠')) contrib *= 1.10;
-            else if (traitName.includes('文艺')) contrib *= 1.05;
-            else if (traitName.includes('傲娇')) contrib *= 0.90;  // 嘴上不帮
-            breakdown.push({ name:pname, votes:Math.floor(contrib), reason:`${traitName} 好感${aff}` });
-            totalVotes += contrib;
+            const lo = def.loyaltyRange[0], hi = def.loyaltyRange[1];
+            cats[key] = {
+                count: Math.max(0, count),
+                loyalty: Math.floor((lo + hi) / 2),
+                votePower: def.votePower,
+            };
         }
-        // CP 联票: 2 名推手时双方互投 20% 加成
-        if (me.promoters.length >= 2) cpBonus = totalVotes * 0.2;
-        return { votes:Math.floor(totalVotes + cpBonus), multiplier:1.0, breakdown };
+        return { totalFans: total, categories: cats };
     },
-    // 计算总票数(中心公式)
+
+    // ----- 重新分配粉丝（日常变化后刷新分布） -----
+    refreshFanbase: function() {
+        const me = G.election;
+        if (!me || !me.fanbase) return;
+        const cats = me.fanbase.categories;
+        // 散粉→单推（忠诚度≥40）
+        if ((cats.casualFan?.loyalty || 0) >= 40) {
+            const convert = Math.floor((cats.casualFan.count || 0) * 0.05);
+            if (convert > 0) { cats.casualFan.count = Math.max(0, (cats.casualFan.count || 0) - convert); cats.soloFan.count = (cats.soloFan.count || 0) + convert; }
+        }
+        // 单推→饭头（忠诚度≥70）
+        if ((cats.soloFan?.loyalty || 0) >= 70) {
+            const convert = Math.floor((cats.soloFan.count || 0) * 0.03);
+            if (convert > 0) { cats.soloFan.count = Math.max(0, (cats.soloFan.count || 0) - convert); cats.fanHead.count = (cats.fanHead.count || 0) + convert; }
+        }
+        // 饭头→单推王（忠诚度≥90）
+        if ((cats.fanHead?.loyalty || 0) >= 90) {
+            const convert = Math.floor((cats.fanHead.count || 0) * 0.02);
+            if (convert > 0) { cats.fanHead.count = Math.max(0, (cats.fanHead.count || 0) - convert); cats.soloKing.count = (cats.soloKing.count || 0) + convert; }
+        }
+        // 有CP对象时单推→CP粉
+        if (G.bestPartner) {
+            const convert = Math.floor((cats.soloFan.count || 0) * 0.05);
+            if (convert > 0) { cats.soloFan.count = Math.max(0, (cats.soloFan.count || 0) - convert); cats.cpFan.count = (cats.cpFan.count || 0) + convert; }
+        }
+        // CP解散 → CP粉50%转散粉，30%转毒唯
+        if (!G.bestPartner && (cats.cpFan.count || 0) > 0) {
+            const lost = Math.floor(cats.cpFan.count * 0.5);
+            const toxic = Math.floor(cats.cpFan.count * 0.3);
+            cats.cpFan.count = Math.max(0, cats.cpFan.count - lost - toxic);
+            cats.casualFan.count = (cats.casualFan.count || 0) + lost;
+            cats.toxicFan.count = (cats.toxicFan.count || 0) + toxic;
+        }
+        // 人气高→毒唯增长
+        if ((G.stats.popularity || 0) > 70 && Math.random() < 0.3) {
+            const add = Math.floor((cats.soloFan.count || 0) * 0.02);
+            if (add > 0) { cats.soloFan.count = Math.max(0, (cats.soloFan.count || 0) - add); cats.toxicFan.count = (cats.toxicFan.count || 0) + add; }
+        }
+    },
+
+    // ----- 计算粉丝票数 -----
+    calcFanVotes: function() {
+        const me = G.election;
+        if (!me || !me.fanbase) return 0;
+        const cats = me.fanbase.categories;
+        const affectionMod = 1 + (G.stats.affection || 50) / 100; // 好感50→1.5倍，100→2倍
+        let total = 0;
+        for (const key of Object.keys(cats)) {
+            const def = this.fanCategories[key];
+            const power = def ? def.votePower : 1;
+            const isSocialFan = (key === 'cp' || key === 'solo'); // CP粉和单推受人缘影响
+            const mod = isSocialFan ? affectionMod : 1;
+            total += (cats[key].count || 0) * power * ((cats[key].loyalty || 50) / 100) * mod;
+        }
+        return Math.floor(total);
+    },
+
+    // ----- 计算总票数（重构） -----
     calculateFinalVotes: function() {
         const me = G.election;
         if (!me) return 0;
-        // 1. 基础票
-        const base = Math.floor((G.stats.popularity || 0) * 1000);
-        // 2. 资源投入(根据 activities[] 累计)
+        // 1. 粉丝票
+        const fanVotes = this.calcFanVotes();
+        // 2. 活动票
         let investVotes = 0;
         for (const a of (me.activitiesUsed || [])) {
             const def = this.activities.find(x => x.id === a.id);
-            if (!def || def.hostile) continue;  // 黑公关不直接加票
-            investVotes += def.votes * (a.count || 1);
+            if (!def || def.hostile) continue;
+            investVotes += Math.floor(def.votes * this.getActivityMultiplier(me.phase) * (a.count || 1));
         }
-        // 3. 推手贡献
-        const promo = this.calcPromoterContrib();
-        // 4. CP 加成
-        // (已包含在 promo.votes)
-        // 5. 黑料扣票
+        // 3. 私联票
+        let privateVotes = 0;
+        for (const pc of (me.privateContacts || [])) {
+            if (!pc.discovered) privateVotes += pc.votesGained || 0;
+        }
+        // 4. 黑料扣票
         let penalty = 0;
-        for (const c of (me.controversies || [])) {
-            penalty += c.penaltyVotes || 0;
-        }
-        // 6. 鸡腿和星光加成
+        for (const c of (me.controversies || [])) { penalty += c.penaltyVotes || 0; }
+        // 5. 黑公关修正
+        let darkOpsMod = me.darkOpsCaught ? -Math.floor(fanVotes * 0.25) : 0;
+        // 6. 鸡腿加成
         const drumBonus = Math.floor((G.stats.drumstick || 0) / 20);
         // 7. 上月排名加成
         const rankBonus = (me.history?.length || 0) > 0 ? (150 - (me.history.at(-1)?.rank || 150)) * 50 : 0;
         // 8. 随机 ±5%
-        const rng = Math.floor((Math.random() - 0.5) * base * 0.1);
-        // 9. 满人气冠军保险
-        const championBonus = (G.stats.popularity || 0) >= 100 ? 50000 : 0;
+        const rng = Math.floor((Math.random() - 0.5) * Math.max(fanVotes, 1000) * 0.1);
 
-        const total = base + investVotes + promo.votes - penalty + drumBonus + rankBonus + championBonus + rng;
+        const total = fanVotes + investVotes + privateVotes - penalty + darkOpsMod + drumBonus + rankBonus + rng;
         me.predictedVotes = Math.max(0, total);
         return me.predictedVotes;
     },
-    // 根据排名计算等级
+
+    // ----- 根据排名计算等级 -----
     getRankTier: function(rank) {
-        if (rank <= 1) return { tier:'top1', name:'👑 第一名', bonus:'鸟巢演唱会 + 杂志封面' };
-        if (rank <= 3) return { tier:'top3', name:'🥇 神七(前三)', bonus:'选拔组 C 位优先' };
-        if (rank <= 7) return { tier:'top7', name:'🥈 神七', bonus:'明星组 + 综艺优先' };
+        if (rank <= 1) return { tier:'top1', name:'👑 第一名(Center)', bonus:'鸟巢演唱会 + 杂志封面 + 全年通告费×1.5', isKami7:true };
+        if (rank <= 3) return { tier:'top3', name:'🥇 神七(前三)', bonus:'选拔组 C 位优先', isKami7:true };
+        if (rank <= 7) return { tier:'top7', name:'🥈 神七', bonus:'人气+50 / 鸡腿+5000 / 综艺优先', isKami7:true };
         if (rank <= 16) return { tier:'top16', name:'🏅 选拔组', bonus:'综艺邀约增加' };
         if (rank <= 32) return { tier:'top32', name:'🎖️ 入选', bonus:'无变化' };
         if (rank <= 48) return { tier:'top48', name:'🎗️ 危险区', bonus:'下月基础票 -5%' };
         return { tier:'none', name:'❌ 落选', bonus:'粉丝流失 20%' };
     },
-    // 计算竞敌(从同团/同队成员中选 3-5 名排名相近的)
+
+    // ----- 计算竞敌 -----
     selectRivals: function() {
-        const me = G.election;
         const all = App.getAllMembers().filter(m => !m.graduate && m.name !== G.player.name);
-        // 按当前排名远近筛选
         const rivals = [];
-        const myRank = G.game.rank || 150;
         for (const m of all) {
-            // 模拟竞敌票数(基于人气+随机性)
             const rivalVotes = Math.floor((G.stats.popularity * 0.8 + Math.random() * 40) * 1000);
             const aff = G.memberAffection?.[m.name] ?? 50;
-            const rivalry = {
-                name: m.name, group: m.group, team: m.team,
-                votes: rivalVotes, affection: aff,
-                action: this._randomRivalAction(),
-            };
-            rivals.push(rivalry);
+            rivals.push({ name: m.name, group: m.group, team: m.team, votes: rivalVotes, affection: aff, action: this._randomRivalAction() });
         }
         rivals.sort((a, b) => b.votes - a.votes);
-        // 取 5 个最接近的
         return rivals.slice(0, 5);
     },
+
     _randomRivalAction: function() {
         const actions = [
             { type:'campaign', desc:'发竞选宣言' },
-            { type:'snatch_promoter', desc:'试图挖走你推的成员' },
+            { type:'private_contact', desc:'私下联系粉丝' },
             { type:'alliance', desc:'提议互投联盟' },
             { type:'smear', desc:'放黑料' },
             { type:'rest', desc:'按兵不动' },
         ];
         return actions[Math.floor(Math.random() * actions.length)];
     },
-    // 推进到下一阶段(每日调用)
+
+    // ----- 推进阶段（每日调用） -----
     advance: function() {
         const me = G.election || this.init();
         const day = G.game.day;
         const dim = day % 30 || 30;
-        // 阶段映射
         let newPhase = me.phase;
         let newMonth = me.month;
+
         if (dim === 1)  { newPhase = 'register'; }
         else if (dim === 10) { newPhase = 'first_report'; }
         else if (dim < 20)  { newPhase = 'first_pull'; }
         else if (dim === 20) { newPhase = 'second_report'; }
         else if (dim < 30)  { newPhase = 'second_pull'; }
         else if (dim === 30) { newPhase = 'final_report'; }
-        // 月切换
+
+        // 月切换 → 结算+重置
         if (dim === 1 && me.phase !== 'register') {
-            // 上月结算
-            if (me.phase === 'final_report' || me.predictedRank > 0) {
-                // 已在 final_pull 后结算
-            }
             newMonth = me.month + 1;
-            // 重置当月状态
             me.activitiesUsed = [];
-            me.promoters = [];
             me.controversies = [];
             me.predictedRank = 0;
             me.predictedVotes = 0;
             me.rivals = this.selectRivals();
+            me.privateContacts = [];
+            me.privateContactRisk = 0;
+            me.darkOpsUsed = 0;
+            me.darkOpsCaught = false;
+            me.reportsShown = [];
+            me.finalRank = 0;
+            me.isKami7 = false;
+            me.rivalPrivateContacts = [];
+            me.fanbase = this.initFanbase();
         }
         me.phase = newPhase;
         me.month = newMonth;
-        // 每日竞敌行动(拉票期)
+        this.refreshFanbase();
+        // 每日私联风险自然衰减 + 冷却重置
+        if (me.privateContactRisk > 0) me.privateContactRisk = Math.max(0, me.privateContactRisk - 2);
+        me._pcUsedToday = {}; // 每日冷却重置
+        // 每日竞敌行动+涨票
         if (newPhase === 'first_pull' || newPhase === 'second_pull') {
             this._dailyRivalAction();
+            for (const r of (me.rivals || [])) { r.votes += Math.floor(Math.random() * 500 + 200); }
         }
     },
+
     _dailyRivalAction: function() {
         const me = G.election;
         if (!me.rivals || me.rivals.length === 0) return;
-        // 随机选一个竞敌产生事件
         if (Math.random() < 0.20) {
             const rival = me.rivals[Math.floor(Math.random() * me.rivals.length)];
-            if (rival.action.type === 'snatch_promoter' && me.promoters.length > 0) {
-                this._tryStealPromoter(rival);
+            if (rival.action.type === 'private_contact') {
+                if (!me.rivalPrivateContacts) me.rivalPrivateContacts = [];
+                me.rivalPrivateContacts.push({ rivalName: rival.name, day: G.game.day, handled: false });
+                App.UI.showNotification('⚠️ ' + rival.name + ' 被发现私联粉丝！');
             } else if (rival.action.type === 'smear' && Math.random() < 0.30) {
                 this._triggerControversy(rival);
             }
         }
     },
-    _tryStealPromoter: function(rival) {
-        const me = G.election;
-        if (me.promoters.length === 0) return;
-        const idx = Math.floor(Math.random() * me.promoters.length);
-        const name = me.promoters[idx];
-        const aff = G.memberAffection?.[name] ?? 50;
-        if (aff < 30 && Math.random() < 0.4) {
-            // 好感度低的成员可能放弃你的应援,转去帮竞敌
-            me.promoters.splice(idx, 1);
-            App.UI.showNotification(`⚠️ ${name} 好感度太低,不再积极为你应援了...`);
-        }
-    },
+
     _triggerControversy: function(rival) {
         const me = G.election;
         const penalty = Math.floor((G.stats.popularity || 0) * 200);
-        me.controversies.push({
-            day: G.game.day, source:rival.name,
-            desc:`被 ${rival.name} 粉丝放黑料`,
-            penaltyVotes: penalty,
-        });
-        App.UI.showNotification(`📸 ${rival.name} 的粉丝在放你黑料!票数 -${penalty}`);
+        me.controversies.push({ day: G.game.day, source: rival.name, desc: '被 ' + rival.name + ' 粉丝放黑料', penaltyVotes: penalty });
+        App.UI.showNotification('📸 ' + rival.name + ' 的粉丝在放你黑料!票数 -' + penalty);
     },
-    // 初始化(首次进入或新存档)
+
+    // ----- 初始化 -----
     init: function() {
         if (!G.election) {
             G.election = {
-                month: 1,
-                phase: 'register',
-                promoters: [],
-                activitiesUsed: [],
-                controversies: [],
-                predictedRank: 0,
-                predictedVotes: 0,
-                rivals: this.selectRivals(),
-                history: [],
-                speech: '',
+                month: 1, phase: 'register',
+                activitiesUsed: [], controversies: [],
+                predictedRank: 0, predictedVotes: 0,
+                rivals: this.selectRivals(), history: [], speech: '',
+                fanbase: this.initFanbase(),
+                privateContacts: [], privateContactRisk: 0, _pcUsedToday: {},
+                darkOpsUsed: 0, darkOpsCaught: false,
+                reportsShown: [], finalRank: 0, isKami7: false,
+                rivalPrivateContacts: [],
             };
+        } else {
+            const me = G.election;
+            if (!me.fanbase) me.fanbase = this.initFanbase();
+            if (!me.privateContacts) me.privateContacts = [];
+            if (me.privateContactRisk === undefined) me.privateContactRisk = 0;
+            if (me.darkOpsUsed === undefined) me.darkOpsUsed = 0;
+            if (me.darkOpsCaught === undefined) me.darkOpsCaught = false;
+            if (!me.reportsShown) me.reportsShown = [];
+            if (me.finalRank === undefined) me.finalRank = 0;
+            if (me.isKami7 === undefined) me.isKami7 = false;
+            if (!me.rivalPrivateContacts) me.rivalPrivateContacts = [];
+            if (me.promoters) delete me.promoters;
         }
         return G.election;
     },
-    // 玩家感言(最终结果后调用)
+
+    // ----- 私联粉丝 -----
+    privateContact: function(fanType) {
+        const me = G.election;
+        const target = this.privateContactTargets[fanType];
+        if (!target) { App.UI.showNotification('⚠️ 无法私联该类型粉丝'); return; }
+        // 触发条件1：阶段限制（仅拉票期1/2和报名期可私联）
+        const canAct = me.phase === 'register' || me.phase === 'first_pull' || me.phase === 'second_pull';
+        if (!canAct) { App.UI.showNotification('⏰ 当前阶段不可私联'); return; }
+        // 触发条件2：风险值 < 90
+        if ((me.privateContactRisk || 0) >= 90) { App.UI.showNotification('⚠️ 风险值过高(≥90)，暂不可私联'); return; }
+        // 触发条件3：每日冷却限制（每种粉丝类型每天最多N次）
+        if (!me._pcUsedToday) me._pcUsedToday = {};
+        const usedToday = me._pcUsedToday[fanType] || 0;
+        if (usedToday >= (target.dailyLimit || 1)) { App.UI.showNotification('⏳ 今日已私联' + target.name + ' ' + usedToday + ' 次，明日再来'); return; }
+        // 触发条件4：概率触发——70%基础成功率 + 人气加成(每10人气+3%)
+        const baseChance = 0.70;
+        const popBonus = Math.min(0.25, (G.stats.popularity || 0) / 10 * 0.03);
+        const triggerRoll = Math.random();
+        if (triggerRoll > baseChance + popBonus) {
+            me._pcUsedToday[fanType] = usedToday + 1;
+            App.UI.showNotification('😔 ' + target.name + '没有回应你的私联请求...');
+            return;
+        }
+        // ---- 计算票数：基础范围 × 人气加成 × 忠诚度修正 ----
+        const pop = G.stats.popularity || 10;
+        const cats = me.fanbase.categories;
+        const catData = cats[fanType] || cats.soloFan || { loyalty: 50 };
+        const loyaltyMod = (catData.loyalty || 50) / 100; // 0~1
+        const popMod = 1 + pop / 200; // 人气10→1.05x, 人气100→1.5x
+        const rawVotes = Math.floor(Math.random() * (target.votesMax - target.votesMin + 1)) + target.votesMin;
+        const votesGained = Math.floor(rawVotes * popMod * (0.6 + loyaltyMod * 0.4));
+        // ---- 计算财产(wechatBalance)增量：基础财富范围 + 人气权重随机 ----
+        const rawWealth = Math.floor(Math.random() * (target.wealthMax - target.wealthMin + 1)) + target.wealthMin;
+        const wealthGained = Math.floor(rawWealth * (0.8 + Math.random() * 0.4 + pop / 500));
+        // 累加风险
+        me.privateContactRisk = Math.min(100, (me.privateContactRisk || 0) + target.riskAdd);
+        // 被发现概率 = 风险值 × 0.8%
+        const discovered = Math.random() * 100 < (me.privateContactRisk * 0.8);
+        me._pcUsedToday[fanType] = usedToday + 1;
+        const record = {
+            fanId: 'fan_' + Date.now(), fanType: fanType, day: G.game.day,
+            votesGained: discovered ? 0 : votesGained,
+            wealthGained: discovered ? 0 : wealthGained,
+            risk: target.riskAdd, discovered: discovered
+        };
+        me.privateContacts.push(record);
+        if (discovered) {
+            App.UI.showNotification('🚨 私联被发现！风险值 ' + me.privateContactRisk + '%');
+            this._handlePrivateContactDiscovery(record);
+        } else {
+            // 票数记入私联记录（calculateFinalVotes 会汇总）
+            // 财产直接加到 wechatBalance
+            G.stats.wechatBalance = (G.stats.wechatBalance || 0) + wealthGained;
+            App.UI.showNotification(target.emoji + ' 私联成功！+' + votesGained.toLocaleString() + ' 票 · ¥' + wealthGained.toLocaleString() + '（风险 ' + me.privateContactRisk + '%）');
+        }
+    },
+
+    _handlePrivateContactDiscovery: function(record) {
+        const me = G.election;
+        const roll = Math.random() * 100;
+        const cats = me.fanbase.categories;
+        if (roll < 40) {
+            me.privateContactRisk += 10;
+            App.UI.showNotification('⚠️ 轻微：私联粉丝被公司警告，该票作废');
+        } else if (roll < 75) {
+            for (const key of Object.keys(cats)) { cats[key].loyalty = Math.max(0, (cats[key].loyalty || 50) - 5); }
+            cats.casualFan.count = Math.max(0, Math.floor((cats.casualFan.count || 0) * 0.8));
+            App.UI.showNotification('🔥 中度：粉丝圈炸锅！忠诚度-30，散粉流失20%');
+        } else if (roll < 95) {
+            this.triggerCollapse('private_contact');
+        } else {
+            me.finalRank = 999;
+            App.UI.showNotification('🚨 极端：警方介入！直接淘汰总选 + 粉丝-80%');
+            for (const key of Object.keys(cats)) { cats[key].count = Math.max(0, Math.floor(cats[key].count * 0.2)); }
+        }
+    },
+
+    // ----- 塌房危机事件 -----
+    triggerCollapse: function(type) {
+        if (!G.collapseState) {
+            G.collapseState = { triggered: false, type: null, severity: 0, day: 0, publicOpinion: 0, resolved: false, resolution: null, recoveryDays: 0 };
+        }
+        G.collapseState.triggered = true;
+        G.collapseState.type = type;
+        G.collapseState.severity = 70;
+        G.collapseState.day = G.game.day;
+        G.collapseState.publicOpinion = 20;
+        G.collapseState.resolved = false;
+        G.collapseState.recoveryDays = 14;
+        App.UI.showCollapseModal();
+    },
+
+    // ----- 塌房应对选择 -----
+    resolveCollapse: function(choice) {
+        const cs = G.collapseState;
+        if (!cs || cs.resolved) return;
+        cs.resolution = choice;
+        cs.resolved = true;
+        const cats = G.election.fanbase.categories;
+        switch (choice) {
+            case 'press_conference':
+                cs.publicOpinion += 20;
+                App.Store.updateStats({ popularity: -(Math.floor((G.stats.popularity || 0) * 0.25)) });
+                G.stats.scandal = Math.min(100, (G.stats.scandal || 0) + 30);
+                for (const key of Object.keys(cats)) { cats[key].count = Math.max(0, Math.floor(cats[key].count * 0.7)); }
+                App.UI.showNotification('📢 记者会道歉：人气-25%，粉丝流失30%');
+                break;
+            case 'deny':
+                var successRate = 0.4 + (100 - (G.stats.scandal || 0)) / 200;
+                if (Math.random() < successRate) {
+                    App.Store.updateStats({ popularity: 10 });
+                    G.stats.scandal = Math.max(0, (G.stats.scandal || 0) - 20);
+                    App.UI.showNotification('🚫 否认成功！人气+10，丑闻-20');
+                } else {
+                    App.Store.updateStats({ popularity: -(Math.floor((G.stats.popularity || 0) * 0.4)) });
+                    G.stats.scandal = Math.min(100, (G.stats.scandal || 0) + 50);
+                    for (const key of Object.keys(cats)) { cats[key].count = Math.max(0, Math.floor(cats[key].count * 0.5)); }
+                    App.UI.showNotification('🚫 否认失败！人气-40%，粉丝流失50%');
+                }
+                break;
+            case 'weibo_post':
+                var creativity = (G.trainingSkills?.vocal || 10) + (G.stats.skill || 10);
+                if (creativity >= 30) {
+                    cs.publicOpinion += 30;
+                    cats.toxicFan.count = Math.floor((cats.toxicFan.count || 0) * 1.15);
+                    cats.casualFan.count = Math.max(0, Math.floor((cats.casualFan.count || 0) * 0.9));
+                    App.UI.showNotification('🎤 微博长文：舆论+30，毒唯+15%，散粉-10%');
+                } else {
+                    cs.publicOpinion += 10;
+                    App.UI.showNotification('🎤 文字功底不足，长文效果不佳...');
+                }
+                break;
+            case 'company_handle':
+                G.stats.agent_satisfaction = Math.max(0, (G.stats.agent_satisfaction || 50) - 20);
+                if (Math.random() < 0.3) {
+                    cs.publicOpinion += 40;
+                    App.UI.showNotification('💼 公司完美处理！危机解除');
+                } else {
+                    App.Store.updateStats({ popularity: -(Math.floor((G.stats.popularity || 0) * 0.15)) });
+                    App.UI.showNotification('💼 公司处理不力，人气-15%');
+                }
+                break;
+        }
+    },
+
+    // ----- 玩家感言 -----
     setSpeech: function(text) {
         const me = G.election;
         me.speech = (text || '').slice(0, 50);
-        // 影响下月基础
         if (text.includes('感谢粉丝')) {
-            G.memberAffection = G.memberAffection || {};
-            // 所有粉丝基础 +5
-            App.UI.showNotification('下月粉丝基础 +5%');
+            const cats = me.fanbase.categories;
+            for (const key of Object.keys(cats)) { cats[key].loyalty = Math.min(100, (cats[key].loyalty || 50) + 3); }
+            App.UI.showNotification('💖 全体粉丝忠诚度+3');
         } else if (text.includes('神七')) {
             me.nextMonthGoal = 'top7';
             App.UI.showNotification('🎯 你向粉丝立下了神七宣言!');
         } else if (text.includes('感谢队友')) {
-            for (const p of me.promoters) {
-                if (G.memberAffection[p] !== undefined) {
-                    G.memberAffection[p] = Math.min(100, G.memberAffection[p] + 30);
-                }
+            const teammates = App.getTeamMates?.(G.player.group, G.player.team) || [];
+            for (const m of teammates.slice(0, 5)) {
+                if (G.memberAffection[m.name] !== undefined) { G.memberAffection[m.name] = Math.min(100, G.memberAffection[m.name] + 10); }
             }
-            App.UI.showNotification('应援对象好感度 +30');
+            App.UI.showNotification('队友好感度+10');
         }
     },
-    // 玩家花鸡腿买拉票活动
+
+    // ----- 玩家花鸡腿买拉票活动（仅初报/终报开放） -----
     buyActivity: function(actId) {
         const me = G.election;
+        const dim2 = G.game.day % 30 || 30;
+        if (dim2 < 10 || dim2 >= 30) {
+            App.UI.showNotification('⏳ 拉票活动仅初报日（Day10）起开放');
+            return;
+        }
         const def = this.activities.find(x => x.id === actId);
         if (!def) return;
-        if ((G.stats.drumstick || 0) < def.cost) {
-            App.UI.showNotification('🍗 鸡腿不足!');
-            return;
-        }
+        if ((G.stats.drumstick || 0) < def.cost) { App.UI.showNotification('🍗 鸡腿不足!'); return; }
         App.Store.updateStats({ drumstick: -def.cost });
-        // 记录使用
         const used = me.activitiesUsed.find(a => a.id === actId);
-        if (used) used.count++;
-        else me.activitiesUsed.push({ id: actId, count: 1 });
-        // 黑公关: 立即攻击一个竞敌
-        if (def.hostile) {
-            this._darkOps(def);
-        } else {
-            App.UI.showNotification(`📣 ${def.name} 完成!票数 +${def.votes}`);
+        if (used) used.count++; else me.activitiesUsed.push({ id: actId, count: 1 });
+        if (def.hostile) { this._darkOps(def); } else {
+            const multiplier = this.getActivityMultiplier(me.phase);
+            const actualVotes = Math.floor(def.votes * multiplier);
+            const cats = me.fanbase.categories;
+            if (actId === 'signing' || actId === 'concert') {
+                cats.soloKing.loyalty = Math.min(100, (cats.soloKing.loyalty || 50) + 2);
+                cats.fanHead.loyalty = Math.min(100, (cats.fanHead.loyalty || 50) + 3);
+            }
+            if (actId === 'sns' || actId === 'media') {
+                cats.casualFan.count = (cats.casualFan.count || 0) + Math.floor(Math.random() * 50 + 20);
+            }
+            App.UI.showNotification('📣 ' + def.name + ' 完成!票数 +' + actualVotes.toLocaleString());
         }
-        // 风险: 高投入增加黑料概率
         const investTotal = me.activitiesUsed.reduce((s,a)=>s + (this.activities.find(x=>x.id===a.id)?.cost||0) * a.count, 0);
-        if (Math.random() < def.risk && investTotal > 500) {
-            this._triggerControversy({ name: '黑粉' });
-        }
+        if (Math.random() < def.risk && investTotal > 500) { this._triggerControversy({ name: '黑粉' }); }
     },
+
     _darkOps: function(def) {
         const me = G.election;
+        me.darkOpsUsed = (me.darkOpsUsed || 0) + 1;
         if (Math.random() < def.risk) {
-            // 暴露
+            me.darkOpsCaught = true;
             this._triggerControversy({ name: '警方' });
-            App.UI.showNotification(`🕵️ 黑公关暴露!反噬 -30% 票`);
+            App.UI.showNotification('🕵️ 黑公关暴露!反噬 -25% 粉丝票');
         } else {
             const target = me.rivals?.[0];
-            if (target) {
-                target.votes = Math.floor(target.votes * 0.7);
-                App.UI.showNotification(`🕵️ ${target.name} 票数 -30%!`);
-            }
+            if (target) { target.votes = Math.floor(target.votes * 0.7); App.UI.showNotification('🕵️ ' + target.name + ' 票数 -30%!'); }
         }
     },
-    // 选择"我推的成员"（玩家=推手/粉丝，名单是应援的成员）
-    setPromoter: function(name) {
+
+    // ----- 玩家处理竞敌私联 -----
+    handleRivalPrivateContact: function(index, action) {
         const me = G.election;
-        if (me.phase !== 'register' && me.phase !== 'first_pull') {
-            App.UI.showNotification('⏰ 只能在报名期/初报前选我推的成员');
-            return;
-        }
-        if (me.promoters.includes(name)) {
-            me.promoters = me.promoters.filter(n => n !== name);
-            App.UI.showNotification(`已取消推 ${name}`);
+        const rpc = (me.rivalPrivateContacts || [])[index];
+        if (!rpc || rpc.handled) return;
+        rpc.handled = true;
+        if (action === 'report') {
+            const rival = me.rivals.find(r => r.name === rpc.rivalName);
+            if (rival) rival.votes = Math.floor(rival.votes * 0.85);
+            App.UI.showNotification('📤 举报 ' + rpc.rivalName + ' 私联！对手票数-15%');
         } else {
-            if (me.promoters.length >= 3) {
-                App.UI.showNotification('最多推 3 名成员');
-                return;
-            }
-            me.promoters.push(name);
-            App.UI.showNotification(`💖 已推 ${name}`);
+            App.UI.showNotification('🤫 选择沉默...');
         }
     },
-    // 推进三报(初报/中报/最终)
+
+    // ----- 三报推进 -----
     doReport: function(type) {
         const me = G.election;
         if (type === 'first' && me.phase !== 'first_report') return;
         if (type === 'second' && me.phase !== 'second_report') return;
         if (type === 'final' && me.phase !== 'final_report') return;
         const votes = this.calculateFinalVotes();
-        // 生成所有候选人票数
         const all = App.getAllMembers().filter(m => !m.graduate);
-        const rankings = all.map(m => ({
-            name: m.name, group: m.group, team: m.team,
-            votes: Math.floor(votes * (0.5 + Math.random()) + Math.random() * 8000),
-        }));
+        const rankings = all.map(m => ({ name: m.name, group: m.group, team: m.team, votes: Math.floor(votes * (0.5 + Math.random()) + Math.random() * 8000) }));
         rankings.push({ name:G.player.name, votes: votes, isPlayer:true });
         rankings.sort((a,b) => b.votes - a.votes);
         const myRank = rankings.findIndex(r => r.name === G.player.name) + 1;
         me.predictedRank = myRank;
         G.game.rank = myRank;
-        // 写入历史(仅最终)
+        me.reportsShown = me.reportsShown || [];
+        me.reportsShown.push(type);
+        if (type === 'first') { me.firstReportVotes = votes; me.firstReportRank = myRank; me.phase = 'first_pull'; }
+        if (type === 'second') { me.secondReportVotes = votes; me.secondReportRank = myRank; me.phase = 'second_pull'; }
         if (type === 'final') {
-            me.history.push({ month:me.month, rank:myRank, votes, top7:myRank <= 7 });
+            me.finalRank = myRank;
+            me.isKami7 = myRank <= 7;
+            me.history.push({ month:me.month, rank:myRank, votes:votes, isKami7:myRank<=7, fanbase:JSON.parse(JSON.stringify(me.fanbase)) });
+            me.phase = 'finalized';
+            if (myRank <= 7) {
+                App.Store.updateStats({ popularity: 50 });
+                G.stats.drumstick = (G.stats.drumstick || 0) + 5000;
+                if (myRank === 1) { App.UI.showNotification('👑 Center！鸟巢演唱会 + 全年通告费×1.5'); }
+                else { App.UI.showNotification('🏆 神七第' + myRank + '名！人气+50 / 鸡腿+5000'); }
+            }
         }
-        // 阶段切换
-        if (type === 'first') me.phase = 'first_pull';
-        else if (type === 'second') me.phase = 'second_pull';
-        else if (type === 'final') me.phase = 'finalized';
-        return { rankings, myRank, votes };
+        return { rankings, myRank, votes, fanbase: me.fanbase, isKami7: me.isKami7 };
     },
 };
 
@@ -2589,6 +2818,974 @@ App.Training = {
     }
 };
 
+// ============ 伤病系统 App.Health ============
+App.Health = {
+    // 6种伤病类型定义
+    injuryTypes: [
+        { id:'sprain',      name:'扭伤',       emoji:'🦶', severity:1, bodyPenalty:20, mentalPenalty:5,  recoveryDays:3,  desc:'关节扭伤，行动不便' },
+        { id:'cold',        name:'感冒',       emoji:'🤧', severity:1, bodyPenalty:15, mentalPenalty:10, recoveryDays:2,  desc:'鼻塞流涕，头昏脑涨' },
+        { id:'voice_loss',  name:'失声',       emoji:'🔇', severity:2, bodyPenalty:5,  mentalPenalty:15, recoveryDays:3,  desc:'嗓子沙哑，无法发声' },
+        { id:'back_injury', name:'腰伤',       emoji:'🦴', severity:2, bodyPenalty:25, mentalPenalty:8,  recoveryDays:5,  desc:'腰部疼痛，影响舞蹈' },
+        { id:'mental_break',name:'心理崩溃',   emoji:'🧠', severity:3, bodyPenalty:10, mentalPenalty:30, recoveryDays:4,  desc:'精神崩溃，无法集中' },
+        { id:'food_poison', name:'食物中毒',   emoji:'🤮', severity:2, bodyPenalty:30, mentalPenalty:10, recoveryDays:3,  desc:'呕吐腹泻，体力骤降' }
+    ],
+
+    // 微信关心消息池（按伤病类型）
+    caringMessages: {
+        sprain:      ['听说你扭伤了！要注意休息啊🥺', '伤筋动骨一百天，别硬撑！', '记得冰敷！我查了说24小时内冰敷最有效🧊', '我给你炖了骨头汤，等会儿送来！🥣', '心疼！舞台上的你那么拼命，但身体更重要💪'],
+        cold:        ['感冒了要多喝热水！💧', '给你买了感冒药，记得按时吃💊', '外面降温了，加件衣服再出门🧥', '好好休息，粉丝会等你的❤️', '生病就别训练了！健康第一！'],
+        voice_loss:  ['嗓子不舒服千万别说话！🤐', '我泡了蜂蜜水给你润喉🍯', '别逞强上台了，嗓子比什么都重要！', '含片薄荷糖试试？听说对嗓子好🌿', '休息几天吧，声音会回来的✨'],
+        back_injury: ['腰伤可不能忽视！要去看医生🏥', '我帮你查了腰部康复操，等你好了带你做', '趴着休息对腰好，别坐着了！', '天哪腰伤很严重啊，一定要好好治！', '康复训练慢慢来，别着急复出💪'],
+        mental_break:['不管发生什么，我们都在你身边🤗', '难过就哭出来，没人会笑话你的', '今天什么都不做也没关系，就好好休息', '给你寄了最喜欢的零食，希望能让你开心一点🎁', '你不是一个人，我们永远支持你❤️'],
+        food_poison: ['中毒了？！快去医院！🚑', '我查了下食物中毒要注意补水！', '别吃外面的东西了，我给你做安全卫生的饭！', '吐完了记得喝点淡盐水补充电解质🧂', '好好休息，肠胃恢复要时间的🛌']
+    },
+
+    // 初始化伤病状态
+    init() {
+        if (!G.health) {
+            G.health = {
+                currentInjuries: [],   // [{type, severity, daysLeft, worsened, dayTriggered}]
+                inRecovery: false,     // 是否在康复中心
+                recoveryDaysLeft: 0,   // 康复中心剩余天数
+                totalInjuryCount: 0,   // 累计伤病次数
+                history: []            // [{type, dayTriggered, dayRecovered, worsenedCount}]
+            };
+        }
+    },
+
+    // 伤病触发概率计算：疲劳/200 + (100-体力)/400 + (100-精神)/400
+    calcInjuryProbability() {
+        const fatigue = G.fatigue || 0;
+        const physical = G.physical || 80;
+        const mental = G.mental || 75;
+        const prob = fatigue / 200 + (100 - physical) / 400 + (100 - mental) / 400;
+        return Math.min(prob, 0.8); // 上限80%
+    },
+
+    // 每日伤病检测（在 advanceDay 中调用）
+    dailyCheck() {
+        this.init();
+        // 已有伤病时不叠加新伤病（但可能加重）
+        if (G.health.currentInjuries.length > 0) {
+            this._processExistingInjuries();
+            return null;
+        }
+        const prob = this.calcInjuryProbability();
+        if (Math.random() < prob) {
+            return this._triggerNewInjury();
+        }
+        return null;
+    },
+
+    // 触发新伤病
+    _triggerNewInjury() {
+        // 根据疲劳/体力偏向选择伤病类型
+        const fatigue = G.fatigue || 0;
+        const physical = G.physical || 80;
+        const mental = G.mental || 75;
+
+        // 权重分配：体力低→扭伤/腰伤/食物中毒；精神低→感冒/失声/心理崩溃；疲劳高→各类型概率上升
+        const weights = this.injuryTypes.map(t => {
+            let w = 1;
+            if (physical < 40 && (t.id === 'sprain' || t.id === 'back_injury' || t.id === 'food_poison')) w += 3;
+            if (mental < 40 && (t.id === 'mental_break' || t.id === 'voice_loss' || t.id === 'cold')) w += 3;
+            if (fatigue > 70) w += 2;
+            if (t.severity === 3) w *= 0.5; // 心理崩溃概率较低
+            return w;
+        });
+
+        const totalWeight = weights.reduce((a, b) => a + b, 0);
+        let rand = Math.random() * totalWeight;
+        let chosenType;
+        for (let i = 0; i < weights.length; i++) {
+            rand -= weights[i];
+            if (rand <= 0) { chosenType = this.injuryTypes[i]; break; }
+        }
+        if (!chosenType) chosenType = this.injuryTypes[0];
+
+        const injury = {
+            type: chosenType.id,
+            name: chosenType.name,
+            emoji: chosenType.emoji,
+            severity: chosenType.severity,
+            bodyPenalty: chosenType.bodyPenalty,
+            mentalPenalty: chosenType.mentalPenalty,
+            desc: chosenType.desc,
+            daysLeft: chosenType.recoveryDays,
+            worsened: false,
+            worsenedCount: 0,
+            dayTriggered: G.game.day
+        };
+
+        G.health.currentInjuries.push(injury);
+        G.health.totalInjuryCount++;
+
+        // 立即扣减体力/精神
+        G.physical = Math.max(0, (G.physical || 80) - chosenType.bodyPenalty);
+        G.mental = Math.max(0, (G.mental || 75) - chosenType.mentalPenalty);
+
+        // 发送微信关心消息
+        this._sendCaringMessages(chosenType.id);
+
+        return injury;
+    },
+
+    // 处理已有伤病（每日恢复推进）
+    _processExistingInjuries() {
+        // 高好感队友探望：好感>60的队友数量影响精神恢复
+        const caringTeammates = Object.values(G.memberAffection || {}).filter(a => a > 60).length;
+        const teammateCareBonus = Math.min(caringTeammates, 5); // 最多5人效果
+        if (teammateCareBonus > 0 && G.mental !== undefined) {
+            G.mental = Math.min(100, G.mental + teammateCareBonus); // 精神恢复
+            if (teammateCareBonus >= 3) {
+                G.stats.drumstick = (G.stats.drumstick || 0) + teammateCareBonus * 5; // 队友送鸡腿
+            }
+        }
+
+        G.health.currentInjuries.forEach(injury => {
+            if (G.health.inRecovery) {
+                // 康复中心加速恢复：每天恢复2天进度
+                injury.daysLeft -= 2;
+            } else {
+                // 自然恢复：每天1天
+                injury.daysLeft -= 1;
+            }
+        });
+
+        // 检查已恢复的伤病
+        const recovered = G.health.currentInjuries.filter(i => i.daysLeft <= 0);
+        recovered.forEach(i => {
+            G.health.history.push({
+                type: i.type,
+                dayTriggered: i.dayTriggered,
+                dayRecovered: G.game.day,
+                worsenedCount: i.worsenedCount
+            });
+        });
+        G.health.currentInjuries = G.health.currentInjuries.filter(i => i.daysLeft > 0);
+
+        // 如果在康复中心，推进天数
+        if (G.health.inRecovery) {
+            G.health.recoveryDaysLeft--;
+            if (G.health.recoveryDaysLeft <= 0 || G.health.currentInjuries.length === 0) {
+                G.health.inRecovery = false;
+                G.health.recoveryDaysLeft = 0;
+            }
+        }
+    },
+
+    // 选择"带伤上场"
+    performWithInjury() {
+        this.init();
+        if (G.health.currentInjuries.length === 0) return { success: true, msg: '当前没有伤病' };
+
+        const injury = G.health.currentInjuries[0];
+        // 加重伤病
+        injury.worsened = true;
+        injury.worsenedCount++;
+        injury.daysLeft += 1; // 延长恢复1天
+        injury.severity = Math.min(3, injury.severity + (injury.worsenedCount >= 3 ? 1 : 0));
+        // 额外扣减体力精神
+        G.physical = Math.max(0, G.physical - 8);
+        G.mental = Math.max(0, G.mental - 5);
+
+        // 带伤上场仍有活动效果，但打折
+        const efficiency = Math.max(0.3, 1 - injury.severity * 0.2);
+
+        return {
+            success: true,
+            efficiency,
+            injury,
+            msg: `带${injury.name}上场！效果${Math.round(efficiency*100)}%，伤病加重！`
+        };
+    },
+
+    // 选择"进入康复中心"
+    enterRecoveryCenter() {
+        this.init();
+        if (G.health.currentInjuries.length === 0) return { blocked: true, reason: '当前没有伤病需要治疗' };
+
+        // 消耗鸡腿：200/天 × 预估恢复天数
+        const maxDays = Math.max(...G.health.currentInjuries.map(i => i.daysLeft));
+        const totalCost = 200 * maxDays;
+        if ((G.stats.drumstick || 0) < 200) {
+            return { blocked: true, reason: `鸡腿不足！康复中心需要200鸡腿/天`, need: 200 };
+        }
+
+        // 先扣除一天的费用
+        App.Store.updateStats({ drumstick: -200 });
+        G.health.inRecovery = true;
+        G.health.recoveryDaysLeft = maxDays;
+
+        return {
+            success: true,
+            costPerDay: 200,
+            totalEstimate: totalCost,
+            msg: `进入康复中心！每天消耗200鸡腿，恢复速度×2`
+        };
+    },
+
+    // 继续支付康复中心费用（每日扣鸡腿）
+    payRecoveryCenterDaily() {
+        this.init();
+        if (!G.health.inRecovery) return null;
+        if (G.health.currentInjuries.length === 0) {
+            G.health.inRecovery = false;
+            return { done: true };
+        }
+        if ((G.stats.drumstick || 0) < 200) {
+            // 鸡腿不足，自动退出康复中心
+            G.health.inRecovery = false;
+            return { insufficient: true, msg: '鸡腿不足200，已退出康复中心，恢复速度恢复正常' };
+        }
+        App.Store.updateStats({ drumstick: -200 });
+        return { paid: true, cost: 200 };
+    },
+
+    // 发送微信关心消息
+    _sendCaringMessages(injuryTypeId) {
+        const messages = this.caringMessages[injuryTypeId] || this.caringMessages.cold;
+        if (!G.chatHistory) return;
+
+        const grp = App.NPCData[G.player.group];
+        if (!grp) return;
+
+        // 从队友和经纪人中选2-3人发关心消息
+        const candidates = [];
+        if (grp.agent) candidates.push(grp.agent.name);
+        if (grp.core) grp.core.forEach(c => candidates.push(c.name));
+        const myTeam = grp.teams?.[G.player.team];
+        if (myTeam) myTeam.forEach(n => { if (!candidates.includes(n)) candidates.push(n); });
+
+        const chosen = candidates.sort(() => Math.random() - 0.5).slice(0, Math.min(3, candidates.length));
+        const msgPool = messages.slice().sort(() => Math.random() - 0.5);
+        const injuryName = this.injuryTypes.find(t => t.id === injuryTypeId)?.name || '伤病';
+
+        chosen.forEach((name, i) => {
+            if (!G.chatHistory[name]) {
+                G.chatHistory[name] = { type: 'member', avatar: '👤', messages: [] };
+            }
+            const text = i < msgPool.length ? msgPool[i] : pick(messages);
+            G.chatHistory[name].messages.push({ from: 'npc', text, time: getTimeStr() });
+        });
+
+        // 工作组群也发消息
+        if (G.chatHistory['📋工作组']) {
+            const agentName = grp.agent?.name || '经纪人';
+            G.chatHistory['📋工作组'].messages.push({
+                from: 'npc',
+                text: `${agentName}：听说你${injuryName}了，先暂停所有通告安排，好好休息！`,
+                time: getTimeStr()
+            });
+        }
+    },
+
+    // 检查当前是否有伤病（供训练/公演模块调用）
+    hasInjury() {
+        this.init();
+        return G.health.currentInjuries.length > 0;
+    },
+
+    // 获取当前伤病效率折扣（供训练/公演计算用）
+    getEfficiencyModifier() {
+        this.init();
+        if (G.health.currentInjuries.length === 0) return 1.0;
+        const worst = G.health.currentInjuries.reduce((a, b) => a.severity > b.severity ? a : b);
+        return Math.max(0.3, 1 - worst.severity * 0.2);
+    },
+
+    // 获取伤病描述摘要
+    getInjurySummary() {
+        this.init();
+        if (G.health.currentInjuries.length === 0) return null;
+        const injury = G.health.currentInjuries[0];
+        return {
+            name: injury.name,
+            emoji: injury.emoji,
+            desc: injury.desc,
+            severity: injury.severity,
+            daysLeft: injury.daysLeft,
+            worsened: injury.worsened,
+            worsenedCount: injury.worsenedCount
+        };
+    }
+};
+
+// ============ 外务/综艺通告系统 App.Variety ============
+// ==================== 恋爱支线系统 ====================
+App.Romance = {
+    // --- 关系阶段 ---
+    stages: [
+        { id:'stranger',  name:'陌生人', emoji:'👋', minAff:0,  threshold:0 },
+        { id:'friend',    name:'朋友',   emoji:'😊', minAff:30, threshold:30 },
+        { id:'ambiguous', name:'暧昧',   emoji:'💫', minAff:55, threshold:55 },
+        { id:'confidant', name:'知己',   emoji:'💎', minAff:75, threshold:75 },
+        { id:'lover',     name:'恋人',   emoji:'💕', minAff:90, threshold:90 },
+    ],
+
+    // --- 公开状态 ---
+    publicStatuses: [
+        { id:'secret',  name:'秘密', emoji:'🤫',  scandalRisk:0 },
+        { id:'rumor',   name:'传闻', emoji:'🗣️',  scandalRisk:0.15 },
+        { id:'public',  name:'公开', emoji:'💍',  scandalRisk:0.35 },
+        { id:'broken',  name:'分手BE', emoji:'💔', scandalRisk:0 },
+    ],
+
+    // --- 6种约会类型 ---
+    dateTypes: [
+        { id:'cafe',     name:'咖啡馆闲聊',   emoji:'☕', cost:100,  affGain:5,  fatigueCost:5,  moodGain:8,  minStage:'friend',     desc:'在安静的咖啡馆里，时间仿佛慢了下来', payBy:'wechat' },
+        { id:'walk',     name:'公园散步',     emoji:'🌳', cost:0,    affGain:4,  fatigueCost:8,  moodGain:6,  minStage:'friend',     desc:'并肩走过林荫道，偶尔肩膀轻轻碰触', payBy:'wechat' },
+        { id:'movie',    name:'电影之夜',     emoji:'🎬', cost:200,  affGain:6,  fatigueCost:3,  moodGain:10, minStage:'ambiguous',  desc:'黑暗中，爆米花桶旁的手指不经意相触', payBy:'wechat' },
+        { id:'dinner',   name:'烛光晚餐',     emoji:'🕯️', cost:500,  affGain:8,  fatigueCost:5,  moodGain:15, minStage:'ambiguous',  desc:'摇曳烛光映衬着彼此的眼眸', payBy:'wechat' },
+        { id:'amusement',name:'游乐园约会',   emoji:'🎡', cost:800,  affGain:10, fatigueCost:15, moodGain:20, minStage:'confidant',  desc:'过山车上的尖叫声，摩天轮上的悄悄话', payBy:'wechat' },
+        { id:'travel',   name:'周末旅行',     emoji:'✈️', cost:2000, affGain:15, fatigueCost:20, moodGain:25, minStage:'confidant',  desc:'陌生的城市里，只有彼此是最熟悉的依靠', payBy:'wechat' },
+    ],
+
+    // --- 6种危机类型 ---
+    crisisTypes: [
+        { id:'paparazzi',  name:'狗仔偷拍',   emoji:'📸', minPublicStatus:'rumor',   baseChance:0.12, desc:'偷拍的镜头正在暗处闪烁...' },
+        { id:'fan_oppose', name:'粉丝反对',   emoji:'😤', minPublicStatus:'public',  baseChance:0.15, desc:'饭圈的怒火正在蔓延...' },
+        { id:'third_party',name:'第三者出现', emoji:'👀', minPublicStatus:'secret',  baseChance:0.08, desc:'一个不速之客出现在你们之间...' },
+        { id:'breakup',    name:'感情危机',   emoji:'💔', minPublicStatus:'secret',  baseChance:0.06, desc:'感情出现了裂痕...' },
+        { id:'leak',       name:'聊天记录泄露', emoji:'📱', minPublicStatus:'secret', baseChance:0.10, desc:'私密对话被公之于众...' },
+        { id:'scandal',    name:'绯闻爆发',   emoji:'📰', minPublicStatus:'rumor',   baseChance:0.10, desc:'媒体的大标题刺眼无比...' },
+    ],
+
+    // --- 初始化 ---
+    init() {
+        if (!G.romance) {
+            G.romance = { relationships:{}, cooldown:0, crisisLog:[], dateHistory:[] };
+        }
+    },
+
+    // --- 获取关系阶段 ---
+    getStage(aff) {
+        const stages = this.stages;
+        for (let i = stages.length - 1; i >= 0; i--) {
+            if (aff >= stages[i].threshold) return stages[i];
+        }
+        return stages[0];
+    },
+
+    getStageIndex(aff) {
+        const stages = this.stages;
+        for (let i = stages.length - 1; i >= 0; i--) {
+            if (aff >= stages[i].threshold) return i;
+        }
+        return 0;
+    },
+
+    // --- 获取与某成员的恋爱关系 ---
+    getRelationship(name) {
+        this.init();
+        return G.romance.relationships[name] || null;
+    },
+
+    // --- 获取所有活跃关系 ---
+    getActiveRelationships() {
+        this.init();
+        return Object.entries(G.romance.relationships).filter(([_, r]) => r.publicStatus !== 'broken');
+    },
+
+    // --- 获取恋人列表 ---
+    getLovers() {
+        this.init();
+        return Object.entries(G.romance.relationships).filter(([_, r]) => r.stage === 'lover' && r.publicStatus !== 'broken');
+    },
+
+    // --- 表白 ---
+    confess(name) {
+        this.init();
+        const aff = G.memberAffection[name] || 50;
+        const currentStage = this.getStage(aff);
+        const stageIdx = this.getStageIndex(aff);
+
+        // 至少需要暧昧阶段才能表白
+        if (stageIdx < 2) {
+            return { success:false, msg:`你们还只是「${currentStage.name}」，至少需要达到「暧昧」才能表白哦` };
+        }
+
+        // 已经有关系了
+        const existing = this.getRelationship(name);
+        if (existing) {
+            if (existing.stage === 'lover') return { success:false, msg:`你们已经是恋人了💕` };
+            if (existing.publicStatus === 'broken') return { success:false, msg:`已经分手了，或许还有重新开始的机会...` };
+            return { success:false, msg:`你们已经在${this.stages.find(s=>s.id===existing.stage)?.name||existing.stage}阶段了` };
+        }
+
+        // 好感度判定
+        const successRate = Math.min(0.95, (aff - 50) / 50); // 50→0%, 75→50%, 100→95%
+        const roll = Math.random();
+
+        if (roll < successRate) {
+            // 表白成功
+            G.romance.relationships[name] = {
+                stage: 'lover',
+                publicStatus: 'secret',
+                sinceDay: G.game.day,
+                lastDate: 0,
+                happiness: 80,
+                datesCount: 0,
+                crisesCount: 0,
+            };
+            G.memberAffection[name] = Math.min(100, aff + 10);
+            App.Store.recalcAffection();
+            return { success:true, msg:`${name}接受了你的表白！💕 你们成为了恋人！` };
+        } else {
+            // 表白失败
+            const failPenalty = Math.floor(Math.random() * 10) + 5;
+            G.memberAffection[name] = Math.max(0, aff - failPenalty);
+            App.Store.recalcAffection();
+            return { success:false, msg:`${name}犹豫了一下，轻轻摇了摇头...「对不起，我还没有准备好」好感度-${failPenalty}` };
+        }
+    },
+
+    // --- 发起约会 ---
+    goDate(name, dateTypeId) {
+        this.init();
+        const rel = this.getRelationship(name);
+        if (!rel) return { success:false, msg:'还没有恋爱关系，无法约会' };
+        if (rel.publicStatus === 'broken') return { success:false, msg:'已经分手了...' };
+        if (G.romance.cooldown > 0) return { success:false, msg:`约会冷却中，还需等待${G.romance.cooldown}天` };
+
+        const dateType = this.dateTypes.find(d => d.id === dateTypeId);
+        if (!dateType) return { success:false, msg:'无效的约会类型' };
+
+        // 检查阶段要求
+        const stageIdx = this.getStageIndex(G.memberAffection[name] || 50);
+        const reqIdx = this.stages.findIndex(s => s.id === dateType.minStage);
+        if (stageIdx < reqIdx) {
+            return { success:false, msg:`需要达到「${this.stages[reqIdx].name}」阶段才能${dateType.name}` };
+        }
+
+        // 扣微信余额
+        if (dateType.cost > 0 && (G.stats.wechatBalance || 0) < dateType.cost) {
+            return { success:false, msg:`微信余额不足！需要¥${dateType.cost}` };
+        }
+
+        // 执行约会
+        if (dateType.cost > 0) G.stats.wechatBalance -= dateType.cost;
+        G.memberAffection[name] = Math.min(100, (G.memberAffection[name] || 50) + dateType.affGain);
+        G.fatigue = Math.min(100, (G.fatigue || 0) + dateType.fatigueCost);
+        G.stats.mood = Math.min(100, G.stats.mood + dateType.moodGain);
+        rel.lastDate = G.game.day;
+        rel.datesCount = (rel.datesCount || 0) + 1;
+        rel.happiness = Math.min(100, (rel.happiness || 50) + 10);
+        G.romance.cooldown = 2; // 2天冷却
+        G.romance.dateHistory.push({ name, type:dateTypeId, day:G.game.day });
+
+        // 约会中随机事件
+        let bonus = '';
+        const eventRoll = Math.random();
+        if (eventRoll < 0.15) {
+            bonus = '\n🌟 约会中偶遇粉丝合照，人气+5！';
+            G.stats.popularity = Math.min(100, G.stats.popularity + 5);
+        } else if (eventRoll < 0.25 && rel.publicStatus === 'secret') {
+            bonus = '\n⚠️ 好像有人在远处拍照...';
+            rel.publicStatus = 'rumor';
+        }
+
+        App.Store.recalcAffection();
+        return { success:true, msg:`${dateType.emoji} ${dateType.name}成功！好感+${dateType.affGain} 心情+${dateType.moodGain}${bonus}` };
+    },
+
+    // --- 推进关系阶段 ---
+    advanceRelationships() {
+        this.init();
+        const entries = this.getActiveRelationships();
+        entries.forEach(([name, rel]) => {
+            if (rel.publicStatus === 'broken') return;
+            const aff = G.memberAffection[name] || 50;
+            const newStageIdx = this.getStageIndex(aff);
+            const currentStageObj = this.stages.find(s => s.id === rel.stage);
+            const currentIdx = currentStageObj ? this.stages.indexOf(currentStageObj) : 0;
+            if (newStageIdx > currentIdx) {
+                rel.stage = this.stages[newStageIdx].id;
+                App.UI.showNotification(`💕 与${name}的关系升华为「${this.stages[newStageIdx].name}」！`, 4000);
+            }
+            // 幸福度衰减
+            if (G.game.day - rel.lastDate > 5) {
+                rel.happiness = Math.max(20, (rel.happiness || 50) - 3);
+            }
+        });
+    },
+
+    // --- 每日危机检测 ---
+    dailyCrisisCheck() {
+        this.init();
+        const entries = this.getActiveRelationships();
+        entries.forEach(([name, rel]) => {
+            if (rel.publicStatus === 'broken') return;
+
+            const pubStatusObj = this.publicStatuses.find(p => p.id === rel.publicStatus);
+            const baseRisk = pubStatusObj ? pubStatusObj.scandalRisk : 0;
+            // 多人关系增加被发现风险
+            const multiPenalty = entries.length > 1 ? 0.1 * (entries.length - 1) : 0;
+            // 幸福度低增加危机风险
+            const unhappyPenalty = (rel.happiness || 50) < 40 ? 0.1 : 0;
+            const totalRisk = Math.min(0.8, baseRisk + multiPenalty + unhappyPenalty);
+
+            if (Math.random() < totalRisk) {
+                this.triggerCrisis(name, rel);
+            }
+        });
+
+        // 冷却递减
+        if (G.romance.cooldown > 0) G.romance.cooldown--;
+    },
+
+    // --- 触发危机 ---
+    triggerCrisis(name, rel) {
+        // 筛选可触发的危机
+        const eligible = this.crisisTypes.filter(c => {
+            const reqIdx = this.publicStatuses.findIndex(p => p.id === c.minPublicStatus);
+            const curIdx = this.publicStatuses.findIndex(p => p.id === rel.publicStatus);
+            return curIdx >= reqIdx;
+        });
+        if (eligible.length === 0) return;
+
+        const crisis = eligible[Math.floor(Math.random() * eligible.length)];
+        rel.crisesCount = (rel.crisesCount || 0) + 1;
+        G.romance.crisisLog.push({ name, type:crisis.id, day:G.game.day });
+
+        // 危机效果
+        let effect = '';
+        switch(crisis.id) {
+            case 'paparazzi':
+                if (rel.publicStatus === 'secret') {
+                    rel.publicStatus = 'rumor';
+                    effect = '关系从「秘密」变为「传闻」！';
+                }
+                G.stats.scandal = Math.min(100, G.stats.scandal + 15);
+                effect += ' 丑闻+15';
+                break;
+            case 'fan_oppose':
+                G.stats.popularity = Math.max(0, G.stats.popularity - 10);
+                G.stats.mood = Math.max(0, G.stats.mood - 15);
+                effect = '人气-10 心情-15';
+                break;
+            case 'third_party':
+                rel.happiness = Math.max(0, (rel.happiness || 50) - 20);
+                G.memberAffection[name] = Math.max(0, (G.memberAffection[name] || 50) - 8);
+                effect = '幸福度-20 好感-8';
+                break;
+            case 'breakup':
+                if ((rel.happiness || 50) < 30) {
+                    rel.publicStatus = 'broken';
+                    effect = `💔 与${name}分手了...`;
+                } else {
+                    rel.happiness = Math.max(0, (rel.happiness || 50) - 15);
+                    effect = '幸福度-15，关系岌岌可危！';
+                }
+                break;
+            case 'leak':
+                rel.publicStatus = 'public';
+                G.stats.scandal = Math.min(100, G.stats.scandal + 20);
+                effect = '关系被公开！丑闻+20';
+                break;
+            case 'scandal':
+                G.stats.scandal = Math.min(100, G.stats.scandal + 25);
+                G.stats.popularity = Math.max(0, G.stats.popularity - 15);
+                effect = '丑闻+25 人气-15';
+                break;
+        }
+
+        App.Store.recalcAffection();
+
+        // 弹出危机事件
+        setTimeout(() => {
+            App.Romance.showCrisisModal(name, crisis, effect);
+        }, 500);
+    },
+
+    // --- 危机弹窗 ---
+    showCrisisModal(name, crisis, effect) {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:2000';
+        overlay.innerHTML = `<div style="background:linear-gradient(135deg,#fff5f5,#ffe0e0);border-radius:16px;padding:24px;margin:20px;text-align:center;max-width:300px">
+            <div style="font-size:48px;margin-bottom:8px">${crisis.emoji}</div>
+            <div style="font-size:18px;font-weight:600;color:#c0392b;margin-bottom:8px">${crisis.name}</div>
+            <div style="font-size:13px;color:#666;margin-bottom:12px">${crisis.desc}</div>
+            <div style="font-size:12px;color:#e74c3c;background:#fff0f0;border-radius:8px;padding:8px;margin-bottom:16px">${effect}</div>
+            <button style="width:100%;padding:10px;border:none;background:#e74c3c;color:#fff;border-radius:8px;font-size:14px;cursor:pointer" onclick="this.closest('.modal-overlay').remove()">我知道了</button>
+        </div>`;
+        document.querySelector('.phone-screen').appendChild(overlay);
+    },
+
+    // --- 分手 ---
+    breakUp(name) {
+        this.init();
+        const rel = this.getRelationship(name);
+        if (!rel) return { success:false, msg:'没有恋爱关系' };
+        if (rel.publicStatus === 'broken') return { success:false, msg:'已经分手了' };
+
+        rel.publicStatus = 'broken';
+        rel.stage = 'friend';
+        const aff = G.memberAffection[name] || 50;
+        G.memberAffection[name] = Math.max(0, aff - 20);
+        G.stats.mood = Math.max(0, G.stats.mood - 20);
+        App.Store.recalcAffection();
+        return { success:true, msg:`💔 与${name}分手了...心情-20 好感-20` };
+    },
+
+    // --- 复合 ---
+    reconcile(name) {
+        this.init();
+        const rel = this.getRelationship(name);
+        if (!rel) return { success:false, msg:'没有关系记录' };
+        if (rel.publicStatus !== 'broken') return { success:false, msg:'还没有分手哦' };
+
+        const aff = G.memberAffection[name] || 50;
+        if (aff < 60) return { success:false, msg:`${name}还没有原谅你，好感度需要60以上才能复合` };
+
+        rel.publicStatus = 'secret';
+        rel.stage = this.getStage(aff).id;
+        rel.happiness = 40;
+        G.memberAffection[name] = Math.min(100, aff + 5);
+        App.Store.recalcAffection();
+        return { success:true, msg:`💕 与${name}复合了！请好好珍惜` };
+    },
+
+    // --- 恋人加成计算 ---
+    getLoverBonus() {
+        const lovers = this.getLovers();
+        if (lovers.length === 0) return { pushBonus:0, stageBonus:0 };
+
+        let pushBonus = 0;
+        let stageBonus = 0;
+        lovers.forEach(([name, rel]) => {
+            if (rel.publicStatus === 'public') {
+                pushBonus += 5;  // 公开恋人=免费推手
+                stageBonus += 10; // 公演协同加成
+            } else if (rel.publicStatus === 'rumor') {
+                pushBonus += 2;
+                stageBonus += 5;
+            } else {
+                stageBonus += 3;
+            }
+        });
+        return { pushBonus: Math.min(15, pushBonus), stageBonus: Math.min(30, stageBonus) };
+    },
+
+    // --- 塌房检测（多人同时暧昧/恋爱+被发现） ---
+    checkCollapse() {
+        this.init();
+        const activeRels = this.getActiveRelationships();
+        if (activeRels.length < 2) return false;
+
+        // 检查是否有多个关系都被发现
+        const exposed = activeRels.filter(([_, r]) => r.publicStatus === 'rumor' || r.publicStatus === 'public');
+        if (exposed.length >= 2) {
+            // 塌房！
+            G.stats.scandal = Math.min(100, G.stats.scandal + 40);
+            G.stats.popularity = Math.max(0, G.stats.popularity - 30);
+            G.stats.mood = Math.max(0, G.stats.mood - 30);
+            // 所有关系变成分手
+            activeRels.forEach(([name, rel]) => {
+                rel.publicStatus = 'broken';
+                rel.stage = 'friend';
+                G.memberAffection[name] = Math.max(0, (G.memberAffection[name] || 50) - 25);
+            });
+            App.Store.recalcAffection();
+            return true;
+        }
+        return false;
+    },
+
+    // --- 每日推进 ---
+    advanceDay() {
+        this.init();
+        this.advanceRelationships();
+        this.dailyCrisisCheck();
+        // 塌房检测
+        if (this.checkCollapse()) {
+            setTimeout(() => {
+                const overlay = document.createElement('div');
+                overlay.className = 'modal-overlay';
+                overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:2000';
+                overlay.innerHTML = `<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:16px;padding:30px;margin:20px;text-align:center;max-width:300px">
+                    <div style="font-size:64px;margin-bottom:12px">💥</div>
+                    <div style="font-size:22px;font-weight:700;color:#e74c3c;margin-bottom:8px">塌房了！</div>
+                    <div style="font-size:13px;color:#ccc;margin-bottom:12px">你同时与多人的恋情被发现，舆论一片哗然！</div>
+                    <div style="font-size:12px;color:#e74c3c;background:rgba(231,76,60,0.1);border-radius:8px;padding:10px;margin-bottom:16px">丑闻+40 · 人气-30 · 心情-30<br>所有恋人关系已结束</div>
+                    <button style="width:100%;padding:12px;border:none;background:#e74c3c;color:#fff;border-radius:8px;font-size:14px;cursor:pointer" onclick="this.closest('.modal-overlay').remove()">接受现实</button>
+                </div>`;
+                document.querySelector('.phone-screen').appendChild(overlay);
+            }, 1000);
+        }
+    },
+};
+
+App.Variety = {
+    // 通告类型定义
+    bookingTypes: [
+        { id:'variety',     name:'综艺节目',   emoji:'📺', days:1, basePop:15,  baseMoney:500,  risk:'冷场出丑',   riskChance:0.15, repReq:0 },
+        { id:'reality',     name:'真人秀录制', emoji:'🎥', days:3, basePop:30,  baseMoney:800,  risk:'暴露隐私',   riskChance:0.25, repReq:20 },
+        { id:'radio',       name:'电台节目',   emoji:'📻', days:1, basePop:5,   baseMoney:200,  risk:'',           riskChance:0,    repReq:0 },
+        { id:'mv',          name:'MV拍摄',     emoji:'🎬', days:2, basePop:20,  baseMoney:300,  risk:'',           riskChance:0,    repReq:10 },
+        { id:'idol_drama',  name:'偶像剧拍摄', emoji:'🎭', days:5, basePop:50,  baseMoney:2000, risk:'CP绯闻',     riskChance:0.20, repReq:35 },
+        { id:'commercial',  name:'商业代言',   emoji:'💼', days:1, basePop:0,   baseMoney:3000, risk:'形象翻车',   riskChance:0.10, repReq:50 },
+        { id:'magazine',    name:'杂志拍摄',   emoji:'📸', days:1, basePop:10,  baseMoney:600,  risk:'',           riskChance:0,    repReq:15 },
+    ],
+
+    // 综艺节目名称库
+    showNames: {
+        variety: ['快乐大本营','奔跑吧偶像','偶像来了','明日之子·综艺版','吐槽大会·偶像季','向往的生活·偶像篇','脱口秀大会·粉圈专场'],
+        reality: ['偶像变形记','练习生的一天','48小时挑战','真相大冒险','明星宿舍日记'],
+        radio:   ['深夜电台·星光FM','偶像心事','音乐之声·48','深夜晚安电台'],
+        mv:      ['Unit曲MV','Solo出道曲MV','团体新曲MV','特别企划MV'],
+        idol_drama: ['恋爱预告','偶像剧·初恋','校园偶像物语','星光之恋','做梦吧少女'],
+        commercial: ['美妆品牌代言','运动品牌代言','时尚服饰代言','饮品代言','数码产品代言'],
+        magazine: ['时尚周刊','偶像画报','少女风格','星光杂志','流行志'],
+    },
+
+    // 录制事件（按通告类型）
+    recordingEvents: {
+        variety: [
+            { desc:'主持人突然问你的恋爱观…', choices:[
+                { id:'open',     label:'大方回应',   outcome:{pop:10, fans:200} },
+                { id:'dodge',    label:'转移话题',   outcome:{pop:0, fans:0} },
+                { id:'cute',     label:'撒娇回避',   outcome:{pop:5, fans:100} },
+                { id:'honest',   label:'真心话',     outcome:{pop:20, fans:500, riskChance:0.5, riskType:'绯闻'} },
+            ]},
+            { desc:'嘉宾挑战：30秒内让全场观众笑！', choices:[
+                { id:'witty',    label:'幽默接梗',   outcome:{pop:15, fans:300, skillBonus:2} },
+                { id:'silly',    label:'搞笑卖萌',   outcome:{pop:8, fans:150} },
+                { id:'safe',     label:'安全回复',   outcome:{pop:2, fans:50} },
+                { id:'cold',     label:'紧张冷场',   outcome:{pop:-5, fans:-100} },
+            ]},
+            { desc:'节目组要求你模仿另一位成员…', choices:[
+                { id:'perfect',  label:'完美模仿',   outcome:{pop:12, fans:250, skillBonus:1} },
+                { id:'cute',     label:'可爱模仿',   outcome:{pop:8, fans:150} },
+                { id:'refuse',   label:'委婉拒绝',   outcome:{pop:-3, fans:0} },
+            ]},
+        ],
+        reality: [
+            { desc:'镜头24小时跟着你，突然拍到你在偷偷吃零食…', choices:[
+                { id:'honest',   label:'大方承认',   outcome:{pop:10, fans:200} },
+                { id:'deny',     label:'假装否认',   outcome:{pop:-8, fans:-150} },
+                { id:'cute',     label:'撒娇说"好想吃"', outcome:{pop:15, fans:300} },
+            ]},
+            { desc:'团队任务失败了，镜头对着你…', choices:[
+                { id:'encourage',label:'鼓励队友',   outcome:{pop:12, fans:250} },
+                { id:'blame',    label:'吐槽队友',   outcome:{pop:-10, fans:-200, riskChance:0.3} },
+                { id:'cry',      label:'眼泪掉下来', outcome:{pop:5, fans:100} },
+            ]},
+        ],
+        idol_drama: [
+            { desc:'导演说加一场吻戏，但合同没写…', choices:[
+                { id:'accept',   label:'配合拍摄',   outcome:{pop:20, money:500, riskChance:0.4, riskType:'绯闻'} },
+                { id:'refuse',   label:'坚持合同',   outcome:{pop:0, money:0, repBonus:5} },
+                { id:'compromise',label:'建议改拍牵手', outcome:{pop:8, money:200} },
+            ]},
+            { desc:'搭档在社交媒体发你们的亲密合照…', choices:[
+                { id:'laugh',    label:'配合调侃',   outcome:{pop:10, fans:300} },
+                { id:'clarify',  label:'声明是工作', outcome:{pop:0, fans:-50} },
+                { id:'ignore',   label:'不回应',     outcome:{pop:-5, fans:-100} },
+            ]},
+        ],
+        commercial: [
+            { desc:'品牌方要求你发一条广告文案，粉丝可能会反感…', choices:[
+                { id:'creative', label:'创意文案',   outcome:{money:500, pop:5} },
+                { id:'plain',    label:'普通文案',   outcome:{money:300, pop:-3} },
+                { id:'refuse',   label:'委婉拒绝',   outcome:{money:0, repBonus:10} },
+            ]},
+        ],
+        magazine: [
+            { desc:'采访中记者问你队内关系…', choices:[
+                { id:'positive', label:'积极回应',   outcome:{pop:8, fans:150} },
+                { id:'vague',    label:'含糊回避',   outcome:{pop:0, fans:0} },
+                { id:'honest',   label:'坦诚回答',   outcome:{pop:5, fans:100, riskChance:0.2} },
+            ]},
+        ],
+        radio: [
+            { desc:'深夜电台，主持人问你最真实的感受…', choices:[
+                { id:'heartfelt',label:'走心回答',   outcome:{pop:5, fans:100} },
+                { id:'safe',     label:'安全回答',   outcome:{pop:0, fans:0} },
+            ]},
+        ],
+        mv: [
+            { desc:'MV导演要求一个高难度动作…', choices:[
+                { id:'perfect',  label:'完美完成',   outcome:{pop:10, skillBonus:2} },
+                { id:'try',      label:'尽力尝试',   outcome:{pop:5, skillBonus:1} },
+                { id:'skip',     label:'选择简单版', outcome:{pop:0} },
+            ]},
+        ],
+    },
+
+    // 初始化 G.variety
+    init() {
+        if (!G.variety) G.variety = { available:[], active:null, completed:[], cooldown:0, reputation:0, weeklySeed:0 };
+        if (G.variety.available.length === 0) this.refreshBookings();
+    },
+
+    // 每周刷新通告（基于天数）
+    refreshBookings() {
+        const week = Math.floor(G.game.day / 7);
+        // 用周数做种子，保证每周通告不变
+        if (G.variety.weeklySeed === week) return;
+        G.variety.weeklySeed = week;
+        G.variety.available = [];
+        const pop = G.stats?.popularity || 10;
+        const rep = G.variety.reputation || 0;
+        const count = 2 + Math.floor(pop / 30) + (rep >= 50 ? 1 : 0); // 2-4个通告
+
+        const shuffled = [...this.bookingTypes].sort(() => Math.random() - 0.5);
+        for (let i = 0; i < Math.min(count, shuffled.length); i++) {
+            const bt = shuffled[i];
+            if (rep < bt.repReq) continue; // 声誉不够跳过
+            const names = this.showNames[bt.id];
+            const showName = names[Math.floor(Math.random() * names.length)];
+            const skillMod = 1 + (G.trainingSkills?.variety || 5) / 50;
+            G.variety.available.push({
+                id: bt.id + '_' + week + '_' + i,
+                type: bt.id,
+                name: showName,
+                emoji: bt.emoji,
+                typeName: bt.name,
+                days: bt.days,
+                rewardPop: Math.round(bt.basePop * skillMod),
+                rewardMoney: Math.round(bt.baseMoney * skillMod),
+                risk: bt.risk,
+                riskChance: bt.riskChance,
+                status: 'open', // open/accepted/recording/done
+            });
+        }
+        // 保底至少1个低门槛通告
+        if (G.variety.available.length === 0) {
+            const bt = this.bookingTypes.find(b => b.repReq === 0);
+            const names = this.showNames[bt.id];
+            G.variety.available.push({
+                id: bt.id + '_' + week + '_0',
+                type: bt.id,
+                name: names[Math.floor(Math.random() * names.length)],
+                emoji: bt.emoji,
+                typeName: bt.name,
+                days: bt.days,
+                rewardPop: bt.basePop,
+                rewardMoney: bt.baseMoney,
+                risk: bt.risk,
+                riskChance: bt.riskChance,
+                status: 'open',
+            });
+        }
+    },
+
+    // 接受通告
+    acceptBooking(bookingId) {
+        if (G.variety.cooldown > 0) return { blocked: true, msg: '通告冷却中，还需' + G.variety.cooldown + '天' };
+        if (G.variety.active) return { blocked: true, msg: '已有进行中的通告' };
+        const b = G.variety.available.find(x => x.id === bookingId);
+        if (!b || b.status !== 'open') return { blocked: true, msg: '该通告已不可接' };
+        b.status = 'recording';
+        b.daysLeft = b.days;
+        b.progress = 0;
+        G.variety.active = b;
+        App.Save.autoSave();
+        return { success: true, booking: b };
+    },
+
+    // 每日推进录制进度
+    advanceRecording() {
+        if (!G.variety.active) return;
+        const b = G.variety.active;
+        b.daysLeft--;
+        b.progress = Math.round(((b.days - b.daysLeft) / b.days) * 100);
+        if (b.daysLeft <= 0) {
+            // 录制完成，触发事件
+            b.status = 'event_pending';
+        }
+    },
+
+    // 解除录制事件
+    resolveEvent(bookingId, choiceId) {
+        const b = G.variety.active;
+        if (!b || b.id !== bookingId) return null;
+        const events = this.recordingEvents[b.type] || [];
+        if (events.length === 0) {
+            // 无事件类型，直接结算
+            return this.settleBooking(b, {});
+        }
+        const event = events[Math.floor(Math.random() * events.length)];
+        const choice = event.choices.find(c => c.id === choiceId);
+        if (!choice) return this.settleBooking(b, {});
+
+        // 好感度降低风险概率：高好感 → 风险概率 ×(1 - affection/200)
+        const affectionRiskMod = 1 - (G.stats.affection || 50) / 200; // 好感50→0.75倍，100→0.5倍
+        const adjustedRisk = (choice.outcome.riskChance || 0) * affectionRiskMod;
+
+        // 处理风险
+        if (adjustedRisk > 0 && Math.random() < adjustedRisk) {
+            const riskType = choice.outcome.riskType || b.risk || '负面事件';
+            const riskPopLoss = randInt(5, 20);
+            G.stats.popularity = Math.max(0, G.stats.popularity - riskPopLoss);
+            const result = {
+                success: false,
+                riskTriggered: true,
+                riskType: riskType,
+                popLoss: riskPopLoss,
+                rewardPop: choice.outcome.pop,
+                rewardMoney: choice.outcome.money || 0,
+                desc: riskType === '绯闻' ? '💥 绯闻爆发！社交媒体炸锅了…' : '💥 事情出了意外…',
+            };
+            // 仍然获得部分收入
+            if (choice.outcome.money) {
+                G.stats.wechatBalance = (G.stats.wechatBalance || 0) + Math.round(choice.outcome.money * 0.5);
+            }
+            this.completeBooking(b, result);
+            return result;
+        }
+
+        return this.settleBooking(b, choice.outcome);
+    },
+
+    // 正常结算
+    settleBooking(b, outcome) {
+        const popGain = (outcome.pop || 0) + b.rewardPop;
+        const moneyGain = (outcome.money || 0) + b.rewardMoney;
+        const skillBonus = outcome.skillBonus || 0;
+        const repBonus = outcome.repBonus || 0;
+
+        G.stats.popularity = Math.min(100, G.stats.popularity + popGain);
+        G.stats.wechatBalance = (G.stats.wechatBalance || 0) + moneyGain;
+        if (skillBonus && G.trainingSkills) {
+            G.trainingSkills.variety = Math.min(100, G.trainingSkills.variety + skillBonus);
+        }
+        G.variety.reputation = Math.min(100, G.variety.reputation + repBonus + (popGain > 0 ? 2 : 0));
+        G.variety.cooldown = 2; // 2天冷却
+
+        const result = {
+            success: true,
+            rewardPop: popGain,
+            rewardMoney: moneyGain,
+            skillBonus: skillBonus,
+            repBonus: repBonus + (popGain > 0 ? 2 : 0),
+            desc: popGain > 10 ? '🌟 表现出色！' : popGain > 0 ? '😊 完成通告' : '😐 平平淡淡',
+        };
+        this.completeBooking(b, result);
+        return result;
+    },
+
+    completeBooking(b, result) {
+        b.status = 'done';
+        b.result = result;
+        G.variety.completed.push(b);
+        G.variety.active = null;
+        G.variety.available = G.variety.available.filter(x => x.id !== b.id);
+        App.Save.autoSave();
+    },
+
+    // 获取当前录制中的事件
+    getCurrentEvent() {
+        const b = G.variety.active;
+        if (!b || b.status !== 'event_pending') return null;
+        const events = this.recordingEvents[b.type] || [];
+        if (events.length === 0) return null;
+        return events[Math.floor(Math.random() * events.length)];
+    },
+};
+
 // ============ 舞台体验系统 V4 ============
 App.Stage = {
     // MC 话题库
@@ -2814,6 +4011,340 @@ App.Stage = {
                 rewards,
                 pers
             };
+        }
+    },
+
+    // ============ 原创公演系统 ============
+    OriginalShow: {
+        // 6步流程状态: theme → songs → units → positions → rehearsal → perform
+        steps: ['theme','songs','units','positions','rehearsal','perform'],
+
+        // 15首初始曲库
+        songLibrary: [
+            // 开场曲(5首)
+            { id:'opening_1', name:'光芒万丈', type:'opening', stars:2, baseScore:35, mainSkill:'dance', desc:'活力四射的开场舞曲，点燃全场气氛' },
+            { id:'opening_2', name:'星辰大海', type:'opening', stars:3, baseScore:50, mainSkill:'performance', desc:'气势磅礴的大气开场，展现团队实力' },
+            { id:'opening_3', name:'破晓之光', type:'opening', stars:3, baseScore:45, mainSkill:'vocal', desc:'合唱开场，声浪如潮' },
+            { id:'opening_4', name:'热血联盟', type:'opening', stars:4, baseScore:65, mainSkill:'dance', desc:'高难度编舞开场，需要全员默契配合' },
+            { id:'opening_5', name:'无尽远方', type:'opening', stars:5, baseScore:80, mainSkill:'performance', desc:'终极开场！完美表现力才能驾驭' },
+            // Unit曲(5首)
+            { id:'unit_1', name:'月下独舞', type:'unit', stars:2, baseScore:30, mainSkill:'dance', desc:'抒情Unit，月光下的独舞故事' },
+            { id:'unit_2', name:'甜蜜告白', type:'unit', stars:2, baseScore:28, mainSkill:'vocal', desc:'甜蜜系对唱Unit，粉红泡泡' },
+            { id:'unit_3', name:'暗夜蔷薇', type:'unit', stars:3, baseScore:42, mainSkill:'performance', desc:'暗黑系Unit，冷艳绽放' },
+            { id:'unit_4', name:'风之传说', type:'unit', stars:4, baseScore:60, mainSkill:'dance', desc:'高难度舞蹈Unit，风一般的舞步' },
+            { id:'unit_5', name:'心之旋律', type:'unit', stars:4, baseScore:55, mainSkill:'vocal', desc:'灵魂系对唱Unit，内心共鸣' },
+            // 终曲(5首)
+            { id:'finale_1', name:'永远的爱', type:'finale', stars:2, baseScore:38, mainSkill:'vocal', desc:'经典终曲，感人至深' },
+            { id:'finale_2', name:'未来之门', type:'finale', stars:3, baseScore:50, mainSkill:'performance', desc:'展望未来的终曲，充满希望' },
+            { id:'finale_3', name:'羽翼之歌', type:'finale', stars:3, baseScore:48, mainSkill:'dance', desc:'翅膀主题终曲，飞翔之舞' },
+            { id:'finale_4', name:'彩虹誓约', type:'finale', stars:4, baseScore:68, mainSkill:'vocal', desc:'誓言终曲，声浪震天' },
+            { id:'finale_5', name:'永恒之光', type:'finale', stars:5, baseScore:85, mainSkill:'performance', desc:'终极终曲！所有技艺的终极考验' }
+        ],
+
+        // 公演主题库
+        themes: [
+            { id:'dream', name:'梦想启航', emoji:'🌟', color:'#4fc3f7', desc:'追逐梦想的故事，充满希望与力量' },
+            { id:'love', name:'恋之季节', emoji:'💕', color:'#f06292', desc:'甜蜜恋爱主题，粉红泡泡满满的舞台' },
+            { id:'night', name:'暗夜传说', emoji:'🌙', color:'#7c4dff', desc:'神秘暗黑系，冷艳与力量的碰撞' },
+            { id:'summer', name:'夏日狂欢', emoji:'☀️', color:'#ff9800', desc:'元气夏日主题，活力无限热力四射' },
+            { id:'rebirth', name:'涅槃重生', emoji:'🔥', color:'#f44336', desc:'突破与重生，展现最强自我' }
+        ],
+
+        // 公演随机事件
+        randomEvents: [
+            { id:'mic_fail', name:'麦克风无声', emoji:'🔇', prob:0.08, effect:-15, desc:'公演中途麦克风突然无声！考验临场应变…',
+              reactions: { success:'冷静示意换麦，临场应变赢得了掌声！', fail:'慌张了好几秒，观众席出现窃窃私语…' }},
+            { id:'center_fall', name:'C位摔倒', emoji:'💥', prob:0.06, effect:-20, desc:'C位成员在高潮段落摔倒！舞台瞬间凝固…',
+              reactions: { success:'摔倒后立刻起身继续，这种坚韧让观众动容！', fail:'摔倒后节奏乱了，整段表演受到影响…' }},
+            { id:'encore', name:'安可呼声', emoji:'🎉', prob:0.12, effect:10, desc:'观众安可呼声震天！要不要加演一段？',
+              reactions: { accept:'安可加演成功！观众满意度飙升！', decline:'礼貌谢幕，观众虽有遗憾但整体效果很好' }},
+            { id:'prop_fail', name:'道具故障', emoji:'🪵', prob:0.05, effect:-10, desc:'舞台道具突然故障！',
+              reactions: { success:'巧妙用肢体替代道具，创意救场！', fail:'道具故障影响了整体视觉效果' }},
+            { id:'fan_chant', name:'粉丝Call爆发', emoji:'📢', prob:0.10, effect:8, desc:'粉丝突然整齐Call声爆发！舞台气氛瞬间点燃！',
+              reactions: { ride:'乘着Call声的节奏表现超常发挥！', miss:'没跟上Call节奏，气氛没能完全利用' }},
+            { id:'wardrobe', name:'服装小意外', emoji:'👗', prob:0.04, effect:-8, desc:'演出服在跳舞时出了小状况…',
+              reactions: { success:'优雅化解服装问题，观众赞叹职业素养！', fail:'服装问题影响了动作完成度' }}
+        ],
+
+        // 初始化原创公演状态
+        init() {
+            if (!G.originalShow) {
+                G.originalShow = {
+                    currentStep: null,     // 当前步骤 index
+                    theme: null,           // 选定主题
+                    songs: { opening:null, unit:null, finale:null },  // 选定曲目
+                    unitMembers: [],       // Unit曲成员
+                    center: null,          // C位
+                    positions: {},         // 站位分配
+                    rehearsalDone: false,  // 是否彩排
+                    rehearsalScore: 0,     // 彩排得分
+                    history: [],           // 历史公演记录
+                    cooldown: 0            // 冷却天数
+                };
+            }
+        },
+
+        // 开始原创公演流程
+        startFlow() {
+            this.init();
+            if (G.originalShow.cooldown > 0) return { error: `原创公演冷却中，还需${G.originalShow.cooldown}天` };
+            if (G.stats.popularity < 20) return { error: '人气不足20，还不能策划原创公演' };
+            if (G.game.dim < 10) return { error: '还在训练期（Day10后开放原创公演）' };
+            G.originalShow.currentStep = 0;
+            return { step: 0, stepName: this.steps[0] };
+        },
+
+        // 选定主题
+        selectTheme(themeId) {
+            this.init();
+            const theme = this.themes.find(t => t.id === themeId);
+            if (!theme) return { error: '无效主题' };
+            G.originalShow.theme = theme;
+            G.originalShow.currentStep = 1;
+            return { step: 1, stepName: 'songs', theme };
+        },
+
+        // 选定曲目（开场+Unit+终曲）
+        selectSongs(openingId, unitId, finaleId) {
+            this.init();
+            const opening = this.songLibrary.find(s => s.id === openingId && s.type === 'opening');
+            const unit = this.songLibrary.find(s => s.id === unitId && s.type === 'unit');
+            const finale = this.songLibrary.find(s => s.id === finaleId && s.type === 'finale');
+            if (!opening || !unit || !finale) return { error: '曲目选择不完整' };
+            G.originalShow.songs = { opening, unit, finale };
+            G.originalShow.currentStep = 2;
+            // 计算总难度星级
+            const totalStars = opening.stars + unit.stars + finale.stars;
+            return { step: 2, stepName: 'units', songs: G.originalShow.songs, totalStars };
+        },
+
+        // 编排Unit成员（选2-3名队友）
+        assignUnitMembers(memberNames) {
+            this.init();
+            const teammates = App.getTeamMates(G.player.group, G.player.team);
+            const valid = memberNames.every(n => teammates.find(t => t.name === n));
+            if (!valid || memberNames.length < 2 || memberNames.length > 3) return { error: 'Unit需选2-3名同队队友' };
+            G.originalShow.unitMembers = memberNames;
+            G.originalShow.currentStep = 3;
+            return { step: 3, stepName: 'positions', unitMembers: memberNames };
+        },
+
+        // 站位分配（选C位+前排后排）
+        assignPositions(centerName) {
+            this.init();
+            const teammates = App.getTeamMates(G.player.group, G.player.team);
+            const allMembers = [...teammates.map(t => t.name)];
+            // 玩家自己也可以是C位
+            if (centerName === G.player.name || allMembers.includes(centerName)) {
+                G.originalShow.center = centerName;
+                // 自动分配站位
+                const others = centerName === G.player.name ? allMembers : allMembers.filter(n => n !== centerName);
+                const frontCount = Math.min(3, others.length);
+                const front = others.slice(0, frontCount);
+                const back = others.slice(frontCount);
+                G.originalShow.positions = {
+                    center: centerName,
+                    front: front,
+                    back: back,
+                    selfPosition: centerName === G.player.name ? 'center' : (front.includes(G.player.name) ? 'front' : 'back')
+                };
+                G.originalShow.currentStep = 4;
+                return { step: 4, stepName: 'rehearsal', positions: G.originalShow.positions };
+            }
+            return { error: '无效C位选择' };
+        },
+
+        // 彩排（消耗1天行动力，获得彩排加成）
+        doRehearsal() {
+            this.init();
+            App.Health.init();
+            const effMod = App.Health.getEfficiencyModifier();
+            const skills = G.trainingSkills || { dance:10, vocal:10, performance:10 };
+            const songs = G.originalShow.songs;
+            // 彩排得分：各曲对应技能*权重
+            const openingSkill = skills[songs.opening.mainSkill] || 10;
+            const unitSkill = skills[songs.unit.mainSkill] || 10;
+            const finaleSkill = skills[songs.finale.mainSkill] || 10;
+            const rawScore = (openingSkill * 0.3 + unitSkill * 0.2 + finaleSkill * 0.5) * effMod;
+            const rehearsalScore = Math.round(rawScore + randInt(-5, 5));
+            G.originalShow.rehearsalDone = true;
+            G.originalShow.rehearsalScore = Math.max(0, rehearsalScore);
+            // 彩排消耗体力精神
+            G.fatigue = Math.min(100, G.fatigue + randInt(10, 20));
+            G.physical = Math.max(0, G.physical - randInt(3, 8));
+            G.originalShow.currentStep = 5;
+            App.Save.autoSave();
+            return { step: 5, stepName: 'perform', rehearsalScore, effMod };
+        },
+
+        // 跳过彩排直接公演
+        skipRehearsal() {
+            this.init();
+            G.originalShow.rehearsalDone = false;
+            G.originalShow.rehearsalScore = 0;
+            G.originalShow.currentStep = 5;
+            App.Save.autoSave();
+            return { step: 5, stepName: 'perform', rehearsalScore: 0 };
+        },
+
+        // 正式公演 - 评分公式
+        doPerform() {
+            this.init();
+            App.Health.init();
+            const songs = G.originalShow.songs;
+            const skills = G.trainingSkills || { dance:10, vocal:10, performance:10, variety:5 };
+            const pos = G.originalShow.positions;
+            const center = G.originalShow.center;
+
+            // === 评分公式 ===
+            // 1. 曲目基础分
+            const songBase = songs.opening.baseScore * 0.25 + songs.unit.baseScore * 0.3 + songs.finale.baseScore * 0.45;
+
+            // 2. 技能匹配分（高好感加成）
+            const openingMatch = skills[songs.opening.mainSkill] || 10;
+            const unitMatch = skills[songs.unit.mainSkill] || 10;
+            const finaleMatch = skills[songs.finale.mainSkill] || 10;
+            const affectionBonus = 1 + (G.stats.affection || 50) / 200; // 好感50→1.25倍，100→1.5倍
+            const skillMatch = Math.round((openingMatch * 0.25 + unitMatch * 0.3 + finaleMatch * 0.45) * 0.4 * affectionBonus);
+
+            // 3. C位人气加成
+            let centerPop = 0;
+            if (center === G.player.name) {
+                centerPop = Math.round(G.stats.popularity * 0.3);
+            } else {
+                // AI成员C位，按好感度计算
+                const aff = G.memberAffection?.[center] || 50;
+                centerPop = Math.round(aff * 0.15);
+            }
+
+            // 4. 好感协同加成
+            const unitMembers = G.originalShow.unitMembers || [];
+            let synergyBonus = 0;
+            unitMembers.forEach(m => {
+                const aff = G.memberAffection?.[m] || 50;
+                synergyBonus += Math.round((aff - 50) * 0.2); // 好感>50才加，<50扣
+            });
+            if (pos.front) {
+                pos.front.forEach(m => {
+                    if (m !== G.player.name) {
+                        const aff = G.memberAffection?.[m] || 50;
+                        synergyBonus += Math.round((aff - 50) * 0.1);
+                    }
+                });
+            }
+
+            // 5. 彩排加成
+            const rehearsalBonus = G.originalShow.rehearsalDone ? Math.round(G.originalShow.rehearsalScore * 0.15) : 0;
+
+            // 6. 伤病扣减
+            const injuryPenalty = G.health?.currentInjuries?.length > 0 ?
+                G.health.currentInjuries.reduce((sum, inj) => sum + inj.severity * 5, 0) : 0;
+
+            // 7. 随机事件
+            let randomEventResult = null;
+            const eventRoll = Math.random();
+            const eligibleEvents = this.randomEvents.filter(e => eventRoll < e.prob * 3); // 放大概率使事件更容易触发
+            if (eligibleEvents.length > 0) {
+                randomEventResult = pick(eligibleEvents);
+            }
+
+            let randomEffect = 0;
+            let eventDesc = '';
+            if (randomEventResult) {
+                // 简单处理：随机决定事件结果是成功还是失败
+                const isSuccess = Math.random() < 0.5 + (skills.performance || 10) / 200;
+                if (randomEventResult.id === 'encore') {
+                    // 安可呼声总是正面
+                    randomEffect = randomEventResult.effect;
+                    eventDesc = randomEventResult.reactions.accept;
+                } else {
+                    randomEffect = isSuccess ? Math.round(randomEventResult.effect * 0.5) : randomEventResult.effect;
+                    eventDesc = isSuccess ? randomEventResult.reactions.success : randomEventResult.reactions.fail;
+                }
+            }
+
+            // 综合得分
+            const totalScore = Math.round(songBase + skillMatch + centerPop + synergyBonus + rehearsalBonus - injuryPenalty + randomEffect + randInt(-3, 5));
+            const finalScore = Math.max(0, Math.min(150, totalScore));
+
+            // 评级
+            let grade, gradeEmoji;
+            if (finalScore >= 120) { grade = 'SS'; gradeEmoji = '🌟🌟🌟'; }
+            else if (finalScore >= 100) { grade = 'S'; gradeEmoji = '⭐⭐⭐⭐⭐'; }
+            else if (finalScore >= 80) { grade = 'A'; gradeEmoji = '⭐⭐⭐⭐'; }
+            else if (finalScore >= 60) { grade = 'B'; gradeEmoji = '⭐⭐⭐'; }
+            else if (finalScore >= 40) { grade = 'C'; gradeEmoji = '⭐⭐'; }
+            else { grade = 'D'; gradeEmoji = '⭐'; }
+
+            // 奖励计算
+            let rewards = { popularity:0, drumstick:0, skillGain:0, mood:0, affection:{} };
+            if (grade === 'SS') { rewards = { popularity:12, drumstick:200, skillGain:3, mood:10, affection:{} }; }
+            else if (grade === 'S') { rewards = { popularity:8, drumstick:120, skillGain:2, mood:7, affection:{} }; }
+            else if (grade === 'A') { rewards = { popularity:5, drumstick:80, skillGain:1, mood:5, affection:{} }; }
+            else if (grade === 'B') { rewards = { popularity:3, drumstick:40, mood:2, affection:{} }; }
+            else if (grade === 'C') { rewards = { popularity:1, drumstick:20, affection:{} }; }
+            else { rewards = { popularity:0, drumstick:5, mood:-3, affection:{} }; }
+
+            // 好感度奖励（队友参与公演后好感+1~3）
+            const allPartners = [...(unitMembers || []), ...(pos.front || []), ...(pos.back || [])].filter(n => n && n !== G.player.name);
+            allPartners.forEach(m => {
+                const gain = grade >= 'A' ? randInt(2, 4) : grade >= 'B' ? randInt(1, 3) : randInt(0, 1);
+                if (!G.memberAffection[m]) G.memberAffection[m] = 50;
+                G.memberAffection[m] = Math.min(100, G.memberAffection[m] + gain);
+                rewards.affection[m] = gain;
+            });
+
+            // 应用奖励
+            G.stats.popularity = Math.min(100, G.stats.popularity + rewards.popularity);
+            G.stats.drumstick = (G.stats.drumstick || 0) + rewards.drumstick;
+            G.stats.mood = Math.min(100, Math.max(0, G.stats.mood + rewards.mood));
+            if (rewards.skillGain > 0) {
+                const mainSkill = songs.finale.mainSkill;
+                G.trainingSkills[mainSkill] = Math.min(100, G.trainingSkills[mainSkill] + rewards.skillGain);
+            }
+            App.Store.updateStats({ popularity: rewards.popularity, mood: rewards.mood });
+            App.Store.recalcAffection(); // 同步好感度
+
+            // 记录历史
+            G.originalShow.history.push({
+                day: G.game.day,
+                theme: G.originalShow.theme.name,
+                songs: `${songs.opening.name}/${songs.unit.name}/${songs.finale.name}`,
+                totalStars: songs.opening.stars + songs.unit.stars + songs.finale.stars,
+                center: center,
+                grade, score: finalScore,
+                rehearsalDone: G.originalShow.rehearsalDone,
+                randomEvent: randomEventResult ? { name: randomEventResult.name, result: eventDesc } : null
+            });
+
+            // 冷却3天
+            G.originalShow.cooldown = 3;
+            // 重置流程状态但保留history和cooldown
+            const history = G.originalShow.history;
+            const cooldown = G.originalShow.cooldown;
+            G.originalShow = {
+                currentStep: null, theme: null,
+                songs: { opening:null, unit:null, finale:null },
+                unitMembers: [], center: null, positions: {},
+                rehearsalDone: false, rehearsalScore: 0,
+                history, cooldown
+            };
+
+            App.Save.autoSave();
+            return {
+                score: finalScore, grade, gradeEmoji,
+                songBase, skillMatch, centerPop, synergyBonus, rehearsalBonus, injuryPenalty,
+                randomEvent: randomEventResult ? { ...randomEventResult, resultDesc: eventDesc, effect: randomEffect } : null,
+                rewards, center, theme: G.originalShow.theme || songs
+            };
+        },
+
+        // 每日冷却递减
+        advanceDay() {
+            this.init();
+            if (G.originalShow.cooldown > 0) {
+                G.originalShow.cooldown--;
+            }
         }
     }
 };
@@ -3122,6 +4653,34 @@ App.UI = {
     wechatTab: 'chat',
     _currentEvent: null,
 
+    // 主页数据面板：身体/心态/疲劳 + 技能 + 好感
+    updateHomeStats() {
+        const el = document.getElementById('homeStatPanel');
+        if (!el || !G.player.name) return;
+        const physical = G.physical ?? 80, mental = G.mental ?? 75, fatigue = G.fatigue ?? 0;
+        const sk = G.trainingSkills || { dance:10, vocal:10, performance:10, variety:5 };
+        const affection = G.stats?.affection ?? 50;
+
+        const physColor = physical > 60 ? '#4caf50' : physical > 30 ? '#ff9800' : '#f44336';
+        const mentalColor = mental > 60 ? '#2196f3' : mental > 30 ? '#ff9800' : '#f44336';
+        const fatColor = fatigue < 30 ? '#4caf50' : fatigue < 60 ? '#ff9800' : '#f44336';
+
+        el.innerHTML =
+        '<div style="display:flex;gap:8px;margin-bottom:6px">'+
+            '<div style="flex:1;background:#fff;border-radius:10px;padding:8px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)"><div style="font-size:16px">💪</div><div style="font-size:10px;color:#666">身体 '+physical+'</div><div style="height:4px;border-radius:2px;background:#eee;margin-top:3px"><div style="height:100%;border-radius:2px;width:'+physical+'%;background:'+physColor+'"></div></div></div>'+
+            '<div style="flex:1;background:#fff;border-radius:10px;padding:8px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)"><div style="font-size:16px">😊</div><div style="font-size:10px;color:#666">心态 '+mental+'</div><div style="height:4px;border-radius:2px;background:#eee;margin-top:3px"><div style="height:100%;border-radius:2px;width:'+mental+'%;background:'+mentalColor+'"></div></div></div>'+
+            '<div style="flex:1;background:#fff;border-radius:10px;padding:8px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)"><div style="font-size:16px">⚡</div><div style="font-size:10px;color:#666">疲劳 '+fatigue+'</div><div style="height:4px;border-radius:2px;background:#eee;margin-top:3px"><div style="height:100%;border-radius:2px;width:'+fatigue+'%;background:'+fatColor+'"></div></div></div>'+
+            '<div style="flex:1;background:#fff;border-radius:10px;padding:8px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)"><div style="font-size:16px">💕</div><div style="font-size:10px;color:#666">好感 '+affection+'</div><div style="height:4px;border-radius:2px;background:#eee;margin-top:3px"><div style="height:100%;border-radius:2px;width:'+affection+'%;background:#ff69b4"></div></div></div>'+
+        '</div>'+
+        '<div style="display:flex;gap:6px;font-size:10px">'+
+            '<span style="color:#e74c3c">💃'+sk.dance+'</span>'+
+            '<span style="color:#9b59b6">🎤'+sk.vocal+'</span>'+
+            '<span style="color:#f39c12">🎭'+sk.performance+'</span>'+
+            '<span style="color:#3498db">📺'+sk.variety+'</span>'+
+            '<span style="color:#999;margin-left:auto">⭐人气'+(G.stats?.popularity||0)+' 🍗鸡腿'+(G.stats?.drumstick||0)+'</span>'+
+        '</div>';
+    },
+
     showPage(id) {
         document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
         const el = document.getElementById(id);
@@ -3190,6 +4749,8 @@ App.UI = {
             case 'chatleak': this.showPage('chatLeakPage'); this.renderChatLeak(); break;
             case 'training': this.showPage('trainingPage'); this.renderTraining(); break;
             case 'stage': this.showPage('stagePage'); this.renderStage(); break;
+            case 'external': this.showPage('externalPage'); this.renderExternal(); break;
+            case 'health': this.showPage('healthPage'); this.renderHealth(); break;
         }
     },
     // 统一弹窗辅助：所有弹窗追加到phone-screen内（不超出手机边框）
@@ -3249,11 +4810,51 @@ App.UI = {
         App.Election.advance();
 
         if (dayInMonth === 10) {
-            this.showElectionReportModalV2('first');
+            this.showElectionReportModalV3('first');
         } else if (dayInMonth === 20) {
-            this.showElectionReportModalV2('second');
+            this.showElectionReportModalV3('second');
         } else if (dayInMonth === 30) {
-            this.showElectionReportModalV2('final');
+            this.showElectionReportModalV3('final');
+        }
+
+        // 塌房恢复期每日检查
+        if (G.collapseState && G.collapseState.triggered && G.collapseState.recoveryDays > 0) {
+            G.collapseState.recoveryDays--;
+            if (G.collapseState.recoveryDays <= 0) {
+                G.collapseState.triggered = false;
+                this.showNotification('✅ 塌房恢复期结束，你已重新出发');
+            }
+        }
+
+        // 外务系统每日推进
+        App.Variety.init();
+        if (G.variety.cooldown > 0) G.variety.cooldown--;
+        App.Variety.advanceRecording();
+        // 每周刷新通告
+        if (G.game.day % 7 === 1) App.Variety.refreshBookings();
+
+        // 伤病系统每日检测
+        App.Health.init();
+        // 原创公演冷却递减
+        App.Stage.OriginalShow.advanceDay();
+        // 恋爱支线每日推进
+        App.Romance.advanceDay();
+        // 同步好感度（从队友好感聚合到stats.affection）
+        App.Store.recalcAffection();
+        const newInjury = App.Health.dailyCheck();
+        if (newInjury) {
+            this.showNotification(`🤕 ${newInjury.emoji} ${newInjury.name}！${newInjury.desc}`, 5000);
+            // 弹出伤病决策弹窗
+            setTimeout(() => this._showInjuryDecisionModal(newInjury), 800);
+        }
+        // 康复中心每日扣鸡腿
+        if (G.health.inRecovery) {
+            const payResult = App.Health.payRecoveryCenterDaily();
+            if (payResult?.insufficient) {
+                this.showNotification(payResult.msg, 3000);
+            } else if (payResult?.paid) {
+                this.showNotification(`🏥 康复中心治疗中 · -200鸡腿`, 2000);
+            }
         }
         
         if (document.getElementById('calendarPage').classList.contains('active')) {
@@ -3981,37 +5582,7 @@ App.UI = {
         const pers = App.MemberPersonality.getFor(id);
         const mood = App.MemberPersonality.getMemberMood(id);
         const mem = G.memberMemory?.[id];
-        // 构建上下文记忆池：显示AI能感知到的记忆
-        let memHTML = '';
-        const eventLabels = { gift:'🎁送礼', dinner:'🍽️请吃饭', birthday:'🎂庆生', date:'💕约会', 
-            transfer:'💰转账', comfort:'🤗安慰', center_deny:'😔未站C', center_give:'⭐站C', 
-            partner_invite:'🤝搭档邀约', chat:'💬聊天', positive_response:'👍积极回应',
-            neutral_response:'😐中立回应', negative_response:'👎消极回应' };
-        const events = mem ? (mem.significantEvents || []).slice(-8).reverse() : [];
-        const chatMsgs = data?.messages ? data.messages.length : 0;
-        if (chatMsgs > 0 || events.length > 0) {
-            memHTML = `
-            <div id="memPool_${id}" style="background:linear-gradient(135deg,#f0f7ff,#e8f0fe);border-bottom:1px solid #c8ddf8;padding:6px 14px;font-size:11px;color:#668;max-height:72px;overflow-y:auto;transition:max-height .3s">
-                <div style="display:flex;gap:12px;align-items:center">
-                    <span style="color:#4a90d9">🧠 上下文感知</span>
-                    <span>💬 ${chatMsgs}条对话</span>
-                    ${mem && mem.totalInteractions > 0 ? `<span>❤️ ${G.memberAffection?.[id]||50}</span>` : ''}
-                    <span style="cursor:pointer;margin-left:auto;color:#8899aa;font-size:10px" onclick="
-                        const p=document.getElementById('memPool_${id}');
-                        const s=p.style.maxHeight==='320px'?'72px':'320px';
-                        p.style.maxHeight=s;
-                        this.textContent=s==='320px'?'▲ 收起':'▼ 展开';
-                    ">▼ 展开</span>
-                </div>`;
-            if (events.length > 0) {
-                memHTML += `<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:4px">`;
-                events.forEach(e => {
-                    memHTML += `<span style="background:#dce8f5;border-radius:6px;padding:1px 6px;font-size:10px;white-space:nowrap">${eventLabels[e.event]||e.event}</span>`;
-                });
-                memHTML += `</div>`;
-            }
-            memHTML += `</div>`;
-        }
+        const memHTML = mem ? `<div style="background:#fffbe6;padding:4px 16px;font-size:10px;color:#b8860b;border-bottom:1px solid #f0e0a0">💭 互动${mem.totalInteractions || 0}次 · 心情${['😊','😐','😔'][Math.floor((mem.mood||60)/34)]}${mem.significantEvents?.length ? ' · 有重要回忆' : ''}</div>` : '';
         const el = document.getElementById('wechatChatPage');
         el.innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.backToWechatList()">←</span><span class="title">${id}</span><span style="font-size:11px;color:#999;margin-left:4px">${mood.emoji}</span><span class="back-btn" style="margin-left:auto" onclick="App.UI.showChatOptions()">⋮</span></div>
         <div style="background:#f8f8f8;padding:4px 16px;font-size:10px;color:#999;border-bottom:1px solid #f0f0f0;display:flex;gap:8px">
@@ -5099,7 +6670,7 @@ App.UI = {
     // ---------- 口袋48 ----------
     renderPocketHome() {
         const grp = App.NPCData[G.player.group];
-        const events = ['排练 14:00','公演 19:00','握手会 13:00'];
+        const events = ['握手会 13:00'];
         const notices = ['本周公演曲目已确定','总选举投票通道即将开启','新歌MV拍摄通知'];
         let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">口袋48</span></div>
         <div class="tab-bar"><div class="tab active" onclick="App.UI.renderPocketHome()">首页</div><div class="tab" onclick="App.UI.renderPocketRoom()">聊天室</div><div class="tab" onclick="App.UI.renderPocketFlip()">翻牌</div><div class="tab" onclick="App.UI.renderPocketLive()">直播</div><div class="tab" onclick="App.UI.renderPocketShow()">演出</div></div>
@@ -5655,18 +7226,29 @@ App.UI = {
     renderPocketShow() {
         document.getElementById('pocketPage').innerHTML = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">演出</span></div>
         <div style="padding:8px">
-            <div class="show-card"><div class="show-title">🎭 排练</div><button class="show-btn" onclick="App.UI.doRehearsal()">开始排练</button></div>
-            <div class="show-card"><div class="show-title">🎤 公演</div><button class="show-btn" onclick="App.UI.doPerformance()">参加公演</button></div>
             <div class="show-card"><div class="show-title">🤝 握手会</div><button class="show-btn" onclick="App.UI.openApp('handshake')">参加握手会</button></div>
+            <div style="font-size:12px;color:#999;text-align:center;margin-top:8px;padding:8px;background:#f9f9f9;border-radius:8px">💡 排练和公演请从主页进入</div>
         </div>`;
     },
     doRehearsal() {
-        App.Store.updateStats({skill:2,stress:2,mood:-1});
-        this.showNotification('排练完成！💪 实力提升');
+        App.Health.init();
+        const effMod = App.Health.getEfficiencyModifier();
+        if (effMod < 1) {
+            this.showNotification(`⚠️ 带伤排练，效果${Math.round(effMod*100)}%`, 2000);
+        }
+        const skillGain = Math.round(2 * effMod);
+        App.Store.updateStats({skill: skillGain, stress:2, mood:-1});
+        this.showNotification(`排练完成！💪 实力+${skillGain}`);
     },
     doPerformance() {
         if (G.stats.popularity < 15) { this.showNotification('人气不足15，还不能参加公演'); return; }
-        const base = G.stats.skill + randInt(-10,10);
+        // 伤病效率折扣
+        App.Health.init();
+        const effMod = App.Health.getEfficiencyModifier();
+        if (effMod < 1) {
+            this.showNotification(`⚠️ 带伤上场，公演效果${Math.round(effMod*100)}%`, 3000);
+        }
+        const base = Math.round((G.stats.skill + randInt(-10,10)) * effMod);
         let grade, detail, effects;
         if (base >= 80) { grade='S'; detail='完美的舞台！'; effects={popularity:8,drumstick:100,mood:5}; }
         else if (base >= 60) { grade='A'; detail='出色的表现！'; effects={popularity:5,drumstick:60,mood:3}; }
@@ -5680,14 +7262,30 @@ App.UI = {
 
     // ---------- 最佳拍档 ----------
     invitePartner(name, groupKey) {
-        const aff = G.memberAffection[name] || 40;
-        if (aff < 61) { this.showNotification(`与${name}的好感度需达到「挚友」(61)才能邀请最佳拍档`); return; }
-        if (G.bestPartner && G.bestPartner.name === name) { this.showNotification(`${name}已经是你的最佳拍档了！`); return; }
-        if (confirm(`邀请${name}成为最佳拍档？确认后本阶段只能与一人组队。`)) {
-            G.bestPartner = { name, avatar: '👤', sinceDay: G.game.day };
-            G.partnerStageUsed = false;
-            this.showNotification(`💞 与${name}结成最佳拍档！`);
-            App.Save.autoSave();
+        try {
+            const aff = G.memberAffection[name] || 40;
+            if (aff < 61) { this.showNotification('与' + name + '的好感度需达到「挚友」(61)才能邀请最佳拍档'); return; }
+            var currentName = typeof G.bestPartner === 'string' ? G.bestPartner : (G.bestPartner && G.bestPartner.name ? G.bestPartner.name : null);
+            if (currentName === name) { this.showNotification(name + '已经是你的最佳拍档了！'); return; }
+            
+            var overlay = document.createElement('div');
+            overlay.className = 'modal-overlay';
+            overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:2000';
+            overlay.innerHTML = '<div style="background:#fff;border-radius:16px;padding:24px;margin:20px;text-align:center;max-width:280px"><div style="font-size:18px;font-weight:600;margin-bottom:12px">💕 邀请最佳拍档</div><p style="font-size:14px;color:#666;margin-bottom:20px">确定邀请 <b>' + name + '</b> 成为最佳拍档？确认后本阶段只能与一人组队。</p><div style="display:flex;gap:10px"><button id="bpConfirmYes2" style="flex:1;padding:10px;border:none;background:#ff69b4;color:#fff;border-radius:8px;font-size:14px">确认</button><button id="bpConfirmNo2" style="flex:1;padding:10px;border:none;background:#eee;color:#333;border-radius:8px;font-size:14px">取消</button></div></div>';
+            document.querySelector('.phone-screen').appendChild(overlay);
+            
+            var self = this;
+            document.getElementById('bpConfirmYes2').onclick = function() {
+                G.bestPartner = { name: name, avatar: '\uD83D\uDC64', sinceDay: G.game.day };
+                G.partnerStageUsed = false;
+                self.showNotification('\uD83D\uDC91 与' + name + '结成最佳拍档！');
+                App.Save.autoSave();
+                self.renderAffection();
+                overlay.remove();
+            };
+            document.getElementById('bpConfirmNo2').onclick = function() { overlay.remove(); };
+        } catch(e) {
+            console.error('[invitePartner]', e);
         }
     },
     dissolvePartner() {
@@ -5710,9 +7308,11 @@ App.UI = {
         if (!G.bestPartner) { this.showNotification('还没有最佳拍档'); return; }
         if (G.partnerStageUsed) { this.showNotification('本周期已进行过双人舞台'); return; }
         G.partnerStageUsed = true;
-        const earn = randInt(100,300);
-        App.Store.updateStats({popularity:10, starlight:5, drumstick:earn});
-        this.showNotification(`🎶 与${G.bestPartner.name}的双人舞台大成功！🍗+${earn}`);
+        const loverBonus = App.Romance.getLoverBonus();
+        const earn = randInt(100,300) + loverBonus.pushBonus * 20;
+        const popGain = 10 + loverBonus.pushBonus;
+        App.Store.updateStats({popularity:popGain, starlight:5 + loverBonus.stageBonus, drumstick:earn});
+        this.showNotification(`🎶 与${G.bestPartner.name}的双人舞台大成功！🍗+${earn}${loverBonus.stageBonus>0 ? ' 💕恋人协同+'+loverBonus.stageBonus+'%' : ''}`);
         App.Achievements.checkAll();
     },
 
@@ -5751,6 +7351,28 @@ App.UI = {
             <div style="font-size:20px;font-weight:700">${G.player.name}</div>
             <div style="font-size:13px">${G.player.group} Team ${G.player.team} · ${stage.name}</div>
         </div>`;
+
+        // 主页数据面板：身体/心态/疲劳/好感 + 技能 + 资源
+        const physical = G.physical ?? 80, mental = G.mental ?? 75, fatigue = G.fatigue ?? 0;
+        const sk = G.trainingSkills || { dance:10, vocal:10, performance:10, variety:5 };
+        const affection = G.stats?.affection ?? 50;
+        const physColor = physical > 60 ? '#4caf50' : physical > 30 ? '#ff9800' : '#f44336';
+        const mentalColor = mental > 60 ? '#2196f3' : mental > 30 ? '#ff9800' : '#f44336';
+        const fatColor = fatigue < 30 ? '#4caf50' : fatigue < 60 ? '#ff9800' : '#f44336';
+        h +=
+        '<div style="display:flex;gap:8px;margin-bottom:8px">'+
+            '<div style="flex:1;background:#fff;border-radius:10px;padding:10px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)"><div style="font-size:18px">💪</div><div style="font-size:11px;color:#666">身体 '+physical+'</div><div style="height:6px;border-radius:3px;background:#eee;margin-top:4px"><div style="height:100%;border-radius:3px;width:'+physical+'%;background:'+physColor+'"></div></div></div>'+
+            '<div style="flex:1;background:#fff;border-radius:10px;padding:10px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)"><div style="font-size:18px">😊</div><div style="font-size:11px;color:#666">心态 '+mental+'</div><div style="height:6px;border-radius:3px;background:#eee;margin-top:4px"><div style="height:100%;border-radius:3px;width:'+mental+'%;background:'+mentalColor+'"></div></div></div>'+
+            '<div style="flex:1;background:#fff;border-radius:10px;padding:10px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)"><div style="font-size:18px">⚡</div><div style="font-size:11px;color:#666">疲劳 '+fatigue+'</div><div style="height:6px;border-radius:3px;background:#eee;margin-top:4px"><div style="height:100%;border-radius:3px;width:'+fatigue+'%;background:'+fatColor+'"></div></div></div>'+
+            '<div style="flex:1;background:#fff;border-radius:10px;padding:10px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)"><div style="font-size:18px">💕</div><div style="font-size:11px;color:#666">好感 '+affection+'</div><div style="height:6px;border-radius:3px;background:#eee;margin-top:4px"><div style="height:100%;border-radius:3px;width:'+affection+'%;background:#ff69b4"></div></div></div>'+
+        '</div>'+
+        '<div style="display:flex;gap:8px;font-size:13px;margin-bottom:12px;padding:4px 0">'+
+            '<span style="color:#e74c3c">💃'+sk.dance+'</span>'+
+            '<span style="color:#9b59b6">🎤'+sk.vocal+'</span>'+
+            '<span style="color:#f39c12">🎭'+sk.performance+'</span>'+
+            '<span style="color:#3498db">📺'+sk.variety+'</span>'+
+            '<span style="color:#999;margin-left:auto">⭐人气'+(s.popularity||0)+' 🍗鸡腿'+(s.drumstick||0)+'</span>'+
+        '</div>';
         const stats = [
             {label:'⭐人气',key:'popularity',color:'#ff69b4'},
             {label:'💪实力',key:'skill',color:'#3498db'},
@@ -5774,6 +7396,21 @@ App.UI = {
                   ${G.partnerStageUsed ? '<span style="color:#999">(本周期已演出)</span>' : '<button class="best-partner-btn" onclick="App.UI.startPartnerStage()">🎶 双人舞台</button>'}
                   <button class="best-partner-btn" onclick="App.UI.dissolvePartner()" style="background:#ff4757;color:#fff;margin-left:8px">💔 解除拍档</button>`;
         }
+        // 恋爱状态
+        App.Romance.init();
+        const activeRels = App.Romance.getActiveRelationships();
+        if (activeRels.length > 0) {
+            h += `<div style="margin-top:12px;font-weight:600">💕 恋爱关系</div>`;
+            activeRels.forEach(([name, rel]) => {
+                const stageObj = App.Romance.stages.find(s => s.id === rel.stage) || App.Romance.stages[0];
+                const pubObj = App.Romance.publicStatuses.find(p => p.id === rel.publicStatus) || App.Romance.publicStatuses[0];
+                h += `<div style="font-size:13px;padding:4px 0">${stageObj.emoji} ${name} · ${stageObj.name} · ${pubObj.emoji}${pubObj.name}</div>`;
+            });
+            const bonus = App.Romance.getLoverBonus();
+            if (bonus.pushBonus > 0 || bonus.stageBonus > 0) {
+                h += `<div style="font-size:11px;color:#c0392b">✨ 恋人加成生效中：推手+${bonus.pushBonus} 公演协同+${bonus.stageBonus}%</div>`;
+            }
+        }
         if (this.checkMoveGroupAvailable()) {
             h += `<div style="margin-top:12px"><button class="create-btn" onclick="App.UI.renderMoveGroupPanel()">🚄 移籍/换队</button></div>`;
         }
@@ -5783,50 +7420,97 @@ App.UI = {
 
     // ---------- 好感度查询 ----------
     renderAffection() {
+        App.Romance.init();
+        const lovers = App.Romance.getLovers();
+        const bonus = App.Romance.getLoverBonus();
+        const activeRels = App.Romance.getActiveRelationships();
+
         let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">💕 好感度</span></div>
         <div style="flex:1;overflow-y:auto">`;
-        
+
+        // === 恋爱状态总览 ===
+        if (activeRels.length > 0) {
+            h += `<div style="margin:8px 12px;background:linear-gradient(135deg,#fff0f5,#ffe4ec);border-radius:12px;padding:12px">
+                <div style="font-size:14px;font-weight:600;color:#c0392b;margin-bottom:8px">💕 我的恋爱</div>`;
+            activeRels.forEach(([name, rel]) => {
+                const aff = G.memberAffection[name] || 50;
+                const stageObj = App.Romance.stages.find(s => s.id === rel.stage) || App.Romance.stages[0];
+                const pubObj = App.Romance.publicStatuses.find(p => p.id === rel.publicStatus) || App.Romance.publicStatuses[0];
+                const happyColor = (rel.happiness || 50) >= 70 ? '#27ae60' : (rel.happiness || 50) >= 40 ? '#f39c12' : '#e74c3c';
+                h += `<div style="background:#fff;border-radius:10px;padding:10px;margin-bottom:8px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                        <span style="font-weight:600;font-size:14px">${stageObj.emoji} ${name}</span>
+                        <span style="font-size:11px;padding:2px 8px;border-radius:10px;background:${rel.publicStatus==='secret'?'#eee':rel.publicStatus==='rumor'?'#fff3cd':rel.publicStatus==='public'?'#f8d7da':'#d6d6d6'};color:#666">${pubObj.emoji} ${pubObj.name}</span>
+                    </div>
+                    <div style="display:flex;gap:8px;font-size:11px;color:#888;margin-bottom:4px">
+                        <span>关系：${stageObj.name}</span>
+                        <span>好感：${aff}%</span>
+                        <span style="color:${happyColor}">幸福：${rel.happiness||50}%</span>
+                    </div>
+                    <div style="display:flex;gap:6px;margin-top:6px">
+                        <button onclick="App.UI.showDateModal('${name}')" style="flex:1;padding:6px;border:none;background:#ff69b4;color:#fff;border-radius:6px;font-size:11px;cursor:pointer">💝 约会</button>
+                        <button onclick="App.UI.confirmBreakUp('${name}')" style="padding:6px 10px;border:none;background:#eee;color:#999;border-radius:6px;font-size:11px;cursor:pointer">💔</button>
+                    </div>
+                </div>`;
+            });
+            if (bonus.pushBonus > 0 || bonus.stageBonus > 0) {
+                h += `<div style="font-size:11px;color:#c0392b;text-align:center;padding:4px">✨ 恋人加成：推手+${bonus.pushBonus} 公演协同+${bonus.stageBonus}%</div>`;
+            }
+            h += `</div>`;
+        }
+
+        // === 最佳拍档 ===
+        if (G.bestPartner) {
+            h += `<div style="margin:0 12px 8px;background:linear-gradient(135deg,#f0f8ff,#e6f0ff);border-radius:12px;padding:10px;font-size:13px">
+                💞 最佳拍档：${typeof G.bestPartner==='string'?G.bestPartner:G.bestPartner.name} (自Day${G.bestPartner.sinceDay||G.bestPartner.day||1})</div>`;
+        }
+
+        // === 成员好感列表 ===
         let hasData = false;
-        
         Object.entries(App.NPCData).forEach(([groupKey, groupData]) => {
             const isMyGroup = groupKey === G.player.group;
             h += `<div class="contact-group-title">🏢 ${groupKey}${isMyGroup?' (我的分团)':''}</div>`;
-            
             if (groupData.teams) {
                 Object.entries(groupData.teams).forEach(([teamName, members]) => {
                     const isMyTeam = isMyGroup && teamName === G.player.team;
                     h += `<div style="font-size:12px;color:${isMyTeam?'#07c160':'#ff69b4'};padding:8px 16px 4px;font-weight:600">Team ${teamName}${isMyTeam?' ★':''}</div>`;
-                    
                     members.forEach(name => {
                         hasData = true;
                         const aff = G.memberAffection[name] || 50;
-                        const canInvite = aff >= 80;
+                        const canInvite = aff >= 61;
                         const affColor = aff >= 80 ? '#ff69b4' : aff >= 50 ? '#07c160' : aff >= 30 ? '#ff9500' : '#ff3b30';
-                        const affLevel = aff >= 80 ? '亲密' : aff >= 50 ? '友好' : aff >= 30 ? '普通' : '疏远';
-                        
-                        h += `<div class="affection-item">
+                        const stageObj = App.Romance.getStage(aff);
+                        const rel = App.Romance.getRelationship(name);
+                        const isLover = rel && rel.publicStatus !== 'broken';
+                        const canConfess = App.Romance.getStageIndex(aff) >= 2 && !isLover; // 暧昧以上且无关系
+
+                        h += `<div class="affection-item" style="${isLover?'border:2px solid #ff69b4;border-radius:12px':''}">
                             <div class="affection-avatar">👤</div>
                             <div class="affection-info">
-                                <div class="affection-name">${name}</div>
+                                <div class="affection-name">${name} <span style="font-size:11px;color:#999">${stageObj.emoji}${stageObj.name}</span></div>
                                 <div class="affection-bar-container">
                                     <div class="affection-bar" style="width:${aff}%;background:${affColor}"></div>
                                 </div>
                                 <div style="display:flex;justify-content:space-between;margin-top:4px">
-                                    <span style="font-size:12px;color:#888">${affLevel}</span>
+                                    <span style="font-size:12px;color:#888">${stageObj.name}</span>
                                     <span style="font-size:14px;font-weight:600;color:${affColor}">${aff}%</span>
                                 </div>
                             </div>
-                            ${canInvite ? `<button class="affection-invite-btn" onclick="App.UI.inviteBestPartner('${name}')">✨ 邀请</button>` : ''}
+                            <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                                ${canInvite ? `<button class="affection-invite-btn" onclick="App.UI.inviteBestPartner('${name}')" style="font-size:10px;padding:4px 8px">✨ 邀请</button>` : ''}
+                                ${canConfess ? `<button onclick="App.UI.confessTo('${name}')" style="font-size:10px;padding:4px 8px;border:none;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;border-radius:12px;cursor:pointer">💌 表白</button>` : ''}
+                                ${rel && rel.publicStatus === 'broken' ? `<button onclick="App.UI.reconcileWith('${name}')" style="font-size:10px;padding:4px 8px;border:none;background:#f0f0f0;color:#999;border-radius:12px;cursor:pointer">🔄 复合</button>` : ''}
+                            </div>
                         </div>`;
                     });
                 });
             }
         });
-        
+
         if (!hasData) {
             h += '<div class="empty-hint">暂无成员数据</div>';
         }
-        
+
         // 社交圈展示
         App.SocialNetwork.initIfNeeded();
         if (G.socialCircles.length > 0) {
@@ -5838,24 +7522,172 @@ App.UI = {
                 </div>`;
             });
         }
-        
+
         h += `</div>`;
         document.getElementById('affectionPage').innerHTML = h;
     },
     inviteBestPartner(name) {
-        if (G.bestPartner) {
-            this.showNotification(`你已经和 ${G.bestPartner} 是最佳拍档了`);
-            return;
+        try {
+            const aff = G.memberAffection[name] || 50;
+            if (aff < 61) { this.showNotification('与' + name + '的好感度需达到「挚友」(61)才能邀请'); return; }
+            var currentName = typeof G.bestPartner === 'string' ? G.bestPartner : (G.bestPartner && G.bestPartner.name ? G.bestPartner.name : null);
+            if (currentName) {
+                if (currentName === name) { this.showNotification(name + '已经是你的最佳拍档了！'); return; }
+                this.showNotification('你已经是' + currentName + '的最佳拍档了，需先解除关系'); 
+                return;
+            }
+            
+            // 使用自定义确认弹窗替代 window.confirm（移动端兼容性更好）
+            var overlay = document.createElement('div');
+            overlay.className = 'modal-overlay';
+            overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:2000';
+            overlay.innerHTML = '<div style="background:#fff;border-radius:16px;padding:24px;margin:20px;text-align:center;max-width:280px"><div style="font-size:18px;font-weight:600;margin-bottom:12px">💕 邀请最佳拍档</div><p style="font-size:14px;color:#666;margin-bottom:20px">确定邀请 <b>' + name + '</b> 成为你的最佳拍档吗？</p><div style="display:flex;gap:10px"><button id="bpConfirmYes" style="flex:1;padding:10px;border:none;background:#ff69b4;color:#fff;border-radius:8px;font-size:14px">确认</button><button id="bpConfirmNo" style="flex:1;padding:10px;border:none;background:#eee;color:#333;border-radius:8px;font-size:14px">取消</button></div></div>';
+            document.querySelector('.phone-screen').appendChild(overlay);
+            
+            var self = this;
+            document.getElementById('bpConfirmYes').onclick = function() {
+                G.bestPartner = { name: name, avatar: '\uD83D\uDC64', sinceDay: G.game.day };
+                G.partnerStageUsed = false;
+                G.memberAffection[name] = Math.min(100, (G.memberAffection[name] || 50) + 10);
+                self.showNotification('\uD83C\uDF89 成功邀请 ' + name + ' 成为最佳拍档！');
+                App.Store.updateStats({popularity: 20, mood: 10});
+                if (typeof App.Store.recalcAffection === 'function') App.Store.recalcAffection();
+                self.renderAffection();
+                overlay.remove();
+            };
+            document.getElementById('bpConfirmNo').onclick = function() { overlay.remove(); };
+        } catch(e) {
+            console.error('[inviteBestPartner]', e);
+            this.showNotification('操作出错: ' + e.message);
         }
-        
-        const confirm = window.confirm(`确定邀请 ${name} 成为你的最佳拍档吗？`);
-        if (confirm) {
-            G.bestPartner = name;
-            G.memberAffection[name] = Math.min(100, (G.memberAffection[name] || 50) + 10);
-            this.showNotification(`🎉 成功邀请 ${name} 成为最佳拍档！`);
-            App.Store.updateStats({popularity: 20, mood: 10});
-            this.renderAffection();
-        }
+    },
+
+    // ---------- 恋爱支线 UI ----------
+    confessTo(name) {
+        const aff = G.memberAffection[name] || 50;
+        const stage = App.Romance.getStage(aff);
+        const successRate = Math.min(95, Math.round(((aff - 50) / 50) * 100));
+
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:2000';
+        overlay.innerHTML = `<div style="background:#fff;border-radius:16px;padding:24px;margin:20px;text-align:center;max-width:300px">
+            <div style="font-size:48px;margin-bottom:8px">💌</div>
+            <div style="font-size:18px;font-weight:600;margin-bottom:8px">向${name}表白</div>
+            <div style="font-size:13px;color:#666;margin-bottom:6px">当前关系：${stage.emoji} ${stage.name}</div>
+            <div style="font-size:13px;color:#888;margin-bottom:16px">好感度：${aff}% · 成功率约${Math.max(0,successRate)}%</div>
+            <div style="font-size:11px;color:#e74c3c;margin-bottom:16px">⚠️ 表白失败好感度会降低</div>
+            <div style="display:flex;gap:10px">
+                <button id="confessYes" style="flex:1;padding:10px;border:none;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;border-radius:8px;font-size:14px;cursor:pointer">💕 表白</button>
+                <button id="confessNo" style="flex:1;padding:10px;border:none;background:#eee;color:#333;border-radius:8px;font-size:14px;cursor:pointer">再等等</button>
+            </div>
+        </div>`;
+        document.querySelector('.phone-screen').appendChild(overlay);
+
+        var self = this;
+        document.getElementById('confessYes').onclick = function() {
+            const result = App.Romance.confess(name);
+            self.showNotification(result.msg, 4000);
+            self.renderAffection();
+            overlay.remove();
+        };
+        document.getElementById('confessNo').onclick = function() { overlay.remove(); };
+    },
+
+    showDateModal(name) {
+        const rel = App.Romance.getRelationship(name);
+        if (!rel) { this.showNotification('还没有恋爱关系'); return; }
+
+        const stageIdx = App.Romance.getStageIndex(G.memberAffection[name] || 50);
+        let dateCards = '';
+        App.Romance.dateTypes.forEach(dt => {
+            const reqIdx = App.Romance.stages.findIndex(s => s.id === dt.minStage);
+            const unlocked = stageIdx >= reqIdx;
+            const canAfford = dt.cost === 0 || (G.stats.wechatBalance || 0) >= dt.cost;
+            const onCooldown = G.romance.cooldown > 0;
+            const disabled = !unlocked || !canAfford || onCooldown;
+
+            dateCards += `<div style="background:#fff;border-radius:10px;padding:10px;margin-bottom:8px;opacity:${disabled?'0.5':'1'};${disabled?'':'cursor:pointer'}" ${!disabled?`onclick="App.UI.executeDate('${name}','${dt.id}')"`:''}>
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="font-size:14px">${dt.emoji} ${dt.name}</span>
+                    <span style="font-size:11px;color:#888">${dt.cost>0?'¥'+dt.cost:'免费'}</span>
+                </div>
+                <div style="font-size:11px;color:#999;margin-top:4px">${dt.desc}</div>
+                <div style="font-size:10px;color:#aaa;margin-top:2px">好感+${dt.affGain} · 心情+${dt.moodGain} · 疲劳+${dt.fatigueCost}${!unlocked?' · 🔒 需要'+App.Romance.stages[reqIdx].name:''}</div>
+            </div>`;
+        });
+
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:2000';
+        overlay.innerHTML = `<div style="background:#fff;border-radius:16px;padding:20px;margin:16px;max-width:320px;width:100%;max-height:80%;overflow-y:auto">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <span style="font-size:16px;font-weight:600">💝 与${name}约会</span>
+                <span style="font-size:12px;color:#888">${G.romance.cooldown>0?'冷却'+G.romance.cooldown+'天':'可约会'}</span>
+            </div>
+            ${dateCards}
+            <button onclick="this.closest('.modal-overlay').remove()" style="width:100%;padding:10px;border:none;background:#eee;color:#333;border-radius:8px;font-size:13px;cursor:pointer;margin-top:4px">关闭</button>
+        </div>`;
+        document.querySelector('.phone-screen').appendChild(overlay);
+    },
+
+    executeDate(name, dateTypeId) {
+        const result = App.Romance.goDate(name, dateTypeId);
+        this.showNotification(result.msg, 4000);
+        // 关闭弹窗
+        document.querySelectorAll('.modal-overlay').forEach(el => el.remove());
+        this.renderAffection();
+    },
+
+    confirmBreakUp(name) {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:2000';
+        overlay.innerHTML = `<div style="background:#fff;border-radius:16px;padding:24px;margin:20px;text-align:center;max-width:280px">
+            <div style="font-size:48px;margin-bottom:8px">💔</div>
+            <div style="font-size:18px;font-weight:600;margin-bottom:8px">确定分手？</div>
+            <div style="font-size:13px;color:#666;margin-bottom:16px">与${name}分手后将失去恋人加成，好感度大幅下降</div>
+            <div style="display:flex;gap:10px">
+                <button id="breakYes" style="flex:1;padding:10px;border:none;background:#e74c3c;color:#fff;border-radius:8px;font-size:14px;cursor:pointer">分手</button>
+                <button id="breakNo" style="flex:1;padding:10px;border:none;background:#eee;color:#333;border-radius:8px;font-size:14px;cursor:pointer">取消</button>
+            </div>
+        </div>`;
+        document.querySelector('.phone-screen').appendChild(overlay);
+
+        var self = this;
+        document.getElementById('breakYes').onclick = function() {
+            const result = App.Romance.breakUp(name);
+            self.showNotification(result.msg, 4000);
+            self.renderAffection();
+            overlay.remove();
+        };
+        document.getElementById('breakNo').onclick = function() { overlay.remove(); };
+    },
+
+    reconcileWith(name) {
+        const aff = G.memberAffection[name] || 50;
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:2000';
+        overlay.innerHTML = `<div style="background:#fff;border-radius:16px;padding:24px;margin:20px;text-align:center;max-width:280px">
+            <div style="font-size:48px;margin-bottom:8px">🔄</div>
+            <div style="font-size:18px;font-weight:600;margin-bottom:8px">请求复合</div>
+            <div style="font-size:13px;color:#666;margin-bottom:16px">与${name}复合需要好感度60以上<br>当前好感度：${aff}%</div>
+            <div style="display:flex;gap:10px">
+                <button id="reconYes" style="flex:1;padding:10px;border:none;background:linear-gradient(135deg,#ff69b4,#ff1493);color:#fff;border-radius:8px;font-size:14px;cursor:pointer">💕 复合</button>
+                <button id="reconNo" style="flex:1;padding:10px;border:none;background:#eee;color:#333;border-radius:8px;font-size:14px;cursor:pointer">取消</button>
+            </div>
+        </div>`;
+        document.querySelector('.phone-screen').appendChild(overlay);
+
+        var self = this;
+        document.getElementById('reconYes').onclick = function() {
+            const result = App.Romance.reconcile(name);
+            self.showNotification(result.msg, 4000);
+            self.renderAffection();
+            overlay.remove();
+        };
+        document.getElementById('reconNo').onclick = function() { overlay.remove(); };
     },
 
     // ---------- 日记本 ----------
@@ -6010,11 +7842,10 @@ App.UI = {
 
     // ---------- 选举、握手、设置 ----------
     renderElection() {
-        // V2 入口
-        return this.renderElectionV2();
+        return this.renderElectionV3();
     },
-    // V2 总选主界面
-    renderElectionV2() {
+    // V3 总选主界面（粉丝投票系统）
+    renderElectionV3() {
         const me = App.Election.init();
         const day = G.game.day;
         const dim = day % 30 || 30;
@@ -6025,216 +7856,296 @@ App.UI = {
         };
         const phase = me.phase;
         const canBuy = phase === 'register' || phase === 'first_pull' || phase === 'second_pull';
-        const canPickPromoter = phase === 'register' || phase === 'first_pull';
+        const fanVotes = App.Election.calcFanVotes();
+        const predictedVotes = App.Election.calculateFinalVotes();
 
-        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🏆 总选举</span></div>`;
-        h += `<div style="flex:1;overflow-y:auto;padding:12px">`;
+        let h = '<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">\u2190</span><span class="title">\uD83C\uDFC6 总选举</span></div>';
+        h += '<div style="flex:1;overflow-y:auto;padding:12px">';
 
         // 头部状态卡
-        const predictedVotes = App.Election.calculateFinalVotes();
-        const predictedRank = me.predictedRank || '—';
-        h += `<div style="background:linear-gradient(135deg,#ff69b4,#ff1493);border-radius:12px;padding:16px;color:#fff;margin-bottom:12px">
-            <div style="font-size:13px;opacity:0.9">第 ${me.month} 届 · ${phaseNames[phase] || phase}</div>
-            <div style="font-size:32px;font-weight:700;margin:4px 0">第 ${dim} 天 / 30 天</div>
-            <div style="display:flex;gap:8px;margin-top:10px">
-                <div style="flex:1;background:rgba(255,255,255,0.18);border-radius:8px;padding:8px">
-                    <div style="font-size:11px;opacity:0.85">预测票数</div>
-                    <div style="font-size:18px;font-weight:700">${predictedVotes.toLocaleString()}</div>
-                </div>
-                <div style="flex:1;background:rgba(255,255,255,0.18);border-radius:8px;padding:8px">
-                    <div style="font-size:11px;opacity:0.85">预测排名</div>
-                    <div style="font-size:18px;font-weight:700">#${predictedRank}</div>
-                </div>
-                <div style="flex:1;background:rgba(255,255,255,0.18);border-radius:8px;padding:8px">
-                    <div style="font-size:11px;opacity:0.85">🍗 鸡腿</div>
-                    <div style="font-size:18px;font-weight:700">${(G.stats.drumstick||0).toLocaleString()}</div>
-                </div>
-            </div>
-        </div>`;
+        h += '<div style="background:linear-gradient(135deg,#ff69b4,#ff1493);border-radius:12px;padding:16px;color:#fff;margin-bottom:12px">';
+        h += '<div style="font-size:13px;opacity:0.9">第 ' + me.month + ' 届 \xB7 ' + (phaseNames[phase] || phase) + '</div>';
+        h += '<div style="font-size:32px;font-weight:700;margin:4px 0">第 ' + dim + ' 天 / 30 天</div>';
+        h += '<div style="display:flex;gap:8px;margin-top:10px">';
+        h += '<div style="flex:1;background:rgba(255,255,255,0.18);border-radius:8px;padding:8px"><div style="font-size:11px;opacity:0.85">粉丝票</div><div style="font-size:18px;font-weight:700">' + fanVotes.toLocaleString() + '</div></div>';
+        h += '<div style="flex:1;background:rgba(255,255,255,0.18);border-radius:8px;padding:8px"><div style="font-size:11px;opacity:0.85">预测总票</div><div style="font-size:18px;font-weight:700">' + predictedVotes.toLocaleString() + '</div></div>';
+        h += '<div style="flex:1;background:rgba(255,255,255,0.18);border-radius:8px;padding:8px"><div style="font-size:11px;opacity:0.85">\uD83C\uDF57 鸡腿</div><div style="font-size:18px;font-weight:700">' + (G.stats.drumstick||0).toLocaleString() + '</div></div>';
+        h += '</div></div>';
 
         // 时间表
-        h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
-            <div style="font-size:14px;font-weight:600;margin-bottom:8px">📅 时间表</div>
-            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;font-size:11px">
-                <div style="text-align:center;padding:6px;background:${dim>=1?'#ffe0eb':'#f5f5f5'};border-radius:6px">📋1-9天<br>报名</div>
-                <div style="text-align:center;padding:6px;background:${dim>=10?'#ffe0eb':'#f5f5f5'};border-radius:6px">📊10天<br>初报</div>
-                <div style="text-align:center;padding:6px;background:${dim>=20?'#ffe0eb':'#f5f5f5'};border-radius:6px">📈20天<br>中报</div>
-                <div style="text-align:center;padding:6px;background:${dim>=30?'#ffe0eb':'#f5f5f5'};border-radius:6px">🏆30天<br>最终</div>
-            </div>
-        </div>`;
+        h += '<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">';
+        h += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">\uD83D\uDCC5 时间表</div>';
+        h += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;font-size:11px">';
+        h += '<div style="text-align:center;padding:6px;background:' + (dim>=1?'#ffe0eb':'#f5f5f5') + ';border-radius:6px">\uD83D\uDCCB1-9天<br>报名</div>';
+        h += '<div style="text-align:center;padding:6px;background:' + (dim>=10?'#ffe0eb':'#f5f5f5') + ';border-radius:6px">\uD83D\uDCCA10天<br>初报</div>';
+        h += '<div style="text-align:center;padding:6px;background:' + (dim>=20?'#ffe0eb':'#f5f5f5') + ';border-radius:6px">\uD83D\uDCC820天<br>中报</div>';
+        h += '<div style="text-align:center;padding:6px;background:' + (dim>=30?'#ffe0eb':'#f5f5f5') + ';border-radius:6px">\uD83C\uDFC630天<br>最终</div>';
+        h += '</div></div>';
 
-        // 我推的成员(玩家 = 推手/粉丝,这里选的是被推的成员)
-        const teamMates = (App.getTeamMates?.(G.player.group, G.player.team) || []).slice(0, 10);
-        h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
-            <div style="display:flex;align-items:baseline;gap:6px;margin-bottom:4px">
-                <span style="font-size:14px;font-weight:600">💖 我推的成员</span>
-                <span style="color:#999;font-size:11px">${me.promoters.length}/3</span>
-            </div>
-            <div style="font-size:10px;color:#999;margin-bottom:8px">你 = 推手(粉丝),以下是你在总选中重点应援的成员</div>`;
-        if (teamMates.length === 0) {
-            h += `<div style="color:#999;font-size:12px;text-align:center;padding:8px">同队暂无成员可推</div>`;
-        } else {
-            for (const m of teamMates) {
-                const isSel = me.promoters.includes(m.name);
-                const aff = G.memberAffection?.[m.name] ?? 50;
-                h += `<div onclick="${canPickPromoter ? `App.UI.electionPickPromoter('${m.name}')` : ''}" style="display:flex;align-items:center;padding:8px;border:1px solid ${isSel?'#ff69b4':'#eee'};border-radius:8px;margin-bottom:4px;cursor:${canPickPromoter?'pointer':'default'};background:${isSel?'#fff5fa':'#fff'}">
-                    <div style="flex:1">
-                        <div style="font-size:14px;font-weight:600">${m.name} ${isSel?'💖':''}</div>
-                        <div style="font-size:11px;color:#999">${m.group} Team ${m.team} · 好感 ${aff}</div>
-                    </div>
-                    <div style="font-size:12px;color:${isSel?'#ff69b4':'#999'}">${isSel?'💖 已推':'点此推她'}</div>
-                </div>`;
-            }
+        // ===== 粉丝分布面板 =====
+        const cats = me.fanbase.categories;
+        const catKeys = Object.keys(App.Election.fanCategories);
+        const totalCatFans = catKeys.reduce((s,k) => s + (cats[k]?.count || 0), 0);
+        h += '<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">';
+        h += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">\uD83D\uDC65 粉丝群体 <span style="color:#999;font-size:11px">(' + (G.game.pocket_fans||0) + '人)</span></div>';
+        for (const key of catKeys) {
+            const def = App.Election.fanCategories[key];
+            const cat = cats[key] || { count:0, loyalty:50 };
+            const pct = totalCatFans > 0 ? Math.floor(cat.count / totalCatFans * 100) : 0;
+            const loyaltyColor = cat.loyalty >= 80 ? '#4caf50' : cat.loyalty >= 50 ? '#ff9800' : '#f44336';
+            h += '<div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid #f5f5f5">';
+            h += '<div style="width:30px;font-size:16px">' + def.emoji + '</div>';
+            h += '<div style="flex:1">';
+            h += '<div style="font-size:12px;font-weight:600">' + def.name + ' <span style="color:#999;font-size:10px">x' + def.votePower + '</span></div>';
+            h += '<div style="display:flex;gap:6px;align-items:center;margin-top:2px">';
+            h += '<div style="flex:1;height:4px;background:#f0f0f0;border-radius:2px;overflow:hidden"><div style="height:100%;width:' + pct + '%;background:#ff69b4"></div></div>';
+            h += '<span style="font-size:10px;color:#666">' + cat.count + '</span>';
+            h += '</div></div>';
+            h += '<div style="text-align:right;min-width:36px"><div style="font-size:11px;font-weight:600;color:' + loyaltyColor + '">' + (cat.loyalty||0) + '%</div><div style="font-size:9px;color:#999">忠诚</div></div>';
+            h += '</div>';
         }
-        h += `</div>`;
+        h += '</div>';
 
-        // 拉票活动商店
-        h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
-            <div style="font-size:14px;font-weight:600;margin-bottom:8px">📣 拉票活动</div>`;
+        // ===== 私联面板 =====
+        h += '<div style="background:#fff5f5;border:1px solid #ffcccc;border-radius:12px;padding:12px;margin-bottom:12px">';
+        h += '<div style="font-size:14px;font-weight:600;margin-bottom:6px;color:#c00">\uD83D\uDCAC 私联粉丝 <span style="color:#999;font-size:11px">(高风险·免费)</span></div>';
+        h += '<div style="font-size:11px;color:#666;margin-bottom:8px">私联特定粉丝获得选票与财产，不消耗鸡腿。70%基础触发率+人气加成，每日每种限1次</div>';
+        // 风险进度条
+        const riskPct = me.privateContactRisk || 0;
+        const riskColor = riskPct >= 60 ? '#f44336' : riskPct >= 30 ? '#ff9800' : '#4caf50';
+        h += '<div style="margin-bottom:8px"><div style="font-size:11px;color:#666;margin-bottom:2px">累计风险：' + riskPct + '% (每天-2)</div>';
+        h += '<div style="height:6px;background:#f0f0f0;border-radius:3px;overflow:hidden"><div style="height:100%;width:' + riskPct + '%;background:' + riskColor + ';transition:width 0.3s"></div></div></div>';
+        // 私联按钮
+        const canPrivate = canBuy && riskPct < 90;
+        for (const [fType, target] of Object.entries(App.Election.privateContactTargets)) {
+            const usedCount = (me._pcUsedToday || {})[fType] || 0;
+            const dailyLeft = (target.dailyLimit || 1) - usedCount;
+            const btnDisabled = !canPrivate || dailyLeft <= 0;
+            h += '<div style="display:flex;align-items:center;padding:6px;border:1px solid #ffe0e0;border-radius:8px;margin-bottom:4px;background:#fff">';
+            h += '<div style="font-size:20px;margin-right:8px">' + target.emoji + '</div>';
+            h += '<div style="flex:1"><div style="font-size:12px;font-weight:600">私联' + target.name + '</div>';
+            h += '<div style="font-size:10px;color:#666">+' + target.votesMin.toLocaleString() + '~' + target.votesMax.toLocaleString() + '票 \xB7 ¥' + target.wealthMin + '~' + target.wealthMax + ' \xB7 风险+' + target.riskAdd + '% \xB7 今日剩余' + dailyLeft + '次</div></div>';
+            h += '<button ' + (btnDisabled ? 'disabled' : '') + ' onclick="App.UI.electionPrivateContact(\'' + fType + '\')" style="padding:6px 10px;background:' + (btnDisabled?'#ccc':'#e53935') + ';color:#fff;border:none;border-radius:6px;font-size:11px;cursor:' + (btnDisabled?'not-allowed':'pointer') + '">' + (dailyLeft<=0?'已用':'私联') + '</button>';
+            h += '</div>';
+        }
+        // 已私联记录
+        if ((me.privateContacts || []).length > 0) {
+            h += '<div style="margin-top:8px;font-size:11px;color:#666">';
+            for (const pc of me.privateContacts.slice(-3)) {
+                const def = App.Election.privateContactTargets[pc.fanType];
+                h += '<div style="padding:2px 0">' + (def?.emoji||'') + ' Day' + pc.day + ': ' + (pc.discovered ? '<span style="color:#f44336">被发现!</span>' : '+' + (pc.votesGained||0).toLocaleString() + '票 \xB7 ¥' + (pc.wealthGained||0)) + '</div>';
+            }
+            h += '</div>';
+        }
+        h += '</div>';
+
+        // ===== 拉票活动商店（初报日起开放至最终日前） =====
+        const activityOpen = dim >= 10 && dim < 30;
+        h += '<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px' + (!activityOpen?';opacity:0.6':'') + '">';
+        if (activityOpen) {
+            h += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">\uD83D\uDCE3 拉票活动 <span style="font-size:11px;color:#4caf50">· 已开放</span></div>';
+        } else {
+            h += '<div style="font-size:14px;font-weight:600;margin-bottom:8px;color:#999">\uD83D\uDCE3 拉票活动 <span style="font-size:11px;color:#bbb">· 暂未开放（Day10 起开放）</span></div>';
+        }
         for (const a of App.Election.activities) {
             const used = (me.activitiesUsed || []).find(x => x.id === a.id);
             const usedCount = used ? used.count : 0;
-            const canAfford = (G.stats.drumstick || 0) >= a.cost;
-            const phaseFactor = App.Election.getActivityMultiplier(phase, a);
+            const phaseFactor = App.Election.getActivityMultiplier(phase);
             const actualVotes = a.hostile ? 0 : Math.floor(a.votes * phaseFactor);
-            h += `<div style="display:flex;align-items:center;padding:10px;border:1px solid #eee;border-radius:8px;margin-bottom:6px;background:${a.hostile?'#fff8f0':'#fff'}">
-                <div style="font-size:24px;margin-right:10px">${a.emoji}</div>
-                <div style="flex:1">
-                    <div style="font-size:14px;font-weight:600">${a.name} ${usedCount>0?`<span style="background:#ff69b4;color:#fff;font-size:10px;padding:2px 6px;border-radius:10px;margin-left:4px">已用${usedCount}</span>`:''}</div>
-                    <div style="font-size:11px;color:#666">${a.desc}</div>
-                    <div style="font-size:11px;margin-top:2px">🍗 ${a.cost} · ${a.hostile?`⚠️ 风险 ${Math.round(a.risk*100)}%`:actualVotes>0?`+${actualVotes.toLocaleString()} 票 (${phaseFactor}×)`:''}</div>
-                </div>
-                <button ${(!canBuy || !canAfford) ? 'disabled' : ''} onclick="App.UI.electionBuyActivity('${a.id}')" style="padding:8px 12px;background:${(!canBuy || !canAfford)?'#ddd':'#ff69b4'};color:#fff;border:none;border-radius:6px;font-size:12px;cursor:${(!canBuy || !canAfford)?'not-allowed':'pointer'}">${canBuy?'进行':'不可'}</button>
-            </div>`;
+            const canAffordAct = (G.stats.drumstick || 0) >= a.cost;
+            const actBtnDisabled = !activityOpen || !canAffordAct;
+            const bg = actBtnDisabled ? '#f5f5f5' : (a.hostile ? '#fff8f0' : '#fff');
+            const emojiFilter = !activityOpen ? ';filter:grayscale(1)' : '';
+            const nameColor = !activityOpen ? ';color:#999' : '';
+            const descColor = !activityOpen ? '#aaa' : '#666';
+            const detailColor = !activityOpen ? '#bbb' : '#666';
+            const tagBg = activityOpen ? '#ff69b4' : '#ccc';
+            const usedTag = usedCount > 0 ? '<span style="background:' + tagBg + ';color:#fff;font-size:10px;padding:2px 6px;border-radius:10px;margin-left:4px">\u5DF2\u7528' + usedCount + '</span>' : '';
+            const detail = a.hostile ? '\u26A0\uFE0F \u98CE\u9669 ' + Math.round(a.risk*100) + '%' : (actualVotes > 0 ? '+' + actualVotes.toLocaleString() + ' \u7968 (' + phaseFactor + '\u00D7)' : '');
+            const btnBg = actBtnDisabled ? '#ccc' : (a.hostile ? '#e67e22' : '#ff69b4');
+            const btnCursor = actBtnDisabled ? 'not-allowed' : 'pointer';
+            const btnText = activityOpen ? (canAffordAct ? '\u8FDB\u884C' : '\u9E21\u817F\u4E0D\u8DB3') : '\u672A\u5F00\u653E';
+            h += '<div style="display:flex;align-items:center;padding:10px;border:1px solid #eee;border-radius:8px;margin-bottom:6px;background:' + bg + '">';
+            h += '<div style="font-size:24px;margin-right:10px' + emojiFilter + '">' + a.emoji + '</div>';
+            h += '<div style="flex:1"><div style="font-size:14px;font-weight:600' + nameColor + '">' + a.name + usedTag + '</div>';
+            h += '<div style="font-size:11px;color:' + descColor + '">' + a.desc + '</div>';
+            h += '<div style="font-size:11px;margin-top:2px;color:' + detailColor + '">\uD83C\uDF57 ' + a.cost + ' \xB7 ' + detail + '</div></div>';
+            h += '<button ' + (actBtnDisabled ? 'disabled' : '') + ' onclick="App.UI.electionBuyActivity(\'' + a.id + '\')" style="padding:8px 12px;background:' + btnBg + ';color:#fff;border:none;border-radius:6px;font-size:12px;cursor:' + btnCursor + '">' + btnText + '</button>';
+            h += '</div>';
         }
-        h += `</div>`;
+        h += '</div>';
 
-        // 竞敌雷达
-        h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
-            <div style="font-size:14px;font-weight:600;margin-bottom:8px">🎯 竞敌雷达 <span style="color:#999;font-size:11px">(主要对手)</span></div>`;
+        // ===== 竞敌雷达 =====
+        h += '<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">';
+        h += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">\uD83C\uDFAF 竞敌雷达</div>';
         const rivals = me.rivals || [];
         if (rivals.length === 0) {
-            h += `<div style="color:#999;font-size:12px;text-align:center;padding:8px">暂无竞敌数据</div>`;
+            h += '<div style="color:#999;font-size:12px;text-align:center;padding:8px">\u6682\u65E0\u7ADE\u654C\u6570\u636E</div>';
         } else {
-            rivals.slice(0, 5).forEach((r, i) => {
-                h += `<div style="display:flex;align-items:center;padding:8px;border-bottom:1px solid #f0f0f0">
-                    <div style="width:24px;font-size:14px;font-weight:600;color:#999">#${i+1}</div>
-                    <div style="flex:1">
-                        <div style="font-size:13px;font-weight:600">${r.name}</div>
-                        <div style="font-size:10px;color:#999">${r.group} · ${r.action?.desc||'无'}</div>
-                    </div>
-                    <div style="font-size:12px;color:#666">${r.votes.toLocaleString()} 票</div>
-                </div>`;
-            });
+            for (let i = 0; i < Math.min(rivals.length, 5); i++) {
+                const r = rivals[i];
+                h += '<div style="display:flex;align-items:center;padding:8px;border-bottom:1px solid #f0f0f0">';
+                h += '<div style="width:24px;font-size:14px;font-weight:600;color:#999">#' + (i+1) + '</div>';
+                h += '<div style="flex:1"><div style="font-size:13px;font-weight:600">' + r.name + '</div>';
+                h += '<div style="font-size:10px;color:#999">' + r.group + ' \xB7 ' + (r.action?.desc||'') + '</div></div>';
+                h += '<div style="font-size:12px;color:#666">' + r.votes.toLocaleString() + ' \u7968</div>';
+                h += '</div>';
+            }
         }
-        h += `</div>`;
+        h += '</div>';
+
+        // 竞敌私联事件
+        if ((me.rivalPrivateContacts || []).filter(r => !r.handled).length > 0) {
+            h += '<div style="background:#fff5e6;border:1px solid #ffd700;border-radius:12px;padding:12px;margin-bottom:12px">';
+            h += '<div style="font-size:13px;font-weight:600;margin-bottom:6px">\u26A0\uFE0F \u7ADE\u654C\u79C1\u8054\u4E8B\u4EF6</div>';
+            for (let i = 0; i < me.rivalPrivateContacts.length; i++) {
+                const rpc = me.rivalPrivateContacts[i];
+                if (rpc.handled) continue;
+                h += '<div style="padding:8px;border:1px solid #ffe0b2;border-radius:6px;margin-bottom:6px">';
+                h += '<div style="font-size:12px">' + rpc.rivalName + ' \u88AB\u53D1\u73B0\u79C1\u8054\u7C89\u4E1D\uFF01</div>';
+                h += '<div style="display:flex;gap:6px;margin-top:6px">';
+                h += '<button onclick="App.UI.electionHandleRivalPC(' + i + ',\'report\')" style="flex:1;padding:6px;background:#4caf50;color:#fff;border:none;border-radius:4px;font-size:11px;cursor:pointer">\uD83D\uDCE4 \u4E3E\u62A5</button>';
+                h += '<button onclick="App.UI.electionHandleRivalPC(' + i + ',\'silence\')" style="flex:1;padding:6px;background:#999;color:#fff;border:none;border-radius:4px;font-size:11px;cursor:pointer">\uD83E\uDD10 \u6C89\u9ED8</button>';
+                h += '</div></div>';
+            }
+            h += '</div>';
+        }
 
         // 黑料列表
         if ((me.controversies || []).length > 0) {
-            h += `<div style="background:#fff5f5;border:1px solid #ffcccc;border-radius:12px;padding:12px;margin-bottom:12px">
-                <div style="font-size:14px;font-weight:600;margin-bottom:8px;color:#c00">⚠️ 黑料/争议 (${me.controversies.length})</div>`;
-            me.controversies.forEach(c => {
-                h += `<div style="font-size:12px;color:#666;padding:4px 0">· ${c.desc} <span style="color:#c00">(-${(c.penaltyVotes||0).toLocaleString()} 票)</span></div>`;
-            });
-            h += `</div>`;
+            h += '<div style="background:#fff5f5;border:1px solid #ffcccc;border-radius:12px;padding:12px;margin-bottom:12px">';
+            h += '<div style="font-size:14px;font-weight:600;margin-bottom:8px;color:#c00">\u26A0\uFE0F \u9ED1\u6599/\u4E89\u8BAE (' + me.controversies.length + ')</div>';
+            for (const c of me.controversies) {
+                h += '<div style="font-size:12px;color:#666;padding:4px 0">\xB7 ' + c.desc + ' <span style="color:#c00">(-' + (c.penaltyVotes||0).toLocaleString() + ' \u7968)</span></div>';
+            }
+            h += '</div>';
         }
 
         // 历史战绩
         if ((me.history || []).length > 0) {
-            h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
-                <div style="font-size:14px;font-weight:600;margin-bottom:8px">📊 历届战绩</div>`;
-            me.history.forEach((h2, i) => {
+            h += '<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">';
+            h += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">\uD83D\uDCCA \u5386\u5C4A\u6218\u7EE9</div>';
+            for (let i = 0; i < me.history.length; i++) {
+                const h2 = me.history[i];
                 const tier = App.Election.getRankTier(h2.rank);
-                h += `<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px;border-bottom:1px solid #f5f5f5">
-                    <span>第 ${i+1} 届</span>
-                    <span>${tier.name}</span>
-                    <span>${h2.votes.toLocaleString()} 票</span>
-                </div>`;
-            });
-            h += `</div>`;
+                h += '<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px;border-bottom:1px solid #f5f5f5">';
+                h += '<span>\u7B2C ' + (i+1) + ' \u5C4A</span>';
+                h += '<span>' + tier.name + (h2.isKami7?' \u2728':'') + '</span>';
+                h += '<span>' + h2.votes.toLocaleString() + ' \u7968</span>';
+                h += '</div>';
+            }
+            h += '</div>';
         }
 
         // 报日快捷按钮
         if (phase === 'first_report' || phase === 'second_report' || phase === 'final_report') {
             const typeMap = { first_report:'first', second_report:'second', final_report:'final' };
-            const typeName = { first:'📊 查看初报排名', second:'📈 查看中报排名', final:'🏆 查看最终排名' };
-            h += `<button onclick="App.UI.electionDoReport('${typeMap[phase]}')" style="width:100%;padding:14px;background:linear-gradient(135deg,#ffd700,#ff9500);color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:bold;cursor:pointer;margin-bottom:12px">${typeName[typeMap[phase]]}</button>`;
+            const typeName = { first:'\uD83D\uDCCA \u67E5\u770B\u521D\u62A5\u6392\u540D', second:'\uD83D\uDCC8 \u67E5\u770B\u4E2D\u62A5\u6392\u540D', final:'\uD83C\uDFC6 \u67E5\u770B\u6700\u7EC8\u6392\u540D' };
+            h += '<button onclick="App.UI.electionDoReport(\'' + typeMap[phase] + '\')" style="width:100%;padding:14px;background:linear-gradient(135deg,#ffd700,#ff9500);color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:bold;cursor:pointer;margin-bottom:12px">' + typeName[typeMap[phase]] + '</button>';
         }
 
-        h += `</div>`;
+        h += '</div>';
         document.getElementById('electionPage').innerHTML = h;
     },
-    // 玩家选推手
-    electionPickPromoter(name) {
-        App.Election.setPromoter(name);
-        this.renderElectionV2();
+
+    // V3 私联操作
+    electionPrivateContact(fanType) {
+        App.Election.privateContact(fanType);
+        this.renderElectionV3();
     },
+
+    // V3 竞敌私联处理
+    electionHandleRivalPC(index, action) {
+        App.Election.handleRivalPrivateContact(index, action);
+        this.renderElectionV3();
+    },
+
     // 玩家买活动
     electionBuyActivity(actId) {
         App.Election.buyActivity(actId);
-        this.renderElectionV2();
+        this.renderElectionV3();
     },
+
     // 玩家点击报日
     electionDoReport(type) {
-        this.showElectionReportModalV2(type);
+        this.showElectionReportModalV3(type);
     },
-    // 报日大弹窗(V2)
-    showElectionReportModalV2(type) {
+
+    // 报日大弹窗(V3)
+    showElectionReportModalV3(type) {
         const result = App.Election.doReport(type);
         if (!result) return;
-        const { rankings, myRank, votes } = result;
+        const { rankings, myRank, votes, fanbase, isKami7 } = result;
         const tier = App.Election.getRankTier(myRank);
-        // 写入旧数据兼容
         G.electionResults = rankings;
-        const phaseName = type === 'first' ? '📊 初报' : type === 'second' ? '📈 中报' : '🏆 最终';
+        const phaseName = type === 'first' ? '\uD83D\uDCCA \u521D\u62A5' : type === 'second' ? '\uD83D\uDCC8 \u4E2D\u62A5' : '\uD83C\uDFC6 \u6700\u7EC8';
         const titleColor = type === 'final' ? 'linear-gradient(135deg,#ffd700,#ff9500)' : 'linear-gradient(135deg,#ff69b4,#ff1493)';
 
-        let h = `<div style="background:#fff;width:340px;max-height:80vh;border-radius:16px;padding:20px;overflow-y:auto">
-            <div style="text-align:center;background:${titleColor};color:#fff;border-radius:12px;padding:20px;margin-bottom:16px">
-                <div style="font-size:22px;font-weight:bold">${phaseName}</div>
-                <div style="font-size:14px;margin-top:4px">第 ${G.game.day} 天</div>
-                <div style="font-size:48px;font-weight:bold;margin:8px 0">#${myRank}</div>
-                <div style="font-size:14px">${votes.toLocaleString()} 票</div>
-                <div style="font-size:12px;margin-top:6px;background:rgba(255,255,255,0.2);border-radius:6px;padding:4px">${tier.name}</div>
-            </div>
+        let h = '<div style="background:#fff;width:340px;max-height:80vh;border-radius:16px;padding:20px;overflow-y:auto">';
+        h += '<div style="text-align:center;background:' + titleColor + ';color:#fff;border-radius:12px;padding:20px;margin-bottom:16px">';
+        h += '<div style="font-size:22px;font-weight:bold">' + phaseName + '</div>';
+        h += '<div style="font-size:14px;margin-top:4px">\u7B2C ' + G.game.day + ' \u5929</div>';
+        h += '<div style="font-size:48px;font-weight:bold;margin:8px 0">#' + myRank + '</div>';
+        h += '<div style="font-size:14px">' + votes.toLocaleString() + ' \u7968</div>';
+        h += '<div style="font-size:12px;margin-top:6px;background:rgba(255,255,255,0.2);border-radius:6px;padding:4px">' + tier.name + '</div>';
+        if (isKami7 && type === 'final') {
+            h += '<div style="font-size:14px;margin-top:6px">\u2728 \u795E\u4E03\u8FBE\u6210\uFF01</div>';
+        }
+        h += '</div>';
 
-            <div style="background:#f8f8f8;border-radius:8px;padding:12px;margin-bottom:12px">
-                <div style="font-size:13px;font-weight:600;margin-bottom:8px">📊 排名前 10</div>`;
-        rankings.slice(0, 10).forEach((r, i) => {
+        // 粉丝分布摘要
+        if (fanbase) {
+            h += '<div style="background:#f8f8f8;border-radius:8px;padding:10px;margin-bottom:12px">';
+            h += '<div style="font-size:12px;font-weight:600;margin-bottom:6px">\uD83D\uDC65 \u7C89\u4E1D\u5206\u5E03</div>';
+            const cats = fanbase.categories;
+            for (const [key, def] of Object.entries(App.Election.fanCategories)) {
+                const cat = cats[key] || { count:0, loyalty:0 };
+                h += '<div style="display:flex;justify-content:space-between;font-size:11px;padding:1px 0">';
+                h += '<span>' + def.emoji + ' ' + def.name + '</span>';
+                h += '<span>' + cat.count + ' \xB7 \u5FE0\u8BDA' + (cat.loyalty||0) + '%</span>';
+                h += '</div>';
+            }
+            h += '</div>';
+        }
+
+        // 排名前10
+        h += '<div style="background:#f8f8f8;border-radius:8px;padding:12px;margin-bottom:12px">';
+        h += '<div style="font-size:13px;font-weight:600;margin-bottom:8px">\uD83D\uDCCA \u6392\u540D\u524D 10</div>';
+        for (let i = 0; i < Math.min(rankings.length, 10); i++) {
+            const r = rankings[i];
             const isMe = r.name === G.player.name;
-            h += `<div style="display:flex;align-items:center;padding:4px 0;${isMe?'background:#fff5fa;border-radius:6px;padding:6px':''}">
-                <div style="width:28px;font-size:14px;font-weight:700;color:${i<3?'#ffd700':'#666'}">#${i+1}</div>
-                <div style="flex:1;font-size:13px;${isMe?'font-weight:600;color:#ff1493':''}">${r.name}${isMe?' ⬅️ 你':''}</div>
-                <div style="font-size:12px;color:#666">${r.votes.toLocaleString()}</div>
-            </div>`;
-        });
-        h += `</div>`;
+            h += '<div style="display:flex;align-items:center;padding:4px 0;' + (isMe?'background:#fff5fa;border-radius:6px;padding:6px':'') + '">';
+            h += '<div style="width:28px;font-size:14px;font-weight:700;color:' + (i<3?'#ffd700':'#666') + '">#' + (i+1) + '</div>';
+            h += '<div style="flex:1;font-size:13px;' + (isMe?'font-weight:600;color:#ff1493':'') + '">' + r.name + (isMe?' \u2B05\uFE0F \u4F60':'') + '</div>';
+            h += '<div style="font-size:12px;color:#666">' + r.votes.toLocaleString() + '</div>';
+            h += '</div>';
+        }
+        h += '</div>';
 
+        // 初报/中报：追加冲刺
         if (type === 'first' || type === 'second') {
-            // 追加资源按钮
-            h += `<div style="background:#fff5e6;border:1px solid #ffd700;border-radius:8px;padding:12px;margin-bottom:12px">
-                <div style="font-size:13px;font-weight:600;margin-bottom:6px">⚡ 追加资源冲刺</div>
-                <div style="font-size:11px;color:#666;margin-bottom:8px">投入鸡腿立即冲刺排名,有 30% 风险</div>
-                <button onclick="App.UI.electionExtraBoost(${type==='first'?'500':'800'})" style="width:100%;padding:10px;background:#ff9500;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">🍗 投 ${type==='first'?'500':'800'} 鸡腿</button>
-            </div>`;
+            h += '<div style="background:#fff5e6;border:1px solid #ffd700;border-radius:8px;padding:12px;margin-bottom:12px">';
+            h += '<div style="font-size:13px;font-weight:600;margin-bottom:6px">\u26A1 \u8FFD\u52A0\u8D44\u6E90\u51B2\u523A</div>';
+            h += '<div style="font-size:11px;color:#666;margin-bottom:8px">\u6295\u5165\u9E21\u817F\u7ACB\u5373\u51B2\u523A\u6392\u540D,\u6709 30% \u98CE\u9669</div>';
+            h += '<button onclick="App.UI.electionExtraBoost(' + (type==='first'?'500':'800') + ')" style="width:100%;padding:10px;background:#ff9500;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">\uD83C\uDF57 \u6295 ' + (type==='first'?'500':'800') + ' \u9E21\u817F</button>';
+            h += '</div>';
         }
 
+        // 最终报告：感言
         if (type === 'final') {
-            // 玩家感言
-            h += `<div style="background:#f0f8ff;border:1px solid #4a90e2;border-radius:8px;padding:12px;margin-bottom:12px">
-                <div style="font-size:13px;font-weight:600;margin-bottom:6px">🎤 发表感言</div>
-                <div style="font-size:11px;color:#666;margin-bottom:6px">关键词:感谢粉丝/感谢队友/立志神七/会努力</div>
-                <input type="text" id="electionSpeechInput" maxlength="50" placeholder="例如:感谢粉丝一路陪伴!" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;margin-bottom:6px">
-                <button onclick="App.UI.electionSubmitSpeech()" style="width:100%;padding:10px;background:#4a90e2;color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer">发表</button>
-            </div>`;
-            // 历史已记录
-            h += `<div style="background:#fff5fa;border-radius:8px;padding:10px;margin-bottom:12px;text-align:center">
-                <div style="font-size:12px;color:#ff69b4;font-weight:600">${tier.bonus}</div>
-            </div>`;
+            h += '<div style="background:#f0f8ff;border:1px solid #4a90e2;border-radius:8px;padding:12px;margin-bottom:12px">';
+            h += '<div style="font-size:13px;font-weight:600;margin-bottom:6px">\uD83C\uDFA4 \u53D1\u8868\u611F\u8A00</div>';
+            h += '<div style="font-size:11px;color:#666;margin-bottom:6px">\u5173\u952E\u8BCD:\u611F\u8C22\u7C89\u4E1D/\u611F\u8C22\u961F\u53CB/\u7ACB\u5FD7\u795E\u4E03/\u4F1A\u52AA\u529B</div>';
+            h += '<input type="text" id="electionSpeechInput" maxlength="50" placeholder="\u4F8B\u5982:\u611F\u8C22\u7C89\u4E1D\u4E00\u8DEF\u9661\u4F34!" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;margin-bottom:6px">';
+            h += '<button onclick="App.UI.electionSubmitSpeech()" style="width:100%;padding:10px;background:#4a90e2;color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer">\u53D1\u8868</button>';
+            h += '</div>';
+            h += '<div style="background:#fff5fa;border-radius:8px;padding:10px;margin-bottom:12px;text-align:center">';
+            h += '<div style="font-size:12px;color:#ff69b4;font-weight:600">' + tier.bonus + '</div>';
+            h += '</div>';
         }
 
-        h += `<button onclick="this.closest('.modal-overlay').remove()" style="width:100%;padding:12px;background:#f5f5f5;border:none;border-radius:8px;cursor:pointer">关闭</button>
-        </div>`;
+        h += '<button onclick="this.closest(\'.modal-overlay\').remove()" style="width:100%;padding:12px;background:#f5f5f5;border:none;border-radius:8px;cursor:pointer">\u5173\u95ED</button>';
+        h += '</div>';
 
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay';
@@ -6242,40 +8153,92 @@ App.UI = {
         overlay.innerHTML = h;
         document.getElementById('phoneModals').appendChild(overlay);
     },
+
     // 追加冲刺
     electionExtraBoost(cost) {
         cost = parseInt(cost);
-        if ((G.stats.drumstick || 0) < cost) {
-            this.showNotification('🍗 鸡腿不足!');
-            return;
-        }
+        if ((G.stats.drumstick || 0) < cost) { this.showNotification('\uD83C\uDF57 \u9E21\u817F\u4E0D\u8DB3!'); return; }
         App.Store.updateStats({ drumstick: -cost });
         const me = G.election;
-        const bonus = cost * 8;  // 1 鸡腿 ≈ 8 票
+        const bonus = cost * 8;
         if (Math.random() < 0.30) {
-            this.showNotification('📸 追加冲刺被拍到了...有黑料风险');
-            me.controversies.push({ day:G.game.day, source:'路人', desc:'被拍到刷票', penaltyVotes: Math.floor(bonus*0.3) });
+            this.showNotification('\uD83D\uDCF8 \u8FFD\u52A0\u51B2\u523A\u88AB\u62CD\u5230\u4E86...\u6709\u9ED1\u6599\u98CE\u9669');
+            me.controversies.push({ day:G.game.day, source:'\u8DEF\u4EBA', desc:'\u88AB\u62CD\u5230\u5237\u7968', penaltyVotes: Math.floor(bonus*0.3) });
         } else {
-            this.showNotification(`⚡ 追加成功! +${bonus.toLocaleString()} 票`);
+            this.showNotification('\u26A1 \u8FFD\u52A0\u6210\u529F! +' + bonus.toLocaleString() + ' \u7968');
         }
         document.querySelector('.modal-overlay')?.remove();
-        this.showElectionReportModalV2(me.phase === 'first_report' ? 'first' : 'second');
+        this.showElectionReportModalV3(me.phase === 'first_report' ? 'first' : 'second');
     },
+
     // 提交感言
     electionSubmitSpeech() {
         const input = document.getElementById('electionSpeechInput');
-        if (!input || !input.value.trim()) {
-            this.showNotification('请输入感言');
-            return;
-        }
+        if (!input || !input.value.trim()) { this.showNotification('\u8BF7\u8F93\u5165\u611F\u8A00'); return; }
         App.Election.setSpeech(input.value.trim());
-        this.showNotification('🎤 感言已发布');
+        this.showNotification('\uD83C\uDFA4 \u611F\u8A00\u5DF2\u53D1\u5E03');
         document.querySelector('.modal-overlay')?.remove();
-        this.renderElectionV2();
+        this.renderElectionV3();
     },
+
     participateElection() {
-        // V2 兼容: 跳转到 renderElectionV2
-        this.renderElectionV2();
+        this.renderElectionV3();
+    },
+
+    // ===== 塌房危机弹窗 =====
+    showCollapseModal() {
+        const cs = G.collapseState;
+        if (!cs) return;
+        let h = '<div style="background:#fff;width:340px;max-height:80vh;border-radius:16px;padding:20px;overflow-y:auto">';
+        h += '<div style="text-align:center;background:linear-gradient(135deg,#b71c1c,#d32f2f);color:#fff;border-radius:12px;padding:20px;margin-bottom:16px">';
+        h += '<div style="font-size:48px;margin-bottom:8px">\uD83D\uDD25</div>';
+        h += '<div style="font-size:22px;font-weight:bold">\u584C\u623F\u4E86\uFF01</div>';
+        const typeNames = { private_contact:'\u79C1\u8054\u7C89\u4E1D', romance:'\u604B\u60C5\u66DD\u5149', scandal:'\u4E11\u95FB', dark_ops:'\u9ED1\u516C\u5173' };
+        h += '<div style="font-size:13px;margin-top:4px">\u4F60\u7684' + (typeNames[cs.type]||'\u4E8B\u4EF6') + '\u88AB\u66DD\u5149\uFF01</div>';
+        h += '</div>';
+
+        h += '<div style="font-size:13px;font-weight:600;margin-bottom:10px">\u8BF7\u9009\u62E9\u5E94\u5BF9\u65B9\u6848\uFF1A</div>';
+
+        // A. 记者会道歉
+        h += '<div onclick="App.UI.resolveCollapse(\'press_conference\')" style="padding:12px;border:1px solid #eee;border-radius:8px;margin-bottom:8px;cursor:pointer;background:#fff">';
+        h += '<div style="font-size:14px;font-weight:600">\uD83D\uDCE2 \u53EC\u5F00\u8BB0\u8005\u4F1A\u516C\u5F00\u9053\u6B49</div>';
+        h += '<div style="font-size:11px;color:#666;margin-top:4px">\u4EBA\u6C14-25%\uFF0C\u7C89\u4E1D\u6D41\u5931 30%\uFF0C\u53EF\u80FD\u88AB\u96EA\u85CF 3-5 \u5929</div>';
+        h += '</div>';
+
+        // B. 全盘否认
+        h += '<div onclick="App.UI.resolveCollapse(\'deny\')" style="padding:12px;border:1px solid #eee;border-radius:8px;margin-bottom:8px;cursor:pointer;background:#fff">';
+        h += '<div style="font-size:14px;font-weight:600">\uD83D\uDEAB \u5168\u76D8\u5426\u8BA4</div>';
+        const successRate = Math.floor((0.4 + (100 - (G.stats.scandal || 0)) / 200) * 100);
+        h += '<div style="font-size:11px;color:#666;margin-top:4px">\u6210\u529F\u7387 ' + successRate + '%\u3002\u6210\u529F:\u4EBA\u6C14+10; \u5931\u8D25:\u4EBA\u6C14-40%\uFF0C\u7C89\u4E1D\u6D41\u5931 50%</div>';
+        h += '</div>';
+
+        // C. 发微博长文
+        const creativity = (G.trainingSkills?.vocal || 10) + (G.stats.skill || 10);
+        h += '<div onclick="App.UI.resolveCollapse(\'weibo_post\')" style="padding:12px;border:1px solid #eee;border-radius:8px;margin-bottom:8px;cursor:pointer;background:#fff">';
+        h += '<div style="font-size:14px;font-weight:600">\uD83C\uDFA4 \u53D1\u5FAE\u535A\u957F\u6587\uFF08\u8D70\u5FC3\u8DEF\u7EBF\uFF09</div>';
+        h += '<div style="font-size:11px;color:#666;margin-top:4px">' + (creativity >= 30 ? '\u6587\u5B57\u529F\u5E95\u5145\u8DB3\uFF0C\u8206\u8BBA+30' : '\u6587\u5B57\u529F\u5E95\u4E0D\u8DB3\uFF0C\u6548\u679C\u6709\u9650') + '</div>';
+        h += '</div>';
+
+        // D. 让公司处理
+        h += '<div onclick="App.UI.resolveCollapse(\'company_handle\')" style="padding:12px;border:1px solid #eee;border-radius:8px;margin-bottom:8px;cursor:pointer;background:#fff">';
+        h += '<div style="font-size:14px;font-weight:600">\uD83D\uDCBC \u8BA9\u516C\u53F8\u5904\u7406</div>';
+        h += '<div style="font-size:11px;color:#666;margin-top:4px">\u7ECF\u7EAA\u4EBA\u6EE1\u610F\u5EA6-20\u3002 30%\u5B8C\u7F8E\u89E3\u51B3 / 70%\u66F4\u7CDF</div>';
+        h += '</div>';
+
+        h += '</div>';
+
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.7)';
+        overlay.innerHTML = h;
+        document.getElementById('phoneModals').appendChild(overlay);
+    },
+
+    // 塌房应对处理
+    resolveCollapse(choice) {
+        App.Election.resolveCollapse(choice);
+        document.querySelector('.modal-overlay')?.remove();
+        this.renderElectionV3();
     },
     renderHandshake() {
         const types = [
@@ -6558,32 +8521,52 @@ App.UI = {
         });
     },
     restartGame() {
-        if (!confirm('确定重新开始？这将清除所有本地存档，无法恢复！')) return;
-        // 清除所有 localStorage
-        localStorage.removeItem('inviteCode');
-        localStorage.removeItem('inviteUserId');
-        localStorage.removeItem('starlight48_save');
-        localStorage.removeItem('starlight48_cloud_token');
-        // 重置 App.Invite 状态
-        App.Invite.inviteCode = null;
-        App.Invite.userId = null;
-        // 重置游戏状态
-        Object.assign(G, {
-            player: { name:'', appearance:'', personality:'', personalityEmoji:'', group:'', team:'', stage:'练习生' },
-            stats: { popularity:10, skill:10, mood:70, affection:50, starlight:10, stress:10, scandal:0, drumstick:0, wechatBalance:0, backpack:{}, agent_satisfaction:50, training:0 },
-            game: { day:1, phase:'morning', interaction_count:0, rank:150, weibo_followers:100, pocket_fans:50, handshake_this_month:false, fan_letters_this_week:0, electionInProgress:false, electionPhase:null, firstReportVotes:0, secondReportVotes:0, firstReportPulls:0, secondReportPulls:0 },
-            flags: { hasFirstShow:false, hasFirstElection:false, hasStalker:false, hasCenterBattle:false, hasCrisis:false, hasEmo:false, hasZeroStress:false, hasMoved:false },
-            achievements: [], chatHistory: {}, weiboPosts: [], moments: [], smsMessages: [], callHistory: [], fanLetters: [], electionResults: [],
-            memberAffection: {}, blockedContacts: [], pocketRoomMessages: [], bestPartner: null, partnerStageUsed: false,
-            settings: { flipPrice: 0, flipPriceEnabled: false },
-            flipState: { day: 1, replied: {} }
-        });
-        App.Save.autoSave();
-        // 显示邀请码页面，重新验证
-        document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-        document.getElementById('inviteScreen').classList.add('active');
-        document.getElementById('bottomNav').style.display = 'none';
-        this.showNotification('🔄 存档已清除，请重新输入邀请码');
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:2000';
+        overlay.innerHTML = `<div style="background:#fff;border-radius:16px;padding:24px;margin:20px;text-align:center;max-width:300px">
+            <div style="font-size:48px;margin-bottom:8px">🔄</div>
+            <div style="font-size:18px;font-weight:600;margin-bottom:8px">确定重新开始？</div>
+            <div style="font-size:13px;color:#666;margin-bottom:16px">这将清除所有本地存档，无法恢复！</div>
+            <div style="display:flex;gap:10px">
+                <button id="restartYes" style="flex:1;padding:10px;border:none;background:#ff4757;color:#fff;border-radius:8px;font-size:14px;cursor:pointer">确定重置</button>
+                <button id="restartNo" style="flex:1;padding:10px;border:none;background:#eee;color:#333;border-radius:8px;font-size:14px;cursor:pointer">取消</button>
+            </div>
+        </div>`;
+        document.querySelector('.phone-screen').appendChild(overlay);
+
+        var self = this;
+        document.getElementById('restartYes').onclick = function() {
+            overlay.remove();
+            // 清除所有 localStorage
+            localStorage.removeItem('inviteCode');
+            localStorage.removeItem('inviteUserId');
+            localStorage.removeItem('starlight48_save');
+            localStorage.removeItem('starlight48_cloud_token');
+            // 重置 App.Invite 状态
+            App.Invite.inviteCode = null;
+            App.Invite.userId = null;
+            // 重置游戏状态
+            Object.assign(G, {
+                player: { name:'', appearance:'', personality:'', personalityEmoji:'', group:'', team:'', stage:'练习生' },
+                stats: { popularity:10, skill:10, mood:70, affection:50, starlight:10, stress:10, scandal:0, drumstick:0, wechatBalance:0, backpack:{}, agent_satisfaction:50, training:0 },
+                game: { day:1, phase:'morning', interaction_count:0, rank:150, weibo_followers:100, pocket_fans:50, handshake_this_month:false, fan_letters_this_week:0, electionInProgress:false, electionPhase:null, firstReportVotes:0, secondReportVotes:0, firstReportPulls:0, secondReportPulls:0 },
+                flags: { hasFirstShow:false, hasFirstElection:false, hasStalker:false, hasCenterBattle:false, hasCrisis:false, hasEmo:false, hasZeroStress:false, hasMoved:false },
+                achievements: [], chatHistory: {}, weiboPosts: [], moments: [], smsMessages: [], callHistory: [], fanLetters: [], electionResults: [],
+                memberAffection: {}, blockedContacts: [], pocketRoomMessages: [], bestPartner: null, partnerStageUsed: false,
+                romance: { relationships:{}, cooldown:0, crisisLog:[], dateHistory:[] },
+                settings: { flipPrice: 0, flipPriceEnabled: false },
+                flipState: { day: 1, replied: {} },
+                collapseState: { triggered: false, type: null, severity: 0, day: 0, publicOpinion: 0, resolved: false, resolution: null, recoveryDays: 0 }
+            });
+            App.Save.autoSave();
+            // 显示邀请码页面，重新验证
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.getElementById('passwordScreen').classList.add('active');
+            document.getElementById('bottomNav').style.display = 'none';
+            self.showNotification('🔄 存档已清除，请重新输入密码');
+        };
+        document.getElementById('restartNo').onclick = function() { overlay.remove(); };
     },
 
     async runNetworkDiagnosis() {
@@ -6760,9 +8743,24 @@ App.UI = {
     },
 
     executeTraining(branchId, intensity) {
+        // 伤病检查：带伤上场效率打折
+        App.Health.init();
+        if (App.Health.hasInjury() && !G.health.currentInjuries.some(i => i.worsened)) {
+            // 首次训练提示带伤上场选择
+            const injury = G.health.currentInjuries[0];
+            const effMod = App.Health.getEfficiencyModifier();
+            this.showNotification(`⚠️ 当前${injury.name}，训练效果${Math.round(effMod*100)}%`, 3000);
+        }
         const result = App.Training.train(branchId, intensity);
         if (result.injury) {
-            this.showNotification(`🤕 训练过度导致受伤！身体-15 心态-10`, 4000);
+            // 训练受伤 → 触发伤病系统
+            const triggered = App.Health._triggerNewInjury();
+            if (triggered) {
+                this.showNotification(`🤕 ${triggered.emoji} ${triggered.name}！${triggered.desc}`, 4000);
+                setTimeout(() => this._showInjuryDecisionModal(triggered), 800);
+            } else {
+                this.showNotification(`🤕 训练过度导致受伤！身体-15 心态-10`, 4000);
+            }
         }
         this.showNotification(`✅ ${App.Training.branches[branchId]?.name} +${result.skillGain} | 疲劳:${result.fatigue}`, 2500);
         this.renderTraining();
@@ -6786,6 +8784,344 @@ App.UI = {
             this.showNotification(msg, 2500);
         }
         this.renderTraining();
+    },
+
+    // ============ 伤病系统页面 ============
+    renderHealth() {
+        App.Health.init();
+        const h = G.health;
+        const prob = App.Health.calcInjuryProbability();
+        const currentInjuries = h.currentInjuries;
+        const history = h.history.slice(-5);
+
+        // 伤病触发概率可视化
+        const probColor = prob < 0.15 ? '#4caf50' : prob < 0.3 ? '#ff9800' : prob < 0.5 ? '#f44336' : '#9c27b0';
+        const probLabel = prob < 0.15 ? '安全' : prob < 0.3 ? '注意' : prob < 0.5 ? '危险' : '高危';
+
+        let h_html = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🏥 伤病管理</span></div>
+        <div style="flex:1;overflow-y:auto;padding:12px">
+
+            <!-- 风险概率 -->
+            <div style="background:linear-gradient(135deg,#fff,#${probColor}22);border-radius:12px;padding:16px;margin-bottom:12px;border:1px solid ${probColor}44">
+                <div style="font-size:14px;font-weight:600;color:#333;margin-bottom:8px">📊 伤病风险评估</div>
+                <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+                    <div style="font-size:24px;font-weight:bold;color:${probColor}">${Math.round(prob*100)}%</div>
+                    <div style="padding:4px 12px;background:${probColor};color:#fff;border-radius:16px;font-size:12px;font-weight:600">${probLabel}</div>
+                </div>
+                <div style="font-size:11px;color:#888;line-height:1.6">
+                    公式：疲劳/200 + (100-体力)/400 + (100-精神)/400<br>
+                    当前：疲劳${G.fatigue||0}/200 + 体力${G.physical||80}/400 + 精神${G.mental||75}/400
+                </div>
+                <div class="stat-bar" style="margin-top:8px"><div class="stat-fill" style="width:${Math.round(prob*100)}%;background:${probColor}"></div></div>
+            </div>
+
+            <!-- 当前伤病 -->
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+                <div style="font-size:14px;font-weight:600;color:#333;margin-bottom:8px">🤕 当前伤病</div>`;
+        if (currentInjuries.length === 0) {
+            h_html += `<div style="text-align:center;padding:20px;color:#999;font-size:13px">✅ 身体健康，无伤病记录</div>`;
+        } else {
+            currentInjuries.forEach(injury => {
+                const sevColors = ['#4caf50','#ff9800','#f44336'];
+                const sevLabels = ['轻度','中度','重度'];
+                const sev = injury.severity > 3 ? 2 : injury.severity - 1;
+                h_html += `
+                <div style="background:#fef2f2;border-radius:8px;padding:12px;margin-bottom:8px;border:1px solid #fecaca">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                        <span style="font-size:20px">${injury.emoji}</span>
+                        <span style="font-size:14px;font-weight:600;color:#333">${injury.name}</span>
+                        <span style="padding:2px 8px;background:${sevColors[sev]};color:#fff;border-radius:8px;font-size:11px">${sevLabels[sev]}</span>
+                        ${injury.worsenedCount > 0 ? `<span style="padding:2px 8px;background:#9c27b0;color:#fff;border-radius:8px;font-size:11px">加重${injury.worsenedCount}次</span>` : ''}
+                    </div>
+                    <div style="font-size:12px;color:#666;margin-bottom:4px">${injury.desc}</div>
+                    <div style="display:flex;justify-content:space-between;font-size:11px;color:#888">
+                        <span>剩余恢复：${injury.daysLeft}天</span>
+                        <span>体力扣减：-${injury.bodyPenalty} | 精神扣减：-${injury.mentalPenalty}</span>
+                    </div>
+                    <div class="stat-bar" style="margin-top:6px"><div class="stat-fill" style="width:${Math.round((1 - injury.daysLeft / (injury.daysLeft + App.Health.injuryTypes.find(t=>t.id===injury.type)?.recoveryDays || 5)) * 100)}%;background:#4caf50"></div></div>
+                </div>`;
+            });
+        }
+        h_html += `</div>`;
+
+        // 决策按钮区域
+        if (currentInjuries.length > 0) {
+            const inRecovery = h.inRecovery;
+            h_html += `
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+                <div style="font-size:14px;font-weight:600;color:#333;margin-bottom:12px">⚡ 伤病决策</div>`;
+            if (inRecovery) {
+                h_html += `
+                <div style="background:#e8f5e9;border-radius:8px;padding:12px;margin-bottom:8px;text-align:center">
+                    <div style="font-size:13px;color:#2e7d32;font-weight:600">🏥 正在康复中心治疗</div>
+                    <div style="font-size:11px;color:#666;margin-top:4px">恢复速度×2 · 每天消耗200鸡腿</div>
+                    <div style="font-size:11px;color:#999;margin-top:2px">剩余治疗天数：${h.recoveryDaysLeft}</div>
+                    <div style="font-size:11px;color:#999">当前鸡腿：${G.stats.drumstick}</div>
+                </div>
+                <button onclick="App.UI.exitRecoveryCenter()" style="width:100%;padding:12px;background:#ff9800;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600;margin-top:4px">🚪 退出康复中心（恢复速度恢复正常）</button>`;
+            } else {
+                h_html += `
+                <button onclick="App.UI.performWithInjuryAction()" style="width:100%;padding:12px;background:linear-gradient(135deg,#f44336,#c0392b);color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600;margin-bottom:8px">💪 伤上场（可继续活动，但加重伤病）</button>
+                <button onclick="App.UI.enterRecoveryCenterAction()" style="width:100%;padding:12px;background:linear-gradient(135deg,#4caf50,#2e7d32);color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600">🏥 康复中心（200鸡腿/天，加速恢复×2）</button>`;
+            }
+            h_html += `</div>`;
+        }
+
+        // 伤病类型说明
+        h_html += `
+        <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+            <div style="font-size:14px;font-weight:600;color:#333;margin-bottom:8px">📋 伤病类型一览</div>`;
+        App.Health.injuryTypes.forEach(t => {
+            const sevColors = ['#4caf50','#ff9800','#f44336'];
+            const sevLabels = ['轻度','中度','重度'];
+            const sev = t.severity - 1;
+            h_html += `
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #f0f0f0">
+                <span style="font-size:16px">${t.emoji}</span>
+                <span style="font-size:13px;font-weight:500;color:#333;flex:1">${t.name}</span>
+                <span style="padding:2px 6px;background:${sevColors[sev]};color:#fff;border-radius:6px;font-size:10px">${sevLabels[sev]}</span>
+                <span style="font-size:11px;color:#999">${t.recoveryDays}天恢复</span>
+            </div>`;
+        });
+        h_html += `</div>`;
+
+        // 伤病历史
+        if (history.length > 0) {
+            h_html += `
+            <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+                <div style="font-size:14px;font-weight:600;color:#333;margin-bottom:8px">📜 伤病历史</div>`;
+            history.forEach(r => {
+                const tName = App.Health.injuryTypes.find(t => t.id === r.type)?.name || r.type;
+                const tEmoji = App.Health.injuryTypes.find(t => t.id === r.type)?.emoji || '🤕';
+                h_html += `
+                <div style="font-size:12px;color:#666;padding:4px 0;border-bottom:1px solid #f0f0f0">
+                    ${tEmoji} ${tName} · Day${r.dayTriggered}→Day${r.dayRecovered} · 加重${r.worsenedCount}次
+                </div>`;
+            });
+            h_html += `</div>`;
+        }
+
+        h_html += `
+            <div style="background:#fff3e0;border-radius:12px;padding:12px;margin-bottom:12px;font-size:12px;color:#856404;line-height:1.5">
+                💡 <b>小贴士</b>：疲劳高、体力/精神低时伤病风险上升。带伤上场会加重病情延长恢复时间，康复中心加速恢复但需要鸡腿。
+            </div>
+        </div>`;
+
+        document.getElementById('healthPage').innerHTML = h_html;
+    },
+
+    // 伤上场操作
+    performWithInjuryAction() {
+        const result = App.Health.performWithInjury();
+        if (result.success) {
+            this.showNotification(`⚠️ ${result.msg}`, 4000);
+        }
+        this.renderHealth();
+    },
+
+    // 进入康复中心操作
+    enterRecoveryCenterAction() {
+        const result = App.Health.enterRecoveryCenter();
+        if (result.blocked) {
+            this.showNotification(`❌ ${result.reason}`, 3000);
+            return;
+        }
+        this.showNotification(`🏥 ${result.msg}`, 3000);
+        this.renderHealth();
+    },
+
+    // 退出康复中心
+    exitRecoveryCenter() {
+        App.Health.init();
+        G.health.inRecovery = false;
+        G.health.recoveryDaysLeft = 0;
+        this.showNotification('🚪 已退出康复中心，恢复速度恢复正常', 2500);
+        this.renderHealth();
+    },
+
+    // 伤病决策弹窗（advanceDay触发伤病时弹出）
+    _showInjuryDecisionModal(injury) {
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = `display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,0.7);z-index:2000`;
+        const drumstick = G.stats.drumstick || 0;
+        modal.innerHTML = `
+            <div style="background:#fff;border-radius:16px;padding:20px;width:calc(100% - 32px);max-width:340px;text-align:center">
+                <div style="font-size:48px;margin-bottom:8px">${injury.emoji}</div>
+                <div style="font-size:18px;font-weight:bold;color:#f44336;margin-bottom:4px">${injury.name}！</div>
+                <div style="font-size:13px;color:#666;margin-bottom:16px">${injury.desc}<br>恢复需要${injury.daysLeft}天 · 体力-${injury.bodyPenalty} 精神-${injury.mentalPenalty}</div>
+                <div style="display:flex;flex-direction:column;gap:10px">
+                    <button onclick="App.UI.performWithInjuryAction();this.closest('.modal-overlay').remove()" 
+                        style="padding:14px;background:linear-gradient(135deg,#f44336,#c0392b);color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer">
+                        💪 带伤上场（可继续活动，伤病加重）
+                    </button>
+                    <button onclick="App.UI.enterRecoveryCenterAction();this.closest('.modal-overlay').remove()" 
+                        style="padding:14px;background:linear-gradient(135deg,#4caf50,#2e7d32);color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer${drumstick < 200 ? ';opacity:0.5' : ''}">
+                        🏥 康复中心（200鸡腿/天，恢复×2）${drumstick < 200 ? ' · 鸡腿不足' : ''}
+                    </button>
+                    <button onclick="this.closest('.modal-overlay').remove()" 
+                        style="padding:10px;background:none;border:none;color:#999;font-size:13px;cursor:pointer">
+                        先不管，看看再说
+                    </button>
+                </div>
+            </div>`;
+        document.getElementById('phoneModals').appendChild(modal);
+        modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+    },
+
+    // ============ 外务/综艺通告页面 ============
+    renderExternal() {
+        App.Variety.init();
+        const v = G.variety;
+        const active = v.active;
+        const cooldown = v.cooldown;
+        const rep = v.reputation;
+        const varietySkill = G.trainingSkills?.variety || 5;
+        const completed = v.completed || [];
+
+        let h = '<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">📋 外务</span></div>';
+        h += '<div style="flex:1;overflow-y:auto;padding:16px">';
+
+        // 顶部状态卡
+        h += '<div style="background:linear-gradient(135deg,#00bcd4,#0097a7);color:#fff;padding:16px;border-radius:14px;margin-bottom:14px;text-align:center">';
+        h += '<div style="font-size:14px;margin-bottom:4px">📊 综艺声誉</div>';
+        h += '<div style="font-size:28px;font-weight:700">' + rep + '<span style="font-size:14px;opacity:0.7">/100</span></div>';
+        h += '<div style="font-size:12px;opacity:0.8;margin-top:4px">综艺技能 Lv.' + varietySkill + (cooldown > 0 ? ' · 冷却' + cooldown + '天' : '') + '</div>';
+        // 声誉等级
+        const repLevel = rep >= 80 ? '🏆 通告女王' : rep >= 50 ? '⭐ 当红通告达人' : rep >= 20 ? '👍 通告新人' : '🌱 新人起步';
+        h += '<div style="font-size:13px;margin-top:2px">' + repLevel + '</div>';
+        h += '</div>';
+
+        // 进行中的通告
+        if (active && active.status === 'recording') {
+            h += '<div style="background:#fff;border-radius:12px;padding:14px;margin-bottom:14px;border:2px solid #00bcd4">';
+            h += '<div style="font-size:14px;font-weight:600;color:#0097a7;margin-bottom:6px">📢 进行中的通告</div>';
+            h += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">';
+            h += '<span style="font-size:22px">' + active.emoji + '</span>';
+            h += '<div><div style="font-size:14px;font-weight:600">' + active.name + '</div>';
+            h += '<div style="font-size:12px;color:#666">' + active.typeName + ' · 剩余' + active.daysLeft + '天</div></div>';
+            h += '</div>';
+            // 进度条
+            const pct = active.progress || 0;
+            h += '<div style="background:#e0e0e0;border-radius:8px;height:10px;margin-bottom:4px;overflow:hidden">';
+            h += '<div style="background:linear-gradient(90deg,#00bcd4,#0097a7);height:10px;width:' + pct + '%;border-radius:8px;transition:width 0.3s"></div>';
+            h += '</div>';
+            h += '<div style="font-size:11px;color:#999;text-align:right">' + pct + '% 完成</div>';
+            h += '</div>';
+        }
+
+        // 录制完成待结算事件
+        if (active && active.status === 'event_pending') {
+            const event = App.Variety.getCurrentEvent();
+            if (event) {
+                h += '<div style="background:#fff3e0;border-radius:12px;padding:14px;margin-bottom:14px;border:2px solid #ff9800">';
+                h += '<div style="font-size:14px;font-weight:600;color:#e65100;margin-bottom:8px">🎬 录制事件！</div>';
+                h += '<div style="background:#fff;border-radius:8px;padding:10px;margin-bottom:10px;font-size:13px;text-align:center">';
+                h += '<b>' + active.emoji + ' ' + active.name + '</b><br><br>' + event.desc;
+                h += '</div>';
+                h += '<div style="font-size:12px;color:#999;margin-bottom:6px">选择你的应对方式：</div>';
+                for (const ch of event.choices) {
+                    const rewardStr = (ch.outcome.pop > 0 ? '⭐+' + ch.outcome.pop : '') + (ch.outcome.money > 0 ? ' 💰+' + ch.outcome.money : '') + (ch.outcome.skillBonus ? ' 🎯技能+' + ch.outcome.skillBonus : '') + (ch.outcome.riskChance ? ' ⚠️风险' + Math.round(ch.outcome.riskChance * 100) + '%' : '');
+                    h += '<button onclick="App.UI.resolveBookingEvent(\'' + active.id + '\',\'' + ch.id + '\')" style="width:100%;padding:10px;margin-bottom:5px;border:1px solid #eee;border-radius:8px;background:#fff;font-size:12px;cursor:pointer;text-align:left">';
+                    h += '<b>' + ch.label + '</b>' + (rewardStr ? ' · ' + rewardStr : '');
+                    h += '</button>';
+                }
+                h += '</div>';
+            } else {
+                // 无事件的通告类型直接结算
+                h += '<div style="background:#e8f5e9;border-radius:12px;padding:14px;margin-bottom:14px;border:2px solid #4caf50">';
+                h += '<div style="font-size:14px;font-weight:600;color:#2e7d32;margin-bottom:8px">✅ 录制完成！</div>';
+                h += '<button onclick="App.UI.resolveBookingEvent(\'' + active.id + '\',\'auto\')" style="padding:12px;background:#4caf50;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;width:100%">🎉 领取报酬</button>';
+                h += '</div>';
+            }
+        }
+
+        // 可选通告列表
+        h += '<div style="background:#fff;border-radius:12px;padding:14px;margin-bottom:14px">';
+        h += '<div style="font-size:14px;font-weight:600;margin-bottom:10px">📋 可选通告</div>';
+
+        const available = v.available.filter(x => x.status === 'open');
+        if (available.length === 0) {
+            h += '<div style="font-size:13px;color:#999;text-align:center;padding:20px">本周暂无新通告，下周刷新</div>';
+        } else {
+            for (const b of available) {
+                const canAccept = cooldown <= 0 && !active;
+                const btnBg = canAccept ? '#00bcd4' : '#ccc';
+                const btnCursor = canAccept ? 'pointer' : 'not-allowed';
+                const btnText = cooldown > 0 ? '冷却中' : active ? '录制中' : '接通告';
+                h += '<div style="display:flex;align-items:center;padding:10px;border:1px solid #eee;border-radius:8px;margin-bottom:6px;background:' + (canAccept ? '#fff' : '#f5f5f5') + '">';
+                h += '<div style="font-size:24px;margin-right:10px">' + b.emoji + '</div>';
+                h += '<div style="flex:1">';
+                h += '<div style="font-size:14px;font-weight:600">' + b.name + '</div>';
+                h += '<div style="font-size:12px;color:#666">' + b.typeName + ' · 耗时' + b.days + '天</div>';
+                h += '<div style="font-size:11px;color:#888;margin-top:2px">⭐+' + b.rewardPop + ' 💰+' + b.rewardMoney + (b.risk ? ' · ⚠️' + b.risk : '') + '</div>';
+                h += '</div>';
+                h += '<button ' + (canAccept ? '' : 'disabled') + ' onclick="App.UI.acceptBooking(\'' + b.id + '\')" style="padding:8px 12px;background:' + btnBg + ';color:#fff;border:none;border-radius:6px;font-size:12px;cursor:' + btnCursor + '">' + btnText + '</button>';
+                h += '</div>';
+            }
+        }
+        h += '</div>';
+
+        // 已完成通告历史
+        if (completed.length > 0) {
+            h += '<div style="background:#fff;border-radius:12px;padding:14px;margin-bottom:14px">';
+            h += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">📜 通告记录</div>';
+            const recent = completed.slice(-5).reverse();
+            for (const c of recent) {
+                const res = c.result || {};
+                h += '<div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid #f0f0f0;font-size:12px">';
+                h += '<span style="font-size:16px;margin-right:6px">' + c.emoji + '</span>';
+                h += '<span style="flex:1">' + c.name + '</span>';
+                h += '<span style="color:' + (res.success ? '#4caf50' : '#f44336') + '">' + (res.success ? '✅' : '❌') + (res.rewardPop > 0 ? ' +' + res.rewardPop : '') + '</span>';
+                h += '</div>';
+            }
+            h += '</div>';
+        }
+
+        // 综艺技能说明
+        h += '<div style="background:#fff;border-radius:12px;padding:14px;margin-bottom:14px">';
+        h += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">💡 综艺技能影响</div>';
+        h += '<div style="font-size:12px;color:#666;line-height:1.6">';
+        h += '综艺技能越高，通告报酬越多（技能加成 ×' + (1 + varietySkill / 50).toFixed(1) + '）<br>';
+        h += '声誉越高，解锁更高级通告（当前解锁至 ' + (rep >= 50 ? '商业代言' : rep >= 35 ? '偶像剧' : rep >= 20 ? '真人秀' : '基础通告') + '）<br>';
+        h += '每周自动刷新 2-4 个新通告，接通告进入录制状态';
+        h += '</div></div>';
+
+        // 握手会入口（从口袋移入外务）
+        h += '<div style="background:linear-gradient(135deg,#fff3e0,#ffe0b2);border-radius:12px;padding:14px;margin-bottom:14px;border:2px solid #ff9800">';
+        h += '<div style="font-size:15px;font-weight:600;color:#e65100;margin-bottom:8px">🤝 粉丝握手会</div>';
+        h += '<div style="font-size:12px;color:#666;line-height:1.5;margin-bottom:10px">与粉丝近距离互动，回答各种有趣问题！可获得鸡腿和人气，但需小心应对敏感话题…</div>';
+        h += "<button onclick=\"App.UI.openApp('handshake')\" style='width:100%;padding:11px;background:#ff9800;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer'>🤝 参加握手会</button>";
+        h += '</div>';
+
+        h += '</div>';
+        document.getElementById('externalPage').innerHTML = h;
+    },
+
+    acceptBooking(bookingId) {
+        const result = App.Variety.acceptBooking(bookingId);
+        if (result.blocked) {
+            App.UI.showNotification('⚠️ ' + result.msg, 2500);
+            return;
+        }
+        App.UI.showNotification('🎉 接下通告：' + result.booking.emoji + ' ' + result.booking.name, 3000);
+        this.renderExternal();
+    },
+
+    resolveBookingEvent(bookingId, choiceId) {
+        const result = App.Variety.resolveEvent(bookingId, choiceId);
+        if (!result) return;
+        let msg = result.desc || '';
+        if (result.success) {
+            msg += '\n⭐人气+' + result.rewardPop;
+            if (result.rewardMoney > 0) msg += ' 💰¥+' + result.rewardMoney;
+            if (result.skillBonus) msg += ' 🎯综艺+' + result.skillBonus;
+            if (result.repBonus) msg += ' 📊声誉+' + result.repBonus;
+        } else {
+            msg += '\n💥 ' + (result.riskType || '意外') + '！⭐人气-' + result.popLoss;
+        }
+        App.UI.showNotification(msg, 5000);
+        this.renderExternal();
     },
 
     // ============ V4 舞台/公演页面 ============
@@ -6832,6 +9168,13 @@ App.UI = {
             ${lastShow ? `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px;font-size:12px;text-align:center;color:#666">
                 上次公演：Day${lastShow.day} · 位置：${lastShow.position || '中排'} · 评分：<b>${lastShow.score || '-'}分</b>
             </div>` : ''}
+
+            <!-- 原创公演 -->
+            <div style="background:linear-gradient(135deg,#e8f5e9,#c8e6c9);border-radius:16px;padding:14px;margin-bottom:16px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:4px">✨ 原创公演</div>
+                <div style="font-size:12px;color:#555;margin-bottom:8px">6步流程策划属于你的完整舞台！选主题→选曲目→编排Unit→站位→彩排→公演</div>
+                <button onclick="App.UI.renderOriginalShow()" style="width:100%;padding:10px;border:none;border-radius:10px;background:linear-gradient(135deg,#4caf50,#2e7d32);color:#fff;font-size:13px;cursor:pointer;font-weight:600">✨ 策划原创公演</button>
+            </div>
 
             <!-- 站位争夺 -->
             <div style="background:linear-gradient(135deg,#fff5f5,#ffe0e0);border-radius:16px;padding:14px;margin-bottom:16px">
@@ -6958,6 +9301,307 @@ App.UI = {
         if (!G.stageHistory) G.stageHistory = [];
         G.stageHistory.push({ day: G.game.day, position: '搭档舞台', partner: partnerName, score: result.score, grade: result.grade });
         this.renderStage();
+    },
+
+    // ============ 原创公演6步交互界面 ============
+    renderOriginalShow() {
+        App.Stage.OriginalShow.init();
+        const os = G.originalShow;
+        const stepIdx = os.currentStep;
+        const steps = App.Stage.OriginalShow.steps;
+        const stepNames = ['选主题','选曲目','编排Unit','站位分配','彩排','正式公演'];
+
+        let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('stage')">←</span><span class="title">✨ 原创公演</span></div>
+        <div style="flex:1;overflow-y:auto;padding:16px">`;
+
+        // 步骤进度条
+        h += `<div style="display:flex;gap:4px;margin-bottom:14px;overflow-x:auto">`;
+        stepNames.forEach((name, i) => {
+            const done = i < stepIdx;
+            const active = i === stepIdx;
+            const bg = done ? '#4caf50' : active ? '#ff9800' : '#e0e0e0';
+            const color = (done || active) ? '#fff' : '#999';
+            h += `<div style="flex:1;min-width:0;padding:6px 2px;text-align:center;background:${bg};border-radius:6px;font-size:10px;color:${color};white-space:nowrap">${i < stepIdx ? '✓' : (i+1)+'.'} ${name}</div>`;
+        });
+        h += `</div>`;
+
+        // 冷却检查
+        if (os.cooldown > 0 && stepIdx === null) {
+            h += `<div style="background:#fff3e0;border-radius:12px;padding:14px;text-align:center;margin-bottom:14px">
+                <div style="font-size:16px">⏳</div>
+                <div style="font-size:13px;color:#e65100;margin-top:4px">原创公演冷却中，还需 ${os.cooldown} 天</div>
+                <button onclick="App.UI.openApp('stage')" style="margin-top:10px;padding:10px 20px;border:none;border-radius:8px;background:#ff9800;color:#fff;cursor:pointer">返回公演舞台</button>
+            </div>`;
+        } else if (stepIdx === null) {
+            // 未开始 - 显示开始按钮和说明
+            h += `<div style="background:linear-gradient(135deg,#e8f5e9,#c8e6c9);border-radius:16px;padding:16px;margin-bottom:14px">
+                <div style="font-size:15px;font-weight:600;margin-bottom:8px">✨ 策划原创公演</div>
+                <div style="font-size:12px;color:#555;line-height:1.6;margin-bottom:10px">
+                    原创公演是你亲自策划的完整舞台！从选主题到正式公演，6步打造属于你的舞台。<br>
+                    <b>流程：</b>选主题 → 选曲目 → 编排Unit → 站位分配 → 彩排 → 正式公演<br>
+                    <b>要求：</b>人气≥20，Day10后开放
+                </div>
+                <button onclick="App.UI.startOriginalShow()" style="width:100%;padding:12px;border:none;border-radius:10px;background:linear-gradient(135deg,#4caf50,#2e7d32);color:#fff;font-size:14px;cursor:pointer;font-weight:600">✨ 开始策划</button>
+            </div>`;
+            // 显示历史
+            if (os.history && os.history.length > 0) {
+                h += `<div style="font-size:14px;font-weight:600;margin-bottom:8px">📜 公演历史</div>`;
+                os.history.slice(-5).reverse().forEach(r => {
+                    const gc = { SS:'#ffd700', S:'#ffd700', A:'#c0c0c0', B:'#cd7f32', C:'#999', D:'#666' };
+                    h += `<div style="display:flex;align-items:center;gap:8px;padding:8px;background:#fff;border-radius:8px;margin-bottom:4px;font-size:12px">
+                        <span style="color:${gc[r.grade]||'#999'};font-weight:700;font-size:16px">${r.grade}</span>
+                        <span style="flex:1">Day${r.day} ${r.theme} · ${r.songs}</span>
+                        <span style="color:#e74c3c;font-weight:600">${r.score}分</span>
+                    </div>`;
+                });
+            }
+        } else if (stepIdx === 0) {
+            // 步骤1: 选主题
+            h += `<div style="font-size:14px;font-weight:600;margin-bottom:10px">🎨 选择公演主题</div>`;
+            h += `<div style="font-size:12px;color:#666;margin-bottom:10px">主题决定了整场公演的氛围和风格</div>`;
+            App.Stage.OriginalShow.themes.forEach(t => {
+                h += `<div onclick="App.UI.selectOriginalTheme('${t.id}')" style="background:${t.color}22;border:2px solid ${t.color};border-radius:12px;padding:12px;margin-bottom:8px;cursor:pointer;display:flex;align-items:center;gap:10px">
+                    <span style="font-size:24px">${t.emoji}</span>
+                    <div style="flex:1">
+                        <div style="font-size:14px;font-weight:600;color:${t.color}">${t.name}</div>
+                        <div style="font-size:11px;color:#666;margin-top:2px">${t.desc}</div>
+                    </div>
+                </div>`;
+            });
+        } else if (stepIdx === 1) {
+            // 步骤2: 选曲目（开场+Unit+终曲）
+            const theme = os.theme;
+            h += `<div style="background:${theme.color}15;border-radius:10px;padding:10px;margin-bottom:10px;display:flex;align-items:center;gap:8px">
+                <span style="font-size:20px">${theme.emoji}</span>
+                <span style="font-size:13px;font-weight:600;color:${theme.color}">${theme.name}</span>
+            </div>`;
+            h += `<div style="font-size:14px;font-weight:600;margin-bottom:6px">🎵 选择曲目</div>`;
+            h += `<div style="font-size:12px;color:#666;margin-bottom:10px">分别选择开场曲、Unit曲和终曲（各选1首）</div>`;
+            // 开场曲选择
+            const selOpening = os.songs.opening?.id || '';
+            const selUnit = os.songs.unit?.id || '';
+            const selFinale = os.songs.finale?.id || '';
+            h += `<div style="background:#fff;border-radius:12px;padding:10px;margin-bottom:10px">
+                <div style="font-size:12px;font-weight:600;color:#4fc3f7;margin-bottom:6px">🎭 开场曲</div>`;
+            App.Stage.OriginalShow.songLibrary.filter(s => s.type === 'opening').forEach(s => {
+                const selected = selOpening === s.id;
+                h += `<div onclick="App.UI.tempSelectSong('opening','${s.id}')" style="padding:8px;border:${selected?'2px solid #4caf50':'1px solid #eee'};border-radius:8px;margin-bottom:4px;cursor:pointer;background:${selected?'#e8f5e9':'#f8f9fa'};font-size:12px">
+                    <span style="font-weight:600">${s.name}</span> <span style="color:#ff9800">${'⭐'.repeat(s.stars)}</span>
+                    <span style="color:#999;margin-left:4px">${s.desc}</span>
+                </div>`;
+            });
+            h += `</div>`;
+            // Unit曲选择
+            h += `<div style="background:#fff;border-radius:12px;padding:10px;margin-bottom:10px">
+                <div style="font-size:12px;font-weight:600;color:#f06292;margin-bottom:6px">💕 Unit曲</div>`;
+            this._osUnitSongs().forEach(s => {
+                const selected = selUnit === s.id;
+                h += `<div onclick="App.UI.tempSelectSong('unit','${s.id}')" style="padding:8px;border:${selected?'2px solid #4caf50':'1px solid #eee'};border-radius:8px;margin-bottom:4px;cursor:pointer;background:${selected?'#e8f5e9':'#f8f9fa'};font-size:12px">
+                    <span style="font-weight:600">${s.name}</span> <span style="color:#ff9800">${'⭐'.repeat(s.stars)}</span>
+                    <span style="color:#999;margin-left:4px">${s.desc}</span>
+                </div>`;
+            });
+            h += `</div>`;
+            // 终曲选择
+            h += `<div style="background:#fff;border-radius:12px;padding:10px;margin-bottom:10px">
+                <div style="font-size:12px;font-weight:600;color:#ff9800;margin-bottom:6px">🎉 终曲</div>`;
+            this._osFinaleSongs().forEach(s => {
+                const selected = selFinale === s.id;
+                h += `<div onclick="App.UI.tempSelectSong('finale','${s.id}')" style="padding:8px;border:${selected?'2px solid #4caf50':'1px solid #eee'};border-radius:8px;margin-bottom:4px;cursor:pointer;background:${selected?'#e8f5e9':'#f8f9fa'};font-size:12px">
+                    <span style="font-weight:600">${s.name}</span> <span style="color:#ff9800">${'⭐'.repeat(s.stars)}</span>
+                    <span style="color:#999;margin-left:4px">${s.desc}</span>
+                </div>`;
+            });
+            h += `</div>`;
+            // 确认按钮
+            h += `<button onclick="App.UI.confirmOriginalSongs()" style="width:100%;padding:12px;border:none;border-radius:10px;background:linear-gradient(135deg,#ff9800,#f57c00);color:#fff;font-size:14px;cursor:pointer;font-weight:600;margin-top:10px">✅ 确认曲目选择</button>`;
+        } else if (stepIdx === 2) {
+            // 步骤3: 编排Unit成员
+            const teammates = App.getTeamMates(G.player.group, G.player.team);
+            const selMembers = os.unitMembers || [];
+            h += `<div style="font-size:14px;font-weight:600;margin-bottom:6px">👥 编排Unit成员</div>`;
+            h += `<div style="font-size:12px;color:#666;margin-bottom:10px">选择2-3名队友加入Unit曲表演（已选${selMembers.length}人）</div>`;
+            h += `<div style="font-size:12px;color:#ff9800;margin-bottom:10px">Unit曲：${os.songs.unit?.name || ''} ${'⭐'.repeat(os.songs.unit?.stars || 0)}</div>`;
+            teammates.slice(0, 8).forEach(t => {
+                const selected = selMembers.includes(t.name);
+                const aff = G.memberAffection?.[t.name] || 50;
+                const pers = App.MemberPersonality.getFor(t.name);
+                h += `<div onclick="App.UI.toggleUnitMember('${t.name}')" style="padding:10px;border:${selected?'2px solid #4caf50':'1px solid #eee'};border-radius:10px;margin-bottom:6px;cursor:pointer;background:${selected?'#e8f5e9':'#fff'};display:flex;align-items:center;gap:8px">
+                    <span style="font-size:18px">${pers.emoji}</span>
+                    <span style="flex:1;font-size:13px">${t.name}</span>
+                    <span style="font-size:11px;color:#e74c3c">❤️${aff}</span>
+                    ${selected ? '<span style="color:#4caf50;font-size:12px">✓ 已选</span>' : ''}
+                </div>`;
+            });
+            h += `<button onclick="App.UI.confirmUnitMembers()" style="width:100%;padding:12px;border:none;border-radius:10px;background:${selMembers.length>=2?'linear-gradient(135deg,#4caf50,#2e7d32)':'#ccc'};color:#fff;font-size:14px;cursor:pointer;font-weight:600;margin-top:10px" ${selMembers.length<2?'disabled':''}>确认Unit编排（需≥2人）</button>`;
+        } else if (stepIdx === 3) {
+            // 步骤4: 站位分配 - 选C位
+            const teammates = App.getTeamMates(G.player.group, G.player.team);
+            h += `<div style="font-size:14px;font-weight:600;margin-bottom:6px">🎯 站位分配 - 选择C位</div>`;
+            h += `<div style="font-size:12px;color:#666;margin-bottom:10px">选择C位核心成员，其他人自动分配前排/后排</div>`;
+            // 玩家自己
+            h += `<div onclick="App.UI.assignOriginalPosition('${G.player.name}')" style="padding:12px;border:2px solid #ff9800;border-radius:12px;margin-bottom:8px;cursor:pointer;background:#fff3e0;display:flex;align-items:center;gap:10px">
+                <span style="font-size:20px">⭐</span>
+                <div style="flex:1">
+                    <div style="font-size:14px;font-weight:600;color:#e65100">${G.player.name}（自己）</div>
+                    <div style="font-size:11px;color:#666">人气${G.stats.popularity} · 实力${G.stats.skill}</div>
+                </div>
+                <span style="font-size:12px;color:#ff9800;font-weight:600">C位候选</span>
+            </div>`;
+            teammates.slice(0, 6).forEach(t => {
+                const aff = G.memberAffection?.[t.name] || 50;
+                const pers = App.MemberPersonality.getFor(t.name);
+                h += `<div onclick="App.UI.assignOriginalPosition('${t.name}')" style="padding:10px;border:1px solid #eee;border-radius:10px;margin-bottom:6px;cursor:pointer;background:#fff;display:flex;align-items:center;gap:8px">
+                    <span style="font-size:18px">${pers.emoji}</span>
+                    <span style="flex:1;font-size:13px">${t.name}</span>
+                    <span style="font-size:11px;color:#e74c3c">❤️${aff}</span>
+                </div>`;
+            });
+        } else if (stepIdx === 4) {
+            // 步骤5: 彩排
+            h += `<div style="font-size:14px;font-weight:600;margin-bottom:6px">🎭 彩排</div>`;
+            h += `<div style="font-size:12px;color:#666;margin-bottom:10px">彩排可以获得加成分数，但消耗体力。也可以跳过彩排直接公演。</div>`;
+            h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px;font-size:12px">
+                <div><b>主题：</b>${os.theme.emoji} ${os.theme.name}</div>
+                <div><b>开场：</b>${os.songs.opening?.name} ${'⭐'.repeat(os.songs.opening?.stars||0)}</div>
+                <div><b>Unit：</b>${os.songs.unit?.name} ${'⭐'.repeat(os.songs.unit?.stars||0)} · ${os.unitMembers.join('、')}</div>
+                <div><b>终曲：</b>${os.songs.finale?.name} ${'⭐'.repeat(os.songs.finale?.stars||0)}</div>
+                <div><b>C位：</b>${os.center === G.player.name ? '⭐ 自己' : os.center}</div>
+            </div>`;
+            h += `<div style="display:flex;gap:8px">
+                <button onclick="App.UI.doOriginalRehearsal()" style="flex:1;padding:12px;border:none;border-radius:10px;background:linear-gradient(135deg,#4fc3f7,#0288d1);color:#fff;font-size:14px;cursor:pointer;font-weight:600">🎭 彩排（+加成）</button>
+                <button onclick="App.UI.skipOriginalRehearsal()" style="flex:1;padding:12px;border:none;border-radius:10px;background:#e0e0e0;color:#666;font-size:14px;cursor:pointer">⏭ 跳过彩排</button>
+            </div>`;
+        } else if (stepIdx === 5) {
+            // 步骤6: 正式公演
+            h += `<div style="font-size:14px;font-weight:600;margin-bottom:6px">✨ 正式公演</div>`;
+            h += `<div style="font-size:12px;color:#666;margin-bottom:10px">所有准备就绪！正式登台！</div>`;
+            h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px;font-size:12px">
+                <div><b>主题：</b>${os.theme.emoji} ${os.theme.name}</div>
+                <div><b>开场：</b>${os.songs.opening?.name} ${'⭐'.repeat(os.songs.opening?.stars||0)}</div>
+                <div><b>Unit：</b>${os.songs.unit?.name} ${'⭐'.repeat(os.songs.unit?.stars||0)} · ${os.unitMembers.join('、')}</div>
+                <div><b>终曲：</b>${os.songs.finale?.name} ${'⭐'.repeat(os.songs.finale?.stars||0)}</div>
+                <div><b>C位：</b>${os.center === G.player.name ? '⭐ 自己' : os.center}</div>
+                <div><b>彩排：</b>${os.rehearsalDone ? `✓ 已彩排（${os.rehearsalScore}分加成）` : '❌ 未彩排'}</div>
+            </div>`;
+            h += `<button onclick="App.UI.doOriginalPerform()" style="width:100%;padding:14px;border:none;border-radius:10px;background:linear-gradient(135deg,#ff9800,#f44336);color:#fff;font-size:16px;cursor:pointer;font-weight:700">🌟 正式公演！</button>`;
+        }
+
+        h += `</div>`;
+        document.getElementById('stagePage').innerHTML = h;
+    },
+
+    _osUnitSongs() { return App.Stage.OriginalShow.songLibrary.filter(s => s.type === 'unit'); },
+    _osFinaleSongs() { return App.Stage.OriginalShow.songLibrary.filter(s => s.type === 'finale'); },
+
+    // 临时选曲（不提交，仅UI高亮）
+    tempSelectSong(type, songId) {
+        App.Stage.OriginalShow.init();
+        if (type === 'opening') {
+            G.originalShow.songs.opening = App.Stage.OriginalShow.songLibrary.find(s => s.id === songId);
+        } else if (type === 'unit') {
+            G.originalShow.songs.unit = App.Stage.OriginalShow.songLibrary.find(s => s.id === songId);
+        } else if (type === 'finale') {
+            G.originalShow.songs.finale = App.Stage.OriginalShow.songLibrary.find(s => s.id === songId);
+        }
+        this.renderOriginalShow();
+    },
+
+    startOriginalShow() {
+        const result = App.Stage.OriginalShow.startFlow();
+        if (result.error) { this.showNotification(result.error); return; }
+        this.renderOriginalShow();
+    },
+
+    selectOriginalTheme(themeId) {
+        const result = App.Stage.OriginalShow.selectTheme(themeId);
+        if (result.error) { this.showNotification(result.error); return; }
+        this.renderOriginalShow();
+    },
+
+    confirmOriginalSongs() {
+        App.Stage.OriginalShow.init();
+        const songs = G.originalShow.songs;
+        if (!songs.opening || !songs.unit || !songs.finale) {
+            this.showNotification('请选择开场曲、Unit曲和终曲各1首！'); return;
+        }
+        const result = App.Stage.OriginalShow.selectSongs(songs.opening.id, songs.unit.id, songs.finale.id);
+        if (result.error) { this.showNotification(result.error); return; }
+        this.showNotification(`✅ 曲目选定！总难度 ⭐${result.totalStars}`, 3000);
+        this.renderOriginalShow();
+    },
+
+    toggleUnitMember(name) {
+        App.Stage.OriginalShow.init();
+        const members = G.originalShow.unitMembers || [];
+        const idx = members.indexOf(name);
+        if (idx >= 0) {
+            members.splice(idx, 1);
+        } else {
+            if (members.length >= 3) { this.showNotification('Unit最多3名队友！'); return; }
+            members.push(name);
+        }
+        G.originalShow.unitMembers = members;
+        this.renderOriginalShow();
+    },
+
+    confirmUnitMembers() {
+        App.Stage.OriginalShow.init();
+        if (G.originalShow.unitMembers.length < 2) { this.showNotification('Unit需至少2名队友！'); return; }
+        const result = App.Stage.OriginalShow.assignUnitMembers(G.originalShow.unitMembers);
+        if (result.error) { this.showNotification(result.error); return; }
+        this.showNotification(`✅ Unit编排完成！`, 2000);
+        this.renderOriginalShow();
+    },
+
+    assignOriginalPosition(centerName) {
+        const result = App.Stage.OriginalShow.assignPositions(centerName);
+        if (result.error) { this.showNotification(result.error); return; }
+        this.showNotification(`✅ C位：${centerName === G.player.name ? '自己' : centerName}`, 2000);
+        this.renderOriginalShow();
+    },
+
+    doOriginalRehearsal() {
+        const result = App.Stage.OriginalShow.doRehearsal();
+        if (result.error) { this.showNotification(result.error); return; }
+        const effLabel = result.effMod < 1 ? `（带伤${Math.round(result.effMod*100)}%）` : '';
+        this.showNotification(`🎭 彩排完成！得分：${result.rehearsalScore}${effLabel}`, 4000);
+        this.renderOriginalShow();
+    },
+
+    skipOriginalRehearsal() {
+        App.Stage.OriginalShow.skipRehearsal();
+        this.showNotification('⏭ 跳过彩排，直接进入公演准备');
+        this.renderOriginalShow();
+    },
+
+    doOriginalPerform() {
+        const result = App.Stage.OriginalShow.doPerform();
+        // 构建详细结果弹窗
+        let detailHTML = `<div class="event-card" style="max-width:340px;padding:20px;text-align:center">
+            <div style="font-size:28px;margin-bottom:4px">${result.gradeEmoji}</div>
+            <div style="font-size:36px;font-weight:700;color:${result.grade==='SS'||result.grade==='S'?'#ffd700':result.grade==='A'?'#c0c0c0':result.grade==='B'?'#cd7f32':'#999'};margin-bottom:6px">${result.grade}</div>
+            <div style="font-size:14px;font-weight:600;margin-bottom:10px">总分：${result.score}</div>
+            <div style="background:#f5f5f5;border-radius:8px;padding:10px;margin-bottom:10px;font-size:11px;text-align:left;line-height:1.6">
+                🎵 曲目基础：${result.songBase}<br>
+                🎯 技能匹配：${result.skillMatch}<br>
+                ⭐ C位人气：${result.centerPop}<br>
+                💞 好感协同：${result.synergyBonus}<br>
+                🎭 彩排加成：${result.rehearsalBonus}<br>
+                🏥 伤病扣减：-${result.injuryPenalty}<br>
+                ${result.randomEvent ? `${result.randomEvent.emoji} ${result.randomEvent.name}：${result.randomEvent.resultDesc}（${result.randomEvent.effect>0?'+'+result.randomEvent.effect:result.randomEvent.effect}）<br>` : ''}
+            </div>
+            <div style="background:#e8f5e9;border-radius:8px;padding:10px;margin-bottom:10px;font-size:12px;text-align:left">
+                ⭐人气+${result.rewards.popularity} · 🍗鸡腿+${result.rewards.drumstick} · 😊心情${result.rewards.mood>0?'+'+result.rewards.mood:result.rewards.mood}
+            </div>
+            <button onclick="document.getElementById('osResultModal')?.remove();App.UI.renderOriginalShow()" style="width:100%;padding:10px;border:none;border-radius:8px;background:#ff9800;color:#fff;font-size:14px;cursor:pointer">继续</button>
+        </div>`;
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.id = 'osResultModal';
+        modal.innerHTML = detailHTML;
+        modal.onclick = (e) => { if (e.target === modal) { modal.remove(); App.UI.renderOriginalShow(); } };
+        document.getElementById('phoneModals').appendChild(modal);
     },
 
 
@@ -7118,12 +9762,13 @@ function assignTeam(personality, group, quizScores) {
         <div class="app-icon" onclick="App.UI.openApp('calendar')"><div class="icon" style="background:linear-gradient(135deg,#3498db,#2980b9)">📅</div><div class="label">日程</div></div>
         <div class="app-icon" onclick="App.UI.openApp('backpack')"><div class="icon" style="background:linear-gradient(135deg,#8b4513,#a0522d)">🎒</div><div class="label">背包</div></div>
         <div class="app-icon" onclick="App.UI.openApp('outdoor')"><div class="icon" style="background:linear-gradient(135deg,#e74c3c,#c0392b)">🚗</div><div class="label">外出</div></div>
-        <div class="app-icon" onclick="App.UI.openApp('profile')"><div class="icon" style="background:linear-gradient(135deg,#a55eea,#8854d0)">👤</div><div class="label">档案</div></div>
         <div class="app-icon" onclick="App.UI.openApp('election')"><div class="icon" style="background:linear-gradient(135deg,#ffd700,#f39c12)">🏆</div><div class="label">总选举</div></div>
-        <div class="app-icon" onclick="App.UI.openApp('affection')"><div class="icon" style="background:linear-gradient(135deg,#ff69b4,#ff1493)">💕</div><div class="label">好感度</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('affection')"><div class="icon" style="background:linear-gradient(135deg,#ff69b4,#ff1493)">💕</div><div class="label">好感·恋爱</div></div>
         <div class="app-icon" onclick="App.UI.openApp('diary')"><div class="icon" style="background:linear-gradient(135deg,#c8a96e,#b8935a)">📔</div><div class="label">日记本</div></div>
         <div class="app-icon" onclick="App.UI.openApp('training')"><div class="icon" style="background:linear-gradient(135deg,#6c5ce7,#a855f7)">💪</div><div class="label">训练</div></div>
         <div class="app-icon" onclick="App.UI.openApp('stage')"><div class="icon" style="background:linear-gradient(135deg,#f97316,#ef4444)">🎭</div><div class="label">公演</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('external')"><div class="icon" style="background:linear-gradient(135deg,#00bcd4,#0097a7)">📋</div><div class="label">外务</div></div>
+        <div class="app-icon" onclick="App.UI.openApp('health')"><div class="icon" style="background:linear-gradient(135deg,#e91e63,#c62828)">🏥</div><div class="label">伤病</div></div>
         <div class="app-icon" onclick="App.UI.openApp('settings')"><div class="icon" style="background:linear-gradient(135deg,#95a5a6,#7f8c8d)">⚙️</div><div class="label">设置</div></div>`;
 
     function updateClock() {
