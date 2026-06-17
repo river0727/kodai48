@@ -1715,6 +1715,334 @@ App.EventPool = {
     ]
 };
 
+// ============ 总选举系统 V2 ============
+// 优化：推手选择/竞敌雷达/拉票活动/三报节奏/翻盘机制/玩家感言
+App.Election = {
+    // 拉票活动目录
+    activities: [
+        { id:'sns',        name:'SNS 投放',        emoji:'📱', cost:  100, votes:  500, desc:'在微博/B站投放广告', risk:0.05 },
+        { id:'media',      name:'媒体采访',        emoji:'📰', cost:  300, votes: 2000, desc:'接受娱乐采访增加曝光', risk:0.08 },
+        { id:'signing',    name:'线下签名会',      emoji:'✍️', cost:  500, votes: 4000, desc:'粉丝近距离接触', risk:0.10 },
+        { id:'airport',    name:'机场应援',        emoji:'✈️', cost: 1000, votes:10000, desc:'粉丝接机 + 媒体出图', risk:0.15 },
+        { id:'concert',    name:'粉丝见面会',      emoji:'🎤', cost: 2000, votes:20000, desc:'小规模 livehouse', risk:0.20 },
+        { id:'dark',       name:'黑公关(打压竞敌)', emoji:'🕵️', cost: 2000, votes:    0, desc:'对竞敌放黑料,被发现反噬', risk:0.40, hostile:true },
+    ],
+    // 拉票活动每日效果加成(随报名期天数线性增长)
+    getActivityMultiplier: function(phase, activity) {
+        if (phase === 'first_pull')  return 1.0;
+        if (phase === 'second_pull') return 1.2;
+        if (phase === 'final_pull')  return 1.5;
+        return 0.5;  // 报名期内活动效果减半
+    },
+    // 计算推手贡献(根据推手好感度+性格)
+    calcPromoterContrib: function() {
+        const me = G.election;
+        if (!me.promoters || me.promoters.length === 0) return { votes:0, multiplier:1.0, breakdown:[] };
+        let totalVotes = 0;
+        let cpBonus = 0;
+        const breakdown = [];
+        for (const pname of me.promoters) {
+            const aff = G.memberAffection?.[pname] ?? 50;
+            const personality = App.MemberPersonality.getFor?.(pname) || null;
+            const traitName = personality?.name || '温柔治愈';
+            // 好感度 30 以下推手摆烂
+            if (aff < 30) {
+                breakdown.push({ name:pname, votes:0, reason:`好感度低(${aff}),摆烂` });
+                continue;
+            }
+            // 基础贡献 = 好感度 * 80
+            let contrib = aff * 80;
+            // 性格修正
+            if (traitName.includes('温柔')) contrib *= 1.20;       // 握手会效率高
+            else if (traitName.includes('元气')) contrib *= 1.15;  // SNS 传播广
+            else if (traitName.includes('冰山')) contrib *= 1.10;  // 话题度高
+            else if (traitName.includes('慵懒')) contrib *= 1.25;  // 粉丝心疼
+            else if (traitName.includes('可靠')) contrib *= 1.10;
+            else if (traitName.includes('文艺')) contrib *= 1.05;
+            else if (traitName.includes('傲娇')) contrib *= 0.90;  // 嘴上不帮
+            breakdown.push({ name:pname, votes:Math.floor(contrib), reason:`${traitName} 好感${aff}` });
+            totalVotes += contrib;
+        }
+        // CP 联票: 2 名推手时双方互投 20% 加成
+        if (me.promoters.length >= 2) cpBonus = totalVotes * 0.2;
+        return { votes:Math.floor(totalVotes + cpBonus), multiplier:1.0, breakdown };
+    },
+    // 计算总票数(中心公式)
+    calculateFinalVotes: function() {
+        const me = G.election;
+        if (!me) return 0;
+        // 1. 基础票
+        const base = Math.floor((G.stats.popularity || 0) * 1000);
+        // 2. 资源投入(根据 activities[] 累计)
+        let investVotes = 0;
+        for (const a of (me.activitiesUsed || [])) {
+            const def = this.activities.find(x => x.id === a.id);
+            if (!def || def.hostile) continue;  // 黑公关不直接加票
+            investVotes += def.votes * (a.count || 1);
+        }
+        // 3. 推手贡献
+        const promo = this.calcPromoterContrib();
+        // 4. CP 加成
+        // (已包含在 promo.votes)
+        // 5. 黑料扣票
+        let penalty = 0;
+        for (const c of (me.controversies || [])) {
+            penalty += c.penaltyVotes || 0;
+        }
+        // 6. 鸡腿和星光加成
+        const drumBonus = Math.floor((G.stats.drumstick || 0) / 20);
+        // 7. 上月排名加成
+        const rankBonus = (me.history?.length || 0) > 0 ? (150 - (me.history.at(-1)?.rank || 150)) * 50 : 0;
+        // 8. 随机 ±5%
+        const rng = Math.floor((Math.random() - 0.5) * base * 0.1);
+        // 9. 满人气冠军保险
+        const championBonus = (G.stats.popularity || 0) >= 100 ? 50000 : 0;
+
+        const total = base + investVotes + promo.votes - penalty + drumBonus + rankBonus + championBonus + rng;
+        me.predictedVotes = Math.max(0, total);
+        return me.predictedVotes;
+    },
+    // 根据排名计算等级
+    getRankTier: function(rank) {
+        if (rank <= 1) return { tier:'top1', name:'👑 第一名', bonus:'鸟巢演唱会 + 杂志封面' };
+        if (rank <= 3) return { tier:'top3', name:'🥇 神七(前三)', bonus:'选拔组 C 位优先' };
+        if (rank <= 7) return { tier:'top7', name:'🥈 神七', bonus:'明星组 + 综艺优先' };
+        if (rank <= 16) return { tier:'top16', name:'🏅 选拔组', bonus:'综艺邀约增加' };
+        if (rank <= 32) return { tier:'top32', name:'🎖️ 入选', bonus:'无变化' };
+        if (rank <= 48) return { tier:'top48', name:'🎗️ 危险区', bonus:'下月基础票 -5%' };
+        return { tier:'none', name:'❌ 落选', bonus:'粉丝流失 20%' };
+    },
+    // 计算竞敌(从同团/同队成员中选 3-5 名排名相近的)
+    selectRivals: function() {
+        const me = G.election;
+        const all = App.getAllMembers().filter(m => !m.graduate && m.name !== G.player.name);
+        // 按当前排名远近筛选
+        const rivals = [];
+        const myRank = G.game.rank || 150;
+        for (const m of all) {
+            // 模拟竞敌票数(基于人气+随机性)
+            const rivalVotes = Math.floor((G.stats.popularity * 0.8 + Math.random() * 40) * 1000);
+            const aff = G.memberAffection?.[m.name] ?? 50;
+            const rivalry = {
+                name: m.name, group: m.group, team: m.team,
+                votes: rivalVotes, affection: aff,
+                action: this._randomRivalAction(),
+            };
+            rivals.push(rivalry);
+        }
+        rivals.sort((a, b) => b.votes - a.votes);
+        // 取 5 个最接近的
+        return rivals.slice(0, 5);
+    },
+    _randomRivalAction: function() {
+        const actions = [
+            { type:'campaign', desc:'发竞选宣言' },
+            { type:'snatch_promoter', desc:'试图拉拢你的推手' },
+            { type:'alliance', desc:'提议互投联盟' },
+            { type:'smear', desc:'放黑料' },
+            { type:'rest', desc:'按兵不动' },
+        ];
+        return actions[Math.floor(Math.random() * actions.length)];
+    },
+    // 推进到下一阶段(每日调用)
+    advance: function() {
+        const me = G.election || this.init();
+        const day = G.game.day;
+        const dim = day % 30 || 30;
+        // 阶段映射
+        let newPhase = me.phase;
+        let newMonth = me.month;
+        if (dim === 1)  { newPhase = 'register'; }
+        else if (dim === 10) { newPhase = 'first_report'; }
+        else if (dim < 20)  { newPhase = 'first_pull'; }
+        else if (dim === 20) { newPhase = 'second_report'; }
+        else if (dim < 30)  { newPhase = 'second_pull'; }
+        else if (dim === 30) { newPhase = 'final_report'; }
+        // 月切换
+        if (dim === 1 && me.phase !== 'register') {
+            // 上月结算
+            if (me.phase === 'final_report' || me.predictedRank > 0) {
+                // 已在 final_pull 后结算
+            }
+            newMonth = me.month + 1;
+            // 重置当月状态
+            me.activitiesUsed = [];
+            me.promoters = [];
+            me.controversies = [];
+            me.predictedRank = 0;
+            me.predictedVotes = 0;
+            me.rivals = this.selectRivals();
+        }
+        me.phase = newPhase;
+        me.month = newMonth;
+        // 每日竞敌行动(拉票期)
+        if (newPhase === 'first_pull' || newPhase === 'second_pull') {
+            this._dailyRivalAction();
+        }
+    },
+    _dailyRivalAction: function() {
+        const me = G.election;
+        if (!me.rivals || me.rivals.length === 0) return;
+        // 随机选一个竞敌产生事件
+        if (Math.random() < 0.20) {
+            const rival = me.rivals[Math.floor(Math.random() * me.rivals.length)];
+            if (rival.action.type === 'snatch_promoter' && me.promoters.length > 0) {
+                this._tryStealPromoter(rival);
+            } else if (rival.action.type === 'smear' && Math.random() < 0.30) {
+                this._triggerControversy(rival);
+            }
+        }
+    },
+    _tryStealPromoter: function(rival) {
+        const me = G.election;
+        if (me.promoters.length === 0) return;
+        const idx = Math.floor(Math.random() * me.promoters.length);
+        const name = me.promoters[idx];
+        const aff = G.memberAffection?.[name] ?? 50;
+        if (aff < 30 && Math.random() < 0.4) {
+            // 好感度低的推手可能倒戈
+            me.promoters.splice(idx, 1);
+            App.UI.showNotification(`⚠️ ${name} 倒戈到了 ${rival.name} 那边...`);
+        }
+    },
+    _triggerControversy: function(rival) {
+        const me = G.election;
+        const penalty = Math.floor((G.stats.popularity || 0) * 200);
+        me.controversies.push({
+            day: G.game.day, source:rival.name,
+            desc:`被 ${rival.name} 粉丝放黑料`,
+            penaltyVotes: penalty,
+        });
+        App.UI.showNotification(`📸 ${rival.name} 的粉丝在放你黑料!票数 -${penalty}`);
+    },
+    // 初始化(首次进入或新存档)
+    init: function() {
+        if (!G.election) {
+            G.election = {
+                month: 1,
+                phase: 'register',
+                promoters: [],
+                activitiesUsed: [],
+                controversies: [],
+                predictedRank: 0,
+                predictedVotes: 0,
+                rivals: this.selectRivals(),
+                history: [],
+                speech: '',
+            };
+        }
+        return G.election;
+    },
+    // 玩家感言(最终结果后调用)
+    setSpeech: function(text) {
+        const me = G.election;
+        me.speech = (text || '').slice(0, 50);
+        // 影响下月基础
+        if (text.includes('感谢粉丝')) {
+            G.memberAffection = G.memberAffection || {};
+            // 所有粉丝基础 +5
+            App.UI.showNotification('下月粉丝基础 +5%');
+        } else if (text.includes('神七')) {
+            me.nextMonthGoal = 'top7';
+            App.UI.showNotification('🎯 你向粉丝立下了神七宣言!');
+        } else if (text.includes('感谢队友')) {
+            for (const p of me.promoters) {
+                if (G.memberAffection[p] !== undefined) {
+                    G.memberAffection[p] = Math.min(100, G.memberAffection[p] + 30);
+                }
+            }
+            App.UI.showNotification('推手好感度 +30');
+        }
+    },
+    // 玩家花鸡腿买拉票活动
+    buyActivity: function(actId) {
+        const me = G.election;
+        const def = this.activities.find(x => x.id === actId);
+        if (!def) return;
+        if ((G.stats.drumstick || 0) < def.cost) {
+            App.UI.showNotification('🍗 鸡腿不足!');
+            return;
+        }
+        App.Store.updateStats({ drumstick: -def.cost });
+        // 记录使用
+        const used = me.activitiesUsed.find(a => a.id === actId);
+        if (used) used.count++;
+        else me.activitiesUsed.push({ id: actId, count: 1 });
+        // 黑公关: 立即攻击一个竞敌
+        if (def.hostile) {
+            this._darkOps(def);
+        } else {
+            App.UI.showNotification(`📣 ${def.name} 完成!票数 +${def.votes}`);
+        }
+        // 风险: 高投入增加黑料概率
+        const investTotal = me.activitiesUsed.reduce((s,a)=>s + (this.activities.find(x=>x.id===a.id)?.cost||0) * a.count, 0);
+        if (Math.random() < def.risk && investTotal > 500) {
+            this._triggerControversy({ name: '黑粉' });
+        }
+    },
+    _darkOps: function(def) {
+        const me = G.election;
+        if (Math.random() < def.risk) {
+            // 暴露
+            this._triggerControversy({ name: '警方' });
+            App.UI.showNotification(`🕵️ 黑公关暴露!反噬 -30% 票`);
+        } else {
+            const target = me.rivals?.[0];
+            if (target) {
+                target.votes = Math.floor(target.votes * 0.7);
+                App.UI.showNotification(`🕵️ ${target.name} 票数 -30%!`);
+            }
+        }
+    },
+    // 选择推手
+    setPromoter: function(name) {
+        const me = G.election;
+        if (me.phase !== 'register' && me.phase !== 'first_pull') {
+            App.UI.showNotification('⏰ 只能在报名期/初报前选推手');
+            return;
+        }
+        if (me.promoters.includes(name)) {
+            me.promoters = me.promoters.filter(n => n !== name);
+            App.UI.showNotification(`已移除推手: ${name}`);
+        } else {
+            if (me.promoters.length >= 3) {
+                App.UI.showNotification('最多选 3 名推手');
+                return;
+            }
+            me.promoters.push(name);
+            App.UI.showNotification(`已选推手: ${name}`);
+        }
+    },
+    // 推进三报(初报/中报/最终)
+    doReport: function(type) {
+        const me = G.election;
+        if (type === 'first' && me.phase !== 'first_report') return;
+        if (type === 'second' && me.phase !== 'second_report') return;
+        if (type === 'final' && me.phase !== 'final_report') return;
+        const votes = this.calculateFinalVotes();
+        // 生成所有候选人票数
+        const all = App.getAllMembers().filter(m => !m.graduate);
+        const rankings = all.map(m => ({
+            name: m.name, group: m.group, team: m.team,
+            votes: Math.floor(votes * (0.5 + Math.random()) + Math.random() * 8000),
+        }));
+        rankings.push({ name:G.player.name, votes: votes, isPlayer:true });
+        rankings.sort((a,b) => b.votes - a.votes);
+        const myRank = rankings.findIndex(r => r.name === G.player.name) + 1;
+        me.predictedRank = myRank;
+        G.game.rank = myRank;
+        // 写入历史(仅最终)
+        if (type === 'final') {
+            me.history.push({ month:me.month, rank:myRank, votes, top7:myRank <= 7 });
+        }
+        // 阶段切换
+        if (type === 'first') me.phase = 'first_pull';
+        else if (type === 'second') me.phase = 'second_pull';
+        else if (type === 'final') me.phase = 'finalized';
+        return { rankings, myRank, votes };
+    },
+};
+
 // ============ 成员性格系统 ============
 App.MemberPersonality = (() => {
     const personalities = [
@@ -2915,13 +3243,17 @@ App.UI = {
         if (G.game.day > 1) App.Diary.generateToday();
         
         const dayInMonth = G.game.day % 30 || 30;
-        
-        if (dayInMonth === 10 && !G.game.electionPhase) {
-            this.showElectionReportModal('first');
-        } else if (dayInMonth === 20 && G.game.electionPhase === 'first') {
-            this.showElectionReportModal('second');
+
+        // V2 总选阶段推进
+        App.Election.init();
+        App.Election.advance();
+
+        if (dayInMonth === 10) {
+            this.showElectionReportModalV2('first');
+        } else if (dayInMonth === 20) {
+            this.showElectionReportModalV2('second');
         } else if (dayInMonth === 30) {
-            this.showElectionModal();
+            this.showElectionReportModalV2('final');
         }
         
         if (document.getElementById('calendarPage').classList.contains('active')) {
@@ -5678,82 +6010,268 @@ App.UI = {
 
     // ---------- 选举、握手、设置 ----------
     renderElection() {
+        // V2 入口
+        return this.renderElectionV2();
+    },
+    // V2 总选主界面
+    renderElectionV2() {
+        const me = App.Election.init();
+        const day = G.game.day;
+        const dim = day % 30 || 30;
+        const phaseNames = {
+            register: '📋 报名期', first_report: '📊 初报日', first_pull: '📣 拉票期1',
+            second_report: '📈 中报日', second_pull: '📣 拉票期2',
+            final_report: '🏆 最终日', finalized: '✅ 已结束'
+        };
+        const phase = me.phase;
+        const canBuy = phase === 'register' || phase === 'first_pull' || phase === 'second_pull';
+        const canPickPromoter = phase === 'register' || phase === 'first_pull';
+
         let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.goHome()">←</span><span class="title">🏆 总选举</span></div>`;
-        
-        const dayInMonth = G.game.day % 30 || 30;
-        const daysUntilElection = 30 - dayInMonth;
-        const daysUntilFirst = dayInMonth < 10 ? 10 - dayInMonth : (40 - dayInMonth);
-        const daysUntilSecond = dayInMonth < 20 ? 20 - dayInMonth : (50 - dayInMonth);
-        
-        if (!G.electionResults.length) {
-            let statusText = '';
-            if (dayInMonth < 10) {
-                statusText = `距离初报还有 ${10 - dayInMonth} 天`;
-            } else if (dayInMonth < 20) {
-                statusText = `初报已发布，距离中报还有 ${20 - dayInMonth} 天`;
-            } else if (dayInMonth < 30) {
-                statusText = `中报已发布，距离最终结果还有 ${30 - dayInMonth} 天`;
-            }
-            
-            h += `<div style="padding:20px">
-                <div style="text-align:center;margin-bottom:20px">
-                    <div style="font-size:48px;margin-bottom:8px">🏆</div>
-                    <div style="font-size:18px;font-weight:600;color:#333">总选举进行中</div>
+        h += `<div style="flex:1;overflow-y:auto;padding:12px">`;
+
+        // 头部状态卡
+        const predictedVotes = App.Election.calculateFinalVotes();
+        const predictedRank = me.predictedRank || '—';
+        h += `<div style="background:linear-gradient(135deg,#ff69b4,#ff1493);border-radius:12px;padding:16px;color:#fff;margin-bottom:12px">
+            <div style="font-size:13px;opacity:0.9">第 ${me.month} 届 · ${phaseNames[phase] || phase}</div>
+            <div style="font-size:32px;font-weight:700;margin:4px 0">第 ${dim} 天 / 30 天</div>
+            <div style="display:flex;gap:8px;margin-top:10px">
+                <div style="flex:1;background:rgba(255,255,255,0.18);border-radius:8px;padding:8px">
+                    <div style="font-size:11px;opacity:0.85">预测票数</div>
+                    <div style="font-size:18px;font-weight:700">${predictedVotes.toLocaleString()}</div>
                 </div>
-                
-                <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
-                    <div style="font-size:14px;color:#666;margin-bottom:12px">📅 总选时间表</div>
-                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0">
-                        <span>📊 初报（第10天）</span>
-                        <span style="color:#ff69b4;font-weight:600">${dayInMonth >= 10 ? '已发布' : daysUntilFirst + '天后'}</span>
-                    </div>
-                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0">
-                        <span>📈 中报（第20天）</span>
-                        <span style="color:#ff69b4;font-weight:600">${dayInMonth >= 20 ? '已发布' : daysUntilSecond + '天后'}</span>
-                    </div>
-                    <div style="display:flex;justify-content:space-between;padding:8px 0">
-                        <span>🏆 最终（第30天）</span>
-                        <span style="color:#ffd700;font-weight:600">${daysUntilElection} 天后</span>
-                    </div>
+                <div style="flex:1;background:rgba(255,255,255,0.18);border-radius:8px;padding:8px">
+                    <div style="font-size:11px;opacity:0.85">预测排名</div>
+                    <div style="font-size:18px;font-weight:700">#${predictedRank}</div>
                 </div>
-                
-                <div style="text-align:center;color:#888">${statusText}</div>
-            </div>`;
+                <div style="flex:1;background:rgba(255,255,255,0.18);border-radius:8px;padding:8px">
+                    <div style="font-size:11px;opacity:0.85">🍗 鸡腿</div>
+                    <div style="font-size:18px;font-weight:700">${(G.stats.drumstick||0).toLocaleString()}</div>
+                </div>
+            </div>
+        </div>`;
+
+        // 时间表
+        h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
+            <div style="font-size:14px;font-weight:600;margin-bottom:8px">📅 时间表</div>
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;font-size:11px">
+                <div style="text-align:center;padding:6px;background:${dim>=1?'#ffe0eb':'#f5f5f5'};border-radius:6px">📋1-9天<br>报名</div>
+                <div style="text-align:center;padding:6px;background:${dim>=10?'#ffe0eb':'#f5f5f5'};border-radius:6px">📊10天<br>初报</div>
+                <div style="text-align:center;padding:6px;background:${dim>=20?'#ffe0eb':'#f5f5f5'};border-radius:6px">📈20天<br>中报</div>
+                <div style="text-align:center;padding:6px;background:${dim>=30?'#ffe0eb':'#f5f5f5'};border-radius:6px">🏆30天<br>最终</div>
+            </div>
+        </div>`;
+
+        // 推手选择(同团成员)
+        const teamMates = (App.getTeamMates?.(G.player.group, G.player.team) || []).slice(0, 10);
+        h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
+            <div style="font-size:14px;font-weight:600;margin-bottom:8px">🤝 推手 <span style="color:#999;font-size:11px">(选 1-3 名,${me.promoters.length}/3)</span></div>`;
+        if (teamMates.length === 0) {
+            h += `<div style="color:#999;font-size:12px;text-align:center;padding:8px">同队暂无成员可推</div>`;
         } else {
-            const currentVotes = G.electionResults.find(r => r.name === G.player.name)?.votes || 0;
-            h += `<div style="text-align:center;padding:16px;background:linear-gradient(135deg,#ffd700,#ff9500);color:#fff">
-                <div style="font-size:24px;font-weight:700">🏆 总选举最终结果</div>
-                <div style="font-size:48px;font-weight:700">#${G.game.rank}</div>
-                <div style="font-size:14px;margin-top:8px">${currentVotes.toLocaleString()} 票</div>
-            </div>`;
-            
-            h += `<div style="padding:12px;background:#f8f8f8;border-bottom:1px solid #eee">
-                <div style="font-weight:600;color:#333">📊 排名榜</div>
-            </div>`;
-            
-            G.electionResults.slice(0,10).forEach((r,i) => {
-                h += `<div class="election-rank"><span class="election-pos top7">${i+1}</span><span class="election-name">${r.name}${r.name===G.player.name?' ⬅️ 你':''}</span><span class="election-votes">${r.votes.toLocaleString()}票</span></div>`;
-            });
-            
-            h += `<div style="padding:16px">
-                <button class="election-participate-btn" onclick="App.UI.goHome()">🏠 返回主页</button>
+            for (const m of teamMates) {
+                const isSel = me.promoters.includes(m.name);
+                const aff = G.memberAffection?.[m.name] ?? 50;
+                h += `<div onclick="${canPickPromoter ? `App.UI.electionPickPromoter('${m.name}')` : ''}" style="display:flex;align-items:center;padding:8px;border:1px solid ${isSel?'#ff69b4':'#eee'};border-radius:8px;margin-bottom:4px;cursor:${canPickPromoter?'pointer':'default'};background:${isSel?'#fff5fa':'#fff'}">
+                    <div style="flex:1">
+                        <div style="font-size:14px;font-weight:600">${m.name} ${isSel?'✅':''}</div>
+                        <div style="font-size:11px;color:#999">${m.group} Team ${m.team} · 好感 ${aff}</div>
+                    </div>
+                    <div style="font-size:12px;color:#ff69b4">${isSel?'已选':'选为推手'}</div>
+                </div>`;
+            }
+        }
+        h += `</div>`;
+
+        // 拉票活动商店
+        h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
+            <div style="font-size:14px;font-weight:600;margin-bottom:8px">📣 拉票活动</div>`;
+        for (const a of App.Election.activities) {
+            const used = (me.activitiesUsed || []).find(x => x.id === a.id);
+            const usedCount = used ? used.count : 0;
+            const canAfford = (G.stats.drumstick || 0) >= a.cost;
+            const phaseFactor = App.Election.getActivityMultiplier(phase, a);
+            const actualVotes = a.hostile ? 0 : Math.floor(a.votes * phaseFactor);
+            h += `<div style="display:flex;align-items:center;padding:10px;border:1px solid #eee;border-radius:8px;margin-bottom:6px;background:${a.hostile?'#fff8f0':'#fff'}">
+                <div style="font-size:24px;margin-right:10px">${a.emoji}</div>
+                <div style="flex:1">
+                    <div style="font-size:14px;font-weight:600">${a.name} ${usedCount>0?`<span style="background:#ff69b4;color:#fff;font-size:10px;padding:2px 6px;border-radius:10px;margin-left:4px">已用${usedCount}</span>`:''}</div>
+                    <div style="font-size:11px;color:#666">${a.desc}</div>
+                    <div style="font-size:11px;margin-top:2px">🍗 ${a.cost} · ${a.hostile?`⚠️ 风险 ${Math.round(a.risk*100)}%`:actualVotes>0?`+${actualVotes.toLocaleString()} 票 (${phaseFactor}×)`:''}</div>
+                </div>
+                <button ${(!canBuy || !canAfford) ? 'disabled' : ''} onclick="App.UI.electionBuyActivity('${a.id}')" style="padding:8px 12px;background:${(!canBuy || !canAfford)?'#ddd':'#ff69b4'};color:#fff;border:none;border-radius:6px;font-size:12px;cursor:${(!canBuy || !canAfford)?'not-allowed':'pointer'}">${canBuy?'进行':'不可'}</button>
             </div>`;
         }
-        
+        h += `</div>`;
+
+        // 竞敌雷达
+        h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
+            <div style="font-size:14px;font-weight:600;margin-bottom:8px">🎯 竞敌雷达 <span style="color:#999;font-size:11px">(主要对手)</span></div>`;
+        const rivals = me.rivals || [];
+        if (rivals.length === 0) {
+            h += `<div style="color:#999;font-size:12px;text-align:center;padding:8px">暂无竞敌数据</div>`;
+        } else {
+            rivals.slice(0, 5).forEach((r, i) => {
+                h += `<div style="display:flex;align-items:center;padding:8px;border-bottom:1px solid #f0f0f0">
+                    <div style="width:24px;font-size:14px;font-weight:600;color:#999">#${i+1}</div>
+                    <div style="flex:1">
+                        <div style="font-size:13px;font-weight:600">${r.name}</div>
+                        <div style="font-size:10px;color:#999">${r.group} · ${r.action?.desc||'无'}</div>
+                    </div>
+                    <div style="font-size:12px;color:#666">${r.votes.toLocaleString()} 票</div>
+                </div>`;
+            });
+        }
+        h += `</div>`;
+
+        // 黑料列表
+        if ((me.controversies || []).length > 0) {
+            h += `<div style="background:#fff5f5;border:1px solid #ffcccc;border-radius:12px;padding:12px;margin-bottom:12px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:8px;color:#c00">⚠️ 黑料/争议 (${me.controversies.length})</div>`;
+            me.controversies.forEach(c => {
+                h += `<div style="font-size:12px;color:#666;padding:4px 0">· ${c.desc} <span style="color:#c00">(-${(c.penaltyVotes||0).toLocaleString()} 票)</span></div>`;
+            });
+            h += `</div>`;
+        }
+
+        // 历史战绩
+        if ((me.history || []).length > 0) {
+            h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
+                <div style="font-size:14px;font-weight:600;margin-bottom:8px">📊 历届战绩</div>`;
+            me.history.forEach((h2, i) => {
+                const tier = App.Election.getRankTier(h2.rank);
+                h += `<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px;border-bottom:1px solid #f5f5f5">
+                    <span>第 ${i+1} 届</span>
+                    <span>${tier.name}</span>
+                    <span>${h2.votes.toLocaleString()} 票</span>
+                </div>`;
+            });
+            h += `</div>`;
+        }
+
+        // 报日快捷按钮
+        if (phase === 'first_report' || phase === 'second_report' || phase === 'final_report') {
+            const typeMap = { first_report:'first', second_report:'second', final_report:'final' };
+            const typeName = { first:'📊 查看初报排名', second:'📈 查看中报排名', final:'🏆 查看最终排名' };
+            h += `<button onclick="App.UI.electionDoReport('${typeMap[phase]}')" style="width:100%;padding:14px;background:linear-gradient(135deg,#ffd700,#ff9500);color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:bold;cursor:pointer;margin-bottom:12px">${typeName[typeMap[phase]]}</button>`;
+        }
+
+        h += `</div>`;
         document.getElementById('electionPage').innerHTML = h;
     },
-    participateElection() {
-        const votes = this.calculateVotes();
-        const allMembers = App.getAllMembers().filter(m => !m.graduate);
-        let rankings = allMembers.map(m => ({ name: m.name, votes: randInt(1000, 50000) }));
-        rankings.push({ name: G.player.name, votes: votes });
-        rankings.sort((a, b) => b.votes - a.votes);
+    // 玩家选推手
+    electionPickPromoter(name) {
+        App.Election.setPromoter(name);
+        this.renderElectionV2();
+    },
+    // 玩家买活动
+    electionBuyActivity(actId) {
+        App.Election.buyActivity(actId);
+        this.renderElectionV2();
+    },
+    // 玩家点击报日
+    electionDoReport(type) {
+        this.showElectionReportModalV2(type);
+    },
+    // 报日大弹窗(V2)
+    showElectionReportModalV2(type) {
+        const result = App.Election.doReport(type);
+        if (!result) return;
+        const { rankings, myRank, votes } = result;
+        const tier = App.Election.getRankTier(myRank);
+        // 写入旧数据兼容
         G.electionResults = rankings;
-        G.game.rank = rankings.findIndex(r => r.name === G.player.name) + 1;
-        
-        this.showNotification(`📣 总选举投票完成！你获得了 ${votes.toLocaleString()} 票，排名第 ${G.game.rank} 名`);
-        App.Store.updateStats({popularity: 5});
-        this.renderElection();
+        const phaseName = type === 'first' ? '📊 初报' : type === 'second' ? '📈 中报' : '🏆 最终';
+        const titleColor = type === 'final' ? 'linear-gradient(135deg,#ffd700,#ff9500)' : 'linear-gradient(135deg,#ff69b4,#ff1493)';
+
+        let h = `<div style="background:#fff;width:340px;max-height:80vh;border-radius:16px;padding:20px;overflow-y:auto">
+            <div style="text-align:center;background:${titleColor};color:#fff;border-radius:12px;padding:20px;margin-bottom:16px">
+                <div style="font-size:22px;font-weight:bold">${phaseName}</div>
+                <div style="font-size:14px;margin-top:4px">第 ${G.game.day} 天</div>
+                <div style="font-size:48px;font-weight:bold;margin:8px 0">#${myRank}</div>
+                <div style="font-size:14px">${votes.toLocaleString()} 票</div>
+                <div style="font-size:12px;margin-top:6px;background:rgba(255,255,255,0.2);border-radius:6px;padding:4px">${tier.name}</div>
+            </div>
+
+            <div style="background:#f8f8f8;border-radius:8px;padding:12px;margin-bottom:12px">
+                <div style="font-size:13px;font-weight:600;margin-bottom:8px">📊 排名前 10</div>`;
+        rankings.slice(0, 10).forEach((r, i) => {
+            const isMe = r.name === G.player.name;
+            h += `<div style="display:flex;align-items:center;padding:4px 0;${isMe?'background:#fff5fa;border-radius:6px;padding:6px':''}">
+                <div style="width:28px;font-size:14px;font-weight:700;color:${i<3?'#ffd700':'#666'}">#${i+1}</div>
+                <div style="flex:1;font-size:13px;${isMe?'font-weight:600;color:#ff1493':''}">${r.name}${isMe?' ⬅️ 你':''}</div>
+                <div style="font-size:12px;color:#666">${r.votes.toLocaleString()}</div>
+            </div>`;
+        });
+        h += `</div>`;
+
+        if (type === 'first' || type === 'second') {
+            // 追加资源按钮
+            h += `<div style="background:#fff5e6;border:1px solid #ffd700;border-radius:8px;padding:12px;margin-bottom:12px">
+                <div style="font-size:13px;font-weight:600;margin-bottom:6px">⚡ 追加资源冲刺</div>
+                <div style="font-size:11px;color:#666;margin-bottom:8px">投入鸡腿立即冲刺排名,有 30% 风险</div>
+                <button onclick="App.UI.electionExtraBoost(${type==='first'?'500':'800'})" style="width:100%;padding:10px;background:#ff9500;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">🍗 投 ${type==='first'?'500':'800'} 鸡腿</button>
+            </div>`;
+        }
+
+        if (type === 'final') {
+            // 玩家感言
+            h += `<div style="background:#f0f8ff;border:1px solid #4a90e2;border-radius:8px;padding:12px;margin-bottom:12px">
+                <div style="font-size:13px;font-weight:600;margin-bottom:6px">🎤 发表感言</div>
+                <div style="font-size:11px;color:#666;margin-bottom:6px">关键词:感谢粉丝/感谢队友/立志神七/会努力</div>
+                <input type="text" id="electionSpeechInput" maxlength="50" placeholder="例如:感谢粉丝一路陪伴!" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;margin-bottom:6px">
+                <button onclick="App.UI.electionSubmitSpeech()" style="width:100%;padding:10px;background:#4a90e2;color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer">发表</button>
+            </div>`;
+            // 历史已记录
+            h += `<div style="background:#fff5fa;border-radius:8px;padding:10px;margin-bottom:12px;text-align:center">
+                <div style="font-size:12px;color:#ff69b4;font-weight:600">${tier.bonus}</div>
+            </div>`;
+        }
+
+        h += `<button onclick="this.closest('.modal-overlay').remove()" style="width:100%;padding:12px;background:#f5f5f5;border:none;border-radius:8px;cursor:pointer">关闭</button>
+        </div>`;
+
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5)';
+        overlay.innerHTML = h;
+        document.getElementById('phoneModals').appendChild(overlay);
+    },
+    // 追加冲刺
+    electionExtraBoost(cost) {
+        cost = parseInt(cost);
+        if ((G.stats.drumstick || 0) < cost) {
+            this.showNotification('🍗 鸡腿不足!');
+            return;
+        }
+        App.Store.updateStats({ drumstick: -cost });
+        const me = G.election;
+        const bonus = cost * 8;  // 1 鸡腿 ≈ 8 票
+        if (Math.random() < 0.30) {
+            this.showNotification('📸 追加冲刺被拍到了...有黑料风险');
+            me.controversies.push({ day:G.game.day, source:'路人', desc:'被拍到刷票', penaltyVotes: Math.floor(bonus*0.3) });
+        } else {
+            this.showNotification(`⚡ 追加成功! +${bonus.toLocaleString()} 票`);
+        }
+        document.querySelector('.modal-overlay')?.remove();
+        this.showElectionReportModalV2(me.phase === 'first_report' ? 'first' : 'second');
+    },
+    // 提交感言
+    electionSubmitSpeech() {
+        const input = document.getElementById('electionSpeechInput');
+        if (!input || !input.value.trim()) {
+            this.showNotification('请输入感言');
+            return;
+        }
+        App.Election.setSpeech(input.value.trim());
+        this.showNotification('🎤 感言已发布');
+        document.querySelector('.modal-overlay')?.remove();
+        this.renderElectionV2();
+    },
+    participateElection() {
+        // V2 兼容: 跳转到 renderElectionV2
+        this.renderElectionV2();
     },
     renderHandshake() {
         const types = [
