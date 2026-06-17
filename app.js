@@ -1837,7 +1837,7 @@ App.Election = {
     _randomRivalAction: function() {
         const actions = [
             { type:'campaign', desc:'发竞选宣言' },
-            { type:'snatch_promoter', desc:'试图拉拢你的推手' },
+            { type:'snatch_promoter', desc:'试图挖走你推的成员' },
             { type:'alliance', desc:'提议互投联盟' },
             { type:'smear', desc:'放黑料' },
             { type:'rest', desc:'按兵不动' },
@@ -1900,9 +1900,9 @@ App.Election = {
         const name = me.promoters[idx];
         const aff = G.memberAffection?.[name] ?? 50;
         if (aff < 30 && Math.random() < 0.4) {
-            // 好感度低的推手可能倒戈
+            // 好感度低的成员可能放弃你的应援,转去帮竞敌
             me.promoters.splice(idx, 1);
-            App.UI.showNotification(`⚠️ ${name} 倒戈到了 ${rival.name} 那边...`);
+            App.UI.showNotification(`⚠️ ${name} 好感度太低,不再积极为你应援了...`);
         }
     },
     _triggerControversy: function(rival) {
@@ -1951,7 +1951,7 @@ App.Election = {
                     G.memberAffection[p] = Math.min(100, G.memberAffection[p] + 30);
                 }
             }
-            App.UI.showNotification('推手好感度 +30');
+            App.UI.showNotification('应援对象好感度 +30');
         }
     },
     // 玩家花鸡腿买拉票活动
@@ -1994,23 +1994,23 @@ App.Election = {
             }
         }
     },
-    // 选择推手
+    // 选择"我推的成员"（玩家=推手/粉丝，名单是应援的成员）
     setPromoter: function(name) {
         const me = G.election;
         if (me.phase !== 'register' && me.phase !== 'first_pull') {
-            App.UI.showNotification('⏰ 只能在报名期/初报前选推手');
+            App.UI.showNotification('⏰ 只能在报名期/初报前选我推的成员');
             return;
         }
         if (me.promoters.includes(name)) {
             me.promoters = me.promoters.filter(n => n !== name);
-            App.UI.showNotification(`已移除推手: ${name}`);
+            App.UI.showNotification(`已取消推 ${name}`);
         } else {
             if (me.promoters.length >= 3) {
-                App.UI.showNotification('最多选 3 名推手');
+                App.UI.showNotification('最多推 3 名成员');
                 return;
             }
             me.promoters.push(name);
-            App.UI.showNotification(`已选推手: ${name}`);
+            App.UI.showNotification(`💖 已推 ${name}`);
         }
     },
     // 推进三报(初报/中报/最终)
@@ -6063,10 +6063,14 @@ App.UI = {
             </div>
         </div>`;
 
-        // 推手选择(同团成员)
+        // 我推的成员(玩家 = 推手/粉丝,这里选的是被推的成员)
         const teamMates = (App.getTeamMates?.(G.player.group, G.player.team) || []).slice(0, 10);
         h += `<div style="background:#fff;border-radius:12px;padding:12px;margin-bottom:12px">
-            <div style="font-size:14px;font-weight:600;margin-bottom:8px">🤝 推手 <span style="color:#999;font-size:11px">(选 1-3 名,${me.promoters.length}/3)</span></div>`;
+            <div style="display:flex;align-items:baseline;gap:6px;margin-bottom:4px">
+                <span style="font-size:14px;font-weight:600">💖 我推的成员</span>
+                <span style="color:#999;font-size:11px">${me.promoters.length}/3</span>
+            </div>
+            <div style="font-size:10px;color:#999;margin-bottom:8px">你 = 推手(粉丝),以下是你在总选中重点应援的成员</div>`;
         if (teamMates.length === 0) {
             h += `<div style="color:#999;font-size:12px;text-align:center;padding:8px">同队暂无成员可推</div>`;
         } else {
@@ -6075,10 +6079,10 @@ App.UI = {
                 const aff = G.memberAffection?.[m.name] ?? 50;
                 h += `<div onclick="${canPickPromoter ? `App.UI.electionPickPromoter('${m.name}')` : ''}" style="display:flex;align-items:center;padding:8px;border:1px solid ${isSel?'#ff69b4':'#eee'};border-radius:8px;margin-bottom:4px;cursor:${canPickPromoter?'pointer':'default'};background:${isSel?'#fff5fa':'#fff'}">
                     <div style="flex:1">
-                        <div style="font-size:14px;font-weight:600">${m.name} ${isSel?'✅':''}</div>
+                        <div style="font-size:14px;font-weight:600">${m.name} ${isSel?'💖':''}</div>
                         <div style="font-size:11px;color:#999">${m.group} Team ${m.team} · 好感 ${aff}</div>
                     </div>
-                    <div style="font-size:12px;color:#ff69b4">${isSel?'已选':'选为推手'}</div>
+                    <div style="font-size:12px;color:${isSel?'#ff69b4':'#999'}">${isSel?'💖 已推':'点此推她'}</div>
                 </div>`;
             }
         }
