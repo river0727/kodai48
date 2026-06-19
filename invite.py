@@ -15,7 +15,10 @@ from typing import Dict, Optional
 logger = logging.getLogger("starlight48.invite")
 
 INVITE_CODE_FILE = "invite_codes.json"
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin48")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "SMY980814")
+MAX_ADMIN_DEVICES = int(os.getenv("MAX_ADMIN_DEVICES", "20"))  # 管理员密码最多绑定设备数
+# 认证版本：修改此值会强制重置所有管理员设备记录
+AUTH_VERSION = 2
 
 # 邀请码格式前缀
 CODE_PREFIX = "PLAY48-"
@@ -36,7 +39,7 @@ def _generate_invite_code() -> str:
 def init_invite_codes(count: int = 2000) -> Dict:
     """
     初始化邀请码系统，强制生成指定数量的邀请码。
-    如果已有旧数据，保留已使用的邀请码记录。
+    如果已有旧数据，保留已使用的邀请码记录和管理员设备记录。
     线程安全。
     """
     with _invite_lock:
@@ -44,10 +47,11 @@ def init_invite_codes(count: int = 2000) -> Dict:
             "codes": {},
             "generated_at": datetime.now().isoformat(),
             "total_count": count,
-            "used_count": 0
+            "used_count": 0,
+            "admin_devices": {"max_devices": MAX_ADMIN_DEVICES, "devices": {}}
         }
 
-        # 如果有旧文件，保留已使用的邀请码记录
+        # 如果有旧文件，保留已使用的邀请码记录和管理员设备记录
         if os.path.exists(INVITE_CODE_FILE):
             try:
                 with open(INVITE_CODE_FILE, 'r', encoding='utf-8') as f:
@@ -56,6 +60,13 @@ def init_invite_codes(count: int = 2000) -> Dict:
                     if info.get("used"):
                         invite_data["codes"][code] = info
                         invite_data["used_count"] += 1
+                # 保留管理员设备记录（除非认证版本已更新）
+                if "admin_devices" in old_data and old_data.get("auth_version") == AUTH_VERSION:
+                    invite_data["admin_devices"] = old_data["admin_devices"]
+                else:
+                    logger.info("认证版本变更或首次部署: admin_devices 已重置")
+                # 标记当前认证版本
+                invite_data["auth_version"] = AUTH_VERSION
                 logger.info("从旧文件恢复 %d 个已使用邀请码", invite_data["used_count"])
             except (json.JSONDecodeError, IOError) as e:
                 logger.warning("读取旧邀请码文件失败: %s，将重新生成", e)
@@ -135,39 +146,66 @@ def _find_code_case_insensitive(invite_data: Dict, code: str) -> Optional[str]:
     return None
 
 
-def validate_invite_code(invite_data: Dict, code: str) -> Dict:
+def validate_invite_code(invite_data: Dict, code: str, user_id: str = "") -> Dict:
     """
     验证邀请码是否有效（线程安全读）。
-    返回: {"valid": bool, "message": str, ...}
+    支持重新登录：如果码已被使用但 user_id 匹配，允许重新进入。
+    返回: {"valid": bool, "message": str, "is_admin": bool, "code": str, "user_id": str, ...}
     """
     if code.upper() == ADMIN_PASSWORD.upper():
-        return {"valid": True, "is_admin": True, "user_id": "admin"}
+        # 管理员密码：检查设备是否已在白名单中
+        with _invite_lock:
+            admin_devices = invite_data.get("admin_devices", {}).get("devices", {})
+        device_count = len(admin_devices)
+        # 如果设备已在列表中，允许重新登录
+        if user_id and user_id in admin_devices:
+            return {"valid": True, "is_admin": True, "user_id": user_id, "device_count": device_count}
+        # 新设备：如果未达上限则允许
+        if device_count < MAX_ADMIN_DEVICES:
+            return {"valid": True, "is_admin": True, "user_id": "", "device_count": device_count}
+        # 已达上限
+        return {
+            "valid": False,
+            "is_admin": True,
+            "message": f"管理员密码设备数已达上限({MAX_ADMIN_DEVICES})，请联系群主申请独立邀请码",
+            "device_count": device_count
+        }
 
     with _invite_lock:
         found_code = _find_code_case_insensitive(invite_data, code)
         if found_code is None:
             return {"valid": False, "message": "邀请码不存在"}
 
-        if invite_data["codes"][found_code].get("used"):
+        code_info = invite_data["codes"][found_code]
+        if code_info.get("used"):
+            # 已被使用：检查是否为同一用户重新登录
+            stored_user_id = code_info.get("user_id", "")
+            if user_id and stored_user_id and stored_user_id == user_id:
+                return {"valid": True, "is_admin": False, "code": found_code, "user_id": user_id, "relogin": True}
             return {"valid": False, "message": "这个邀请码已经被使用了"}
 
-        return {"valid": True, "is_admin": False, "code": found_code}
+        return {"valid": True, "is_admin": False, "code": found_code, "user_id": ""}
 
 
-def use_invite_code(invite_data: Dict, code: str, user_id: str) -> bool:
+def use_invite_code(invite_data: Dict, code: str, user_id: str, device_id: str = "") -> Dict:
     """
     使用邀请码（线程安全）。
-    返回: True 表示使用成功，False 表示失败。
+    管理员密码：追踪设备，限制设备数。
+    PLAY48- 码：一人一码，使用后绑定 user_id。
+    返回: {"success": bool, "message": str, "relogin": bool, ...}
     """
     if code.upper() == ADMIN_PASSWORD.upper():
-        return True
+        return _use_admin_password(invite_data, user_id, device_id)
 
     with _invite_lock:
         found_code = _find_code_case_insensitive(invite_data, code)
         if found_code is None:
-            return False
+            return {"success": False, "message": "邀请码不存在"}
         if invite_data["codes"][found_code].get("used"):
-            return False
+            # 检查是否为同一用户重新登录
+            if invite_data["codes"][found_code].get("user_id") == user_id:
+                return {"success": True, "message": "欢迎回来！", "relogin": True}
+            return {"success": False, "message": "这个邀请码已经被其他人使用了"}
 
         invite_data["codes"][found_code]["used"] = True
         invite_data["codes"][found_code]["used_at"] = datetime.now().isoformat()
@@ -184,7 +222,50 @@ def use_invite_code(invite_data: Dict, code: str, user_id: str) -> bool:
             invite_data["used_count"] = invite_data.get("used_count", 1) - 1
             raise
 
-        return True
+        return {"success": True, "message": "邀请码绑定成功！", "relogin": False}
+
+
+def _use_admin_password(invite_data: Dict, user_id: str, device_id: str) -> Dict:
+    """管理员密码使用逻辑：设备追踪 + 数量限制"""
+    with _invite_lock:
+        if "admin_devices" not in invite_data:
+            invite_data["admin_devices"] = {"max_devices": MAX_ADMIN_DEVICES, "devices": {}}
+
+        admin_devices = invite_data["admin_devices"]["devices"]
+        now = datetime.now().isoformat()
+
+        # 设备已存在 → 重新登录
+        if device_id and device_id in admin_devices:
+            admin_devices[device_id]["last_used"] = now
+            admin_devices[device_id]["use_count"] += 1
+            try:
+                _save_invite_data(invite_data)
+            except OSError:
+                pass
+            return {"success": True, "message": "欢迎回来！", "relogin": True, "device_count": len(admin_devices)}
+
+        # 新设备：检查上限
+        if len(admin_devices) >= MAX_ADMIN_DEVICES:
+            return {
+                "success": False,
+                "message": f"管理员密码设备数已达上限({MAX_ADMIN_DEVICES})，请联系群主申请独立邀请码",
+                "device_count": len(admin_devices)
+            }
+
+        # 记录新设备
+        admin_devices[device_id] = {
+            "user_id": user_id,
+            "first_used": now,
+            "last_used": now,
+            "use_count": 1
+        }
+        try:
+            _save_invite_data(invite_data)
+        except OSError:
+            del admin_devices[device_id]
+            raise
+
+        return {"success": True, "message": "管理员密码绑定成功！", "relogin": False, "device_count": len(admin_devices)}
 
 
 def get_invite_stats(invite_data: Dict) -> Dict:

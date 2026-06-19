@@ -4,28 +4,109 @@
 const App = window.App = {};
 
 // ============ 配置 ============
-// API 地址自动检测：优先使用当前服务器地址，file:// 协议下回退到部署地址
-// 可通过在 URL 后加 ?api=https://xxx 临时覆盖
+// API 地址自动检测：file:// 协议下回退到部署地址
+// ⚠️ 已移除 ?api= URL参数覆盖功能（防止恶意重定向盗用）
 App.Config = (() => {
-    const params = new URLSearchParams(window.location.search);
-    const customApi = params.get('api');
-    if (customApi) return { API_URL: customApi };
-
     const proto = window.location.protocol;
     if (proto === 'file:') {
-        // 直接打开 HTML 文件时，使用默认部署地址
         return { API_URL: 'https://kodai48-production.up.railway.app' };
     }
     if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
         return { API_URL: `http://${window.location.host}` };
     }
-    // GitHub Pages / 其他纯静态托管：origin 不会有后端 API，必须指向 Railway
     const isStaticHost = /(?:^|\.)github\.io$|(?:^|\.)netlify\.app$|(?:^|\.)vercel\.app$|(?:^|\.)gitbook\.io$|(?:^|\.)codepen\.io$|(?:^|\.)jsbin\.com$|(?:^|\.)jsfiddle\.net$|(?:^|\.)pages\.dev$/i.test(window.location.hostname);
     if (isStaticHost) {
         return { API_URL: 'https://kodai48-production.up.railway.app' };
     }
     return { API_URL: window.location.origin };
 })();
+
+// ============ 安全防护模块 ============
+// 域名锁 + AI调用配额 + 熔断机制 —— 防止恶意盗用导致AI费用飙升
+App.Security = {
+    // 授权域名白名单（只有这些域名才能调用AI后端）
+    ALLOWED_DOMAINS: ['river0727.github.io', 'localhost', '127.0.0.1'],
+    // file:// 协议也允许（本地测试）
+    ALLOWED_PROTOCOLS: ['file:', 'http:', 'https:'],
+
+    // AI调用配额
+    MAX_SESSION_CALLS: 200,       // 单次浏览器session最多200次AI调用
+    MAX_DAILY_CALLS: 200,         // 每个游戏日最多200次（含日记+泄露+聊天）
+    _sessionCallCount: 0,
+    _dailyCallCount: 0,
+    _lastDayReset: 0,
+
+    // 熔断阈值
+    CIRCUIT_BREAKER_THRESHOLD: 5, // 连续失败5次后熔断，本session不再调用AI
+
+    // 检查当前域名是否在白名单中
+    isDomainAuthorized() {
+        const host = window.location.hostname;
+        const proto = window.location.protocol;
+        // file:// 协议视为本地授权
+        if (proto === 'file:') return true;
+        // localhost
+        if (host === 'localhost' || host === '127.0.0.1') return true;
+        // 白名单域名
+        for (const d of this.ALLOWED_DOMAINS) {
+            if (host === d || host.endsWith('.' + d)) return true;
+        }
+        return false;
+    },
+
+    // 检查AI调用是否在配额内
+    canCallAI() {
+        // 域名未授权 → 禁止AI调用
+        if (!this.isDomainAuthorized()) {
+            console.warn('🛡️ 安全拦截：当前域名不在授权白名单中，AI功能已禁用');
+            return false;
+        }
+        // 熔断检查
+        if (App.AI._consecutiveFailures >= this.CIRCUIT_BREAKER_THRESHOLD) {
+            console.warn('🛡️ 熔断保护：连续失败过多，本session暂停AI调用');
+            return false;
+        }
+        // session配额
+        if (this._sessionCallCount >= this.MAX_SESSION_CALLS) {
+            console.warn('🛡️ 配额保护：本次session AI调用已达上限(' + this.MAX_SESSION_CALLS + ')');
+            return false;
+        }
+        // 日配额（按游戏日重置）
+        const currentDay = G.game?.day || 0;
+        if (currentDay !== this._lastDayReset) {
+            this._dailyCallCount = 0;
+            this._lastDayReset = currentDay;
+        }
+        if (this._dailyCallCount >= this.MAX_DAILY_CALLS) {
+            console.warn('🛡️ 配额保护：今日AI调用已达上限(' + this.MAX_DAILY_CALLS + ')');
+            return false;
+        }
+        return true;
+    },
+
+    // 记录一次AI调用
+    recordCall() {
+        this._sessionCallCount++;
+        this._dailyCallCount++;
+    },
+
+    // 获取当前配额状态（供UI显示）
+    getQuotaInfo() {
+        const currentDay = G.game?.day || 0;
+        if (currentDay !== this._lastDayReset) {
+            this._dailyCallCount = 0;
+            this._lastDayReset = currentDay;
+        }
+        return {
+            authorized: this.isDomainAuthorized(),
+            sessionUsed: this._sessionCallCount,
+            sessionMax: this.MAX_SESSION_CALLS,
+            dailyUsed: this._dailyCallCount,
+            dailyMax: this.MAX_DAILY_CALLS,
+            circuitBroken: App.AI._consecutiveFailures >= this.CIRCUIT_BREAKER_THRESHOLD
+        };
+    }
+};
 
 // ============ 网络诊断与连接管理 ============
 App.Network = {
@@ -458,11 +539,64 @@ App.Invite = {
         throw lastError || new Error('未知网络错误');
     },
     
-    /** 管理员密码快速通道（前端直通，无需服务器） */
+    /** 生成设备指纹（不唯一但足够分辨不同设备） */
+    _getDeviceFingerprint() {
+        const parts = [
+            navigator.hardwareConcurrency || '',
+            navigator.deviceMemory || '',
+            screen.width + 'x' + screen.height + 'x' + screen.colorDepth,
+            new Date().getTimezoneOffset(),
+            navigator.language || '',
+            navigator.platform || ''
+        ];
+        // 简单hash，不追求加密级唯一性，只做设备区分
+        let hash = 0;
+        const str = parts.join('|');
+        for (let i = 0; i < str.length; i++) {
+            const ch = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + ch;
+            hash |= 0;
+        }
+        return 'dev_' + Math.abs(hash).toString(36);
+    },
+
+    /** 记录管理员密码使用（设备追踪） */
+    _recordAdminUsage() {
+        const fp = this._getDeviceFingerprint();
+        let log;
+        try {
+            log = JSON.parse(localStorage.getItem('_adminUsageLog') || '{"devices":[],"totalUses":0}');
+        } catch(e) { log = { devices: [], totalUses: 0 }; }
+        log.totalUses++;
+        if (!log.devices.includes(fp)) {
+            log.devices.push(fp);
+        }
+        localStorage.setItem('_adminUsageLog', JSON.stringify(log));
+        return { deviceCount: log.devices.length, totalUses: log.totalUses };
+    },
+
+    /** 获取管理员密码使用统计 */
+    getAdminUsageStats() {
+        try {
+            const log = JSON.parse(localStorage.getItem('_adminUsageLog') || '{"devices":[],"totalUses":0}');
+            return { deviceCount: log.devices.length, totalUses: log.totalUses };
+        } catch(e) { return { deviceCount: 0, totalUses: 0 }; }
+    },
+
+    /** 生成稳定的用户ID（基于设备指纹） */
+    _generateUserId() {
+        const fp = this._getDeviceFingerprint();
+        // 优先从localStorage获取已有userId
+        const saved = localStorage.getItem('_deviceUserId');
+        if (saved) return saved;
+        const uid = 'user_' + fp + '_' + Date.now().toString(36);
+        localStorage.setItem('_deviceUserId', uid);
+        return uid;
+    },
+
+    /** 管理员密码 */
     _isAdminPassword(code) {
-        // 默认管理员密码: ADMIN48
-        // 仅前端快速通道，服务端仍会做最终校验
-        return code === 'ADMIN48';
+        return code === 'SMY980814';
     },
     
     async validate() {
@@ -483,31 +617,20 @@ App.Invite = {
             return;
         }
         
-        // 管理员密码：前端快速通道，无需服务器
-        if (this._isAdminPassword(code)) {
-            console.log('[Invite] 管理员密码快速通道');
-            this.inviteCode = code;
-            this.userId = 'admin_' + Date.now();
-            this.success();
-            return;
-        }
-        
-        // 格式基本校验：必须包含 PLAY48- 前缀
-        if (!code.startsWith('PLAY48-')) {
-            this._showError('邀请码格式不正确，应为 PLAY48-XXXXXXXX');
-            return;
-        }
+        const isAdmin = this._isAdminPassword(code);
+        const userId = this._generateUserId();
+        const deviceId = this._getDeviceFingerprint();
         
         this._lockUI();
         try {
-            console.log('[Invite] 开始服务器验证:', code);
-            // 先验证邀请码
+            console.log('[Invite] 开始服务器验证:', code.substring(0, 6) + '***');
+            // 统一走服务器验证（管理员密码也走服务器，做设备追踪）
             const validateData = await this._fetchWithTimeout(
                 `${this.API_URL}/api/invite/validate`,
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ code: code })
+                    body: JSON.stringify({ code: code, userId: userId })
                 },
                 8000, 1  // 8秒超时，重试1次
             );
@@ -517,23 +640,35 @@ App.Invite = {
                 return;
             }
             
-            // 普通邀请码，先使用它 - 用后端返回的正确验证码！
+            // 如果是重新登录（relogin），说明码已被使用但属于同一用户，直接进入
+            if (validateData.relogin) {
+                console.log('[Invite] 重新登录，user_id匹配');
+                this.inviteCode = code;
+                this.userId = validateData.user_id || userId;
+                this.success();
+                return;
+            }
+            
+            // 正常使用邀请码（管理员密码也走此通道）
             const realCode = validateData.code || code;
-            const userId = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
             const useData = await this._fetchWithTimeout(
                 `${this.API_URL}/api/invite/use`,
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ code: realCode, userId: userId })
+                    body: JSON.stringify({ code: realCode, userId: userId, deviceId: deviceId })
                 },
                 8000, 1  // 8秒超时，重试1次
             );
             
             if (useData.success) {
                 this.inviteCode = code;
-                this.userId = userId;
+                this.userId = useData.relogin && validateData.user_id ? validateData.user_id : userId;
                 this.success();
+                // 管理员密码：显示设备计数提醒
+                if (isAdmin && useData.device_count !== undefined) {
+                    console.log('[Invite] 管理员密码已绑定 ' + useData.device_count + ' 台设备');
+                }
             } else {
                 this._showError(useData.message || '邀请码使用失败');
             }
@@ -945,6 +1080,18 @@ App.AI = {
 
     async reply(npcId, ctx, msg) {
         console.log('🤖 AI 回复请求:', { npcId, msg: msg.substring(0, 30), endpoint: this.apiEndpoint });
+        // 🛡️ 安全检查：域名授权 + 配额 + 熔断
+        if (!App.Security.canCallAI()) {
+            const quota = App.Security.getQuotaInfo();
+            if (!quota.authorized) {
+                App.UI.showNotification('🛡️ 本站点未授权，AI功能不可用', 4000);
+            } else if (quota.circuitBroken) {
+                App.UI.showNotification('🛡️ AI服务暂时熔断，使用本地回复', 3000);
+            } else if (quota.sessionUsed >= quota.sessionMax) {
+                App.UI.showNotification('🛡️ 本次AI对话已达上限，使用本地回复', 3000);
+            }
+            return this.localReply(npcId, ctx, msg);
+        }
         if (this.apiEndpoint) {
             try {
                 const inviteCode = App.Invite.getInviteCode();
@@ -1003,6 +1150,7 @@ ${ctx.lastExchanges || ctx.recentChat || '（这是你们的第一次对话）'}
                 }
                 
                 // 使用带超时和重试的 fetch（AI 对话：8s 超时，最多1次重试）
+                App.Security.recordCall(); // 🛡️ 记录本次AI调用
                 const res = await App.Network.fetchWithRetry(this.apiEndpoint, {
                     method:'POST', headers:{'Content-Type':'application/json'},
                     body:JSON.stringify({npcId, context:ctx, message:msg, inviteCode: inviteCode, rolePrompt: rolePrompt}),
@@ -1101,7 +1249,7 @@ ${ctx.lastExchanges || ctx.recentChat || '（这是你们的第一次对话）'}
 // ============ 粉丝 AI 人设系统 ============
 // 10 个独立人设：名字、头像、性格、语言风格、互动延迟
 App.FanAI = {
-    // 10 个差异化人设
+    // 10 个差异化人设，纯本地预设回复引擎
     personas: [
         {
             id: 'lively_xiaoyuan', name: '小圆', avatar: '🐱', prefix: '',
@@ -1109,15 +1257,15 @@ App.FanAI = {
             color: '#ff69b4',
             replyDelay: { min: 1500, max: 4000 },
             keywords: {
-                '吃饭|吃|饭|饿': ['${trigger}？姐姐吃饭了吗？🍚', '我刚吃完饭~姐姐也要好好${trigger}！', '姐姐饿不饿？要不要一起${trigger}呀~'],
-                '公演|舞台|表演': ['今天的${trigger}好期待！🌟', '姐姐的${trigger}绝绝子！', '什么时候${trigger}呀~'],
-                '累|辛苦|压力': ['姐姐要好好休息！😢', '不要太${trigger}了心疼姐姐', '我们永远支持你！'],
-                '新歌|歌|唱': ['${trigger}好听到爆！🔥', '姐姐唱功越来越好了！', '什么时候出${trigger}呀~'],
-                '谢谢|感谢|辛苦': ['不用谢！应该的！', '姐姐说${trigger}好温柔🥺', '爱你姐姐！'],
-                '早|晚安|睡觉': ['姐姐${trigger}！☀️', '晚安姐姐好梦~🌙', '姐姐睡个好觉！'],
-                '化妆|漂亮|好看': ['姐姐今天好${trigger}！', '这个${trigger}绝了！', '好看到尖叫！'],
-                '笑|哈哈|搞笑': ['哈哈哈笑死我了😂', '姐姐好幽默！', '我也笑了哈哈'],
-                'default': ['姐姐好棒！💕', '爱你哟❤️', '永远支持姐姐！', '姐姐最棒了！', '加油加油！', '今天也要元气满满！', '期待姐姐的舞台！', '姐姐在干嘛呀~']
+                '吃饭|吃|饭|饿': ['${trigger}？姐姐吃饭了吗？🍚', '我刚吃完饭~姐姐也要好好${trigger}！', '姐姐饿不饿？要不要一起${trigger}呀~', '一起${trigger}吗！我请客！💰', '姐姐今天${trigger}什么好吃的了呀？', '啊我也${trigger}了！食堂阿姨今天做了红烧肉！', '${trigger}饭时间到了！姐姐不能不${trigger}哦~'],
+                '公演|舞台|表演': ['今天的${trigger}好期待！🌟', '姐姐的${trigger}绝绝子！', '什么时候${trigger}呀~', '${trigger}的票我已经抢到了！！', '姐姐在${trigger}上好闪亮✨✨✨', '我要去前排给姐姐举灯牌！', '${trigger}结束了吗？我还想再看！'],
+                '累|辛苦|压力': ['姐姐要好好休息！😢', '不要太${trigger}了心疼姐姐', '我们永远支持你！', '姐姐${trigger}就歇一歇！我给你揉肩~', '抱抱姐姐！一切都会好的💕', '我们帮你分担${trigger}！', '姐姐今天是不是${trigger}了？要不要聊聊'],
+                '新歌|歌|唱': ['${trigger}好听到爆！🔥', '姐姐唱功越来越好了！', '什么时候出${trigger}呀~', '${trigger}我已经循环了99遍了！', '姐姐的${trigger}让我整夜睡不着！', '新${trigger}什么时候上线呀？等的我好苦！', '${trigger}太好听了我要分享给所有人！'],
+                '谢谢|感谢|辛苦': ['不用谢！应该的！', '姐姐说${trigger}好温柔🥺', '爱你姐姐！', '我们才要${trigger}姐姐呢！', '${trigger}什么呀！陪伴姐姐是我的荣幸！', '姐姐不用${trigger}我们啦~这都是爱！'],
+                '早|晚安|睡觉': ['姐姐${trigger}！☀️', '晚安姐姐好梦~🌙', '姐姐睡个好觉！', '${trigger}呀！新的一天元气满满！', '${trigger}~明天继续加油！', '姐姐${trigger}了吗？记得吃早餐哦！'],
+                '化妆|漂亮|好看': ['姐姐今天好${trigger}！', '这个${trigger}绝了！', '好看到尖叫！', '姐姐${trigger}到犯规！', '这颜值我跪了！${trigger}不像话', '姐姐每天都${trigger}！今天格外${trigger}！'],
+                '笑|哈哈|搞笑': ['哈哈哈笑死我了😂', '姐姐好幽默！', '我也笑了哈哈', '姐姐${trigger}的时候我嘴角也跟着上扬！', '${trigger}${trigger}${trigger}！姐姐是搞笑担当吧', '笑到室友都问我怎么了🤣'],
+                'default': ['姐姐好棒！💕', '爱你哟❤️', '永远支持姐姐！', '姐姐最棒了！', '加油加油！', '今天也要元气满满！', '期待姐姐的舞台！', '姐姐在干嘛呀~', '想姐姐了！🥺', '嘿嘿在等姐姐更新呢', '姐姐看到我了吗？举手🙋', '我们粉丝团越来越大了！', '今天又是为姐姐心动的一天！', '姐妹们集合！！姐姐上线了', '转发了姐姐的动态！冲！']
             }
         },
         {
@@ -1126,12 +1274,13 @@ App.FanAI = {
             color: '#e74c3c',
             replyDelay: { min: 1000, max: 3000 },
             keywords: {
-                '公演|舞台': ['${trigger}必到！', '第 N 次看${trigger}了！', '姐姐${trigger}又进步了！'],
-                '新歌|歌': ['${trigger}已循环 100 遍', '期待${trigger}！', '单曲循环中'],
-                '累|辛苦': ['姐姐加油！', '我们都在！', '冲冲冲！'],
-                '谢谢': ['不用谢！永远陪姐姐！', '铁粉的本分！'],
-                '早|晚安': ['姐姐${trigger}！', '晚安！明天见！'],
-                'default': ['冲冲冲！', '永远支持！', '铁粉报到！', '姐姐最棒！', '陪伴姐姐每一天！', '我们一直都在！']
+                '公演|舞台': ['${trigger}必到！', '第 N 次看${trigger}了！', '姐姐${trigger}又进步了！', '${trigger}全程录像！回去反复看！', '姐姐C位稳了！${trigger}太震撼', '${trigger}现场氛围炸了！！'],
+                '新歌|歌': ['${trigger}已循环 100 遍', '期待${trigger}！', '单曲循环中', '${trigger}！购买100份！冲！', '${trigger}出必冲榜！', '${trigger}打榜我出500票！'],
+                '累|辛苦': ['姐姐加油！', '我们都在！', '冲冲冲！', '${trigger}也要前进！冲！', '陪姐姐度过${trigger}期！永不退粉！', '铁粉不倒！姐姐加油！'],
+                '谢谢': ['不用谢！永远陪姐姐！', '铁粉的本分！', '${trigger}！互相的！', '支持姐姐是本能！不用${trigger}！'],
+                '早|晚安': ['姐姐${trigger}！', '晚安！明天见！', '${trigger}！新一天继续冲！', '${trigger}！今天也要打卡支持！'],
+                '训练|练习': ['姐姐${trigger}辛苦了！', '${trigger}成果我们看得见！', '每场${trigger}都是汗水！冲！'],
+                'default': ['冲冲冲！', '永远支持！', '铁粉报到！', '姐姐最棒！', '陪伴姐姐每一天！', '我们一直都在！', '签到！第365天！', '铁粉永不退！', '前排占位！', '姐姐看到我了！冲冲冲！', '今天的任务：给姐姐打榜！', '每日打卡✅永不缺席！']
             }
         },
         {
@@ -1140,13 +1289,13 @@ App.FanAI = {
             color: '#9b59b6',
             replyDelay: { min: 2000, max: 5000 },
             keywords: {
-                '公演|舞台': ['新${trigger}是什么主题呀？', '这次${trigger}会跳舞吗~', '什么时候${trigger}呀？'],
-                '新歌|歌': ['${trigger}什么时候上线呀？', '这次是什么风格的${trigger}呀？', '会有 MV 吗~'],
-                '吃|饭': ['姐姐${trigger}了吗？', '今天吃了什么呀？', '姐姐喜欢吃什么~'],
-                '喜欢|爱': ['姐姐喜欢什么呀？', '姐姐最近喜欢什么歌？', '姐姐的爱好是什么~'],
-                '早|晚安': ['姐姐${trigger}！今天有什么计划呀？', '晚安~明天见哦'],
-                '住|哪里': ['姐姐住在哪里呀~', '下次能来我们城市吗'],
-                'default': ['姐姐最近在忙什么呀？', '姐姐有什么想说的吗~', '可以多发点日常吗~', '姐姐今天开心吗？', '在吗在吗？', '姐妹们都在吗~']
+                '公演|舞台': ['新${trigger}是什么主题呀？', '这次${trigger}会跳舞吗~', '什么时候${trigger}呀？', '${trigger}有新曲目吗？好奇！', '姐姐${trigger}穿什么衣服呀？', '${trigger}会选什么站位呀~'],
+                '新歌|歌': ['${trigger}什么时候上线呀？', '这次是什么风格的${trigger}呀？', '会有 MV 吗~', '新${trigger}是快歌还是慢歌呀？', '${trigger}是谁写的呀？好奇好奇！', '${trigger}MV在哪里拍呀~'],
+                '吃|饭': ['姐姐${trigger}了吗？', '今天吃了什么呀？', '姐姐喜欢吃什么~', '姐姐平时${trigger}什么口味呀？', '食堂的饭好吃吗~', '姐姐有没有偷偷吃零食呀🤔'],
+                '喜欢|爱': ['姐姐喜欢什么呀？', '姐姐最近喜欢什么歌？', '姐姐的爱好是什么~', '姐姐最喜欢什么颜色呀？', '姐姐${trigger}吃甜的还是咸的~', '姐姐有什么小秘密吗？好奇！'],
+                '早|晚安': ['姐姐${trigger}！今天有什么计划呀？', '晚安~明天见哦', '${trigger}！今天天气好吗~', '${trigger}！有什么新鲜事吗？'],
+                '住|哪里': ['姐姐住在哪里呀~', '下次能来我们城市吗', '姐姐宿舍是什么样的呀？', '训练室在哪里呀~'],
+                'default': ['姐姐最近在忙什么呀？', '姐姐有什么想说的吗~', '可以多发点日常吗~', '姐姐今天开心吗？', '在吗在吗？', '姐妹们都在吗~', '姐姐有没有什么小习惯呀？', '姐姐平时几点起床呀🤔', '好奇姐姐训练时的样子~', '姐姐会做饭吗？好奇！', '今天有什么好玩的事吗呀~', '姐姐的日常好有趣呀！']
             }
         },
         {
@@ -1155,13 +1304,13 @@ App.FanAI = {
             color: '#27ae60',
             replyDelay: { min: 3000, max: 6000 },
             keywords: {
-                '累|辛苦|压力': ['姐姐要好好休息哦', '不要太${trigger}了心疼你', '记得早点睡哦~'],
-                '吃|饭': ['记得好好${trigger}哦~', '不要只吃零食！', '注意营养呀'],
-                '早|晚安': ['姐姐${trigger}~今天也要开心哦', '晚安~做个好梦哦', '明天见呀'],
-                '生病|不舒服': ['姐姐没事吧？要去看医生哦！', '多喝热水！', '注意身体呀'],
-                '谢谢': ['不用谢啦~', '应该的呀', '我们一直都在呢'],
-                '化妆|漂亮': ['今天好漂亮呀', '姐姐一直都很美', '好看到心动'],
-                'default': ['姐姐要照顾好自己哦', '我们永远爱你~', '多喝水多休息呀', '加油！我们相信你！', '不要太有压力哦~']
+                '累|辛苦|压力': ['姐姐要好好休息哦', '不要太${trigger}了心疼你', '记得早点睡哦~', '${trigger}的时候记得给自己放个假呀', '姐姐${trigger}了？我给你煮了红枣茶~', '抱抱姐姐~${trigger}总会过去的', '姐姐身体比什么都重要哦'],
+                '吃|饭': ['记得好好${trigger}哦~', '不要只吃零食！', '注意营养呀', '姐姐${trigger}了吗？我做了便饭给你~', '${trigger}要按时哦！不然会胃疼的', '给姐姐带了我妈做的饺子哦🥟', '姐姐${trigger}清淡点比较好呀'],
+                '早|晚安': ['姐姐${trigger}~今天也要开心哦', '晚安~做个好梦哦', '明天见呀', '${trigger}！记得喝杯温水哦~', '${trigger}~被子盖好别着凉', '姐姐${trigger}了吗？新的一天要加油哦'],
+                '生病|不舒服': ['姐姐没事吧？要去看医生哦！', '多喝热水！', '注意身体呀', '${trigger}了？我帮姐姐查了偏方~', '姐姐吃药了吗？按时吃药哦', '${trigger}就多休息！别逞强呀'],
+                '谢谢': ['不用谢啦~', '应该的呀', '我们一直都在呢', '${trigger}什么呀~都是真心的！', '姐姐客气了！陪伴就是最好的${trigger}'],
+                '化妆|漂亮': ['今天好漂亮呀', '姐姐一直都很美', '好看到心动', '姐姐素颜也好看呀！${trigger}只是锦上添花~', '${trigger}的姐姐让整个舞台都亮了'],
+                'default': ['姐姐要照顾好自己哦', '我们永远爱你~', '多喝水多休息呀', '加油！我们相信你！', '不要太有压力哦~', '姐姐今天看起来状态不错呀~', '给姐姐准备了小零食哦🍪', '降温了记得多穿衣服哦！', '姐姐的笑容是最好的药呀🌻', '慢慢来~不着急哦', '姐姐注意别熬夜呀！', '今天的训练轻松点哦~别太拼']
             }
         },
         {
@@ -1170,12 +1319,13 @@ App.FanAI = {
             color: '#f39c12',
             replyDelay: { min: 2000, max: 4500 },
             keywords: {
-                '笑|哈哈|搞笑': ['哈哈哈哈笑死我了😂', '笑到肚子疼', '姐姐好${trigger}哈哈哈'],
-                '新歌|歌': ['${trigger}洗脑循环了哈哈哈', '这歌太上头', '脑自动循环了救命'],
-                '公演|舞台': ['${trigger}名场面预定！', '姐姐${trigger} yyds！', '这不得上热搜'],
-                '化妆|漂亮': ['姐姐今天美得不像话', '这颜值犯规了', '心动了怎么办'],
-                '吃|饭': ['姐姐吃啥好吃的了', '我饿了... 姐姐请客！', '我也要吃！'],
-                'default': ['哈哈哈哈笑死', '笑死我了', '姐姐太搞笑了', '这是什么沙雕发言', '姐姐在说什么人间迷惑行为', '脑回路清奇', '笑不活了家人们']
+                '笑|哈哈|搞笑': ['哈哈哈哈笑死我了😂', '笑到肚子疼', '姐姐好${trigger}哈哈哈', '${trigger}${trigger}！我笑到室友以为我疯了', '笑到岔气了救命🤣', '姐姐是${trigger}担当吧！认证了'],
+                '新歌|歌': ['${trigger}洗脑循环了哈哈哈', '这歌太上头', '脑自动循环了救命', '${trigger}！听完满脑子都是副歌哈哈哈', '我室友被我逼着听${trigger}100遍🤣'],
+                '公演|舞台': ['${trigger}名场面预定！', '姐姐${trigger} yyds！', '这不得上热搜', '${trigger}好炸！全场都在尖叫哈哈哈', '姐姐${trigger}的表情包素材已经截好了🤣'],
+                '化妆|漂亮': ['姐姐今天美得不像话', '这颜值犯规了', '心动了怎么办', '姐姐${trigger}到我想做表情包！哈哈哈', '${trigger}！手机截图已经存了99张了'],
+                '吃|饭': ['姐姐吃啥好吃的了', '我饿了... 姐姐请客！', '我也要吃！', '姐姐${trigger}啥？我也要！贪心哈哈哈', '分享${trigger}照片！馋死我们了吧🤣'],
+                '累|辛苦': ['姐姐${trigger}了？躺平才是正义哈哈哈', '${trigger}就摆烂一天！我们也支持摆烂🤣', '姐姐${trigger}的样子也好可爱哈哈哈'],
+                'default': ['哈哈哈哈笑死', '笑死我了', '姐姐太搞笑了', '这是什么沙雕发言', '姐姐在说什么人间迷惑行为', '脑回路清奇', '笑不活了家人们', '已截图！表情包素材！', '姐姐说的每一句都想做表情包😂', '哈哈哈这是什么宝藏偶像', '每次看姐姐的动态都笑到捶桌', '姐妹们快看姐姐说了啥🤣', '我宣布姐姐是本周最搞笑的人', '关注姐姐永不后悔！每天都有笑料', '转发！让更多人笑到！']
             }
         },
         {
@@ -1184,12 +1334,13 @@ App.FanAI = {
             color: '#e84393',
             replyDelay: { min: 4000, max: 8000 },
             keywords: {
-                '公演|舞台': ['${trigger}好...好看', '姐姐好厉害...', '我...我在台下！'],
-                '新歌|歌': ['歌好好听...', '听哭了', '单曲循环中...'],
-                '化妆|漂亮': ['姐姐好${trigger}...', '心动', '脸红'],
-                '谢谢': ['不...不用谢', '应该的', '能为姐姐做点事很开心'],
-                '早|晚安': ['姐姐${trigger}...', '晚安姐姐...好梦'],
-                'default': ['喜欢姐姐...', '姐姐加油', '我会一直支持的', '姐姐好棒...', '小声：爱姐姐', '默默打卡', '害羞.jpg']
+                '公演|舞台': ['${trigger}好...好看', '姐姐好厉害...', '我...我在台下！', '看了${trigger}...好感动', '姐姐${trigger}的时候我在角落偷偷鼓掌...', '我...我录了${trigger}的视频！回去反复看'],
+                '新歌|歌': ['歌好好听...', '听哭了', '单曲循环中...', '新${trigger}...好喜欢', '${trigger}让我心跳好快...', '听${trigger}的时候...偷偷哭了'],
+                '化妆|漂亮': ['姐姐好${trigger}...', '心动', '脸红', '${trigger}...好${trigger}...', '看到姐姐${trigger}的样子...心跳加速了...', '姐姐${trigger}到我不敢直视...害羞'],
+                '谢谢': ['不...不用谢', '应该的', '能为姐姐做点事很开心', '${trigger}什么...这是我的小小心意...', '姐姐${trigger}了...我也很开心...'],
+                '早|晚安': ['姐姐${trigger}...', '晚安姐姐...好梦', '${trigger}...今天也要加油哦...', '姐姐${trigger}了...我刚刚才醒...害羞'],
+                '累|辛苦': ['姐姐${trigger}了...心疼...', '休息一下吧...', '我...我帮姐姐揉肩好不好...'],
+                'default': ['喜欢姐姐...', '姐姐加油', '我会一直支持的', '姐姐好棒...', '小声：爱姐姐', '默默打卡', '害羞.jpg', '姐姐...看到我的留言了吗...', '悄悄留个言...希望姐姐看到', '今天又偷偷看姐姐动态了...', '我会默默一直支持姐姐的...', '写了好久...终于鼓起勇气发了', '姐姐知道吗...你是我唯一的偶像...']
             }
         },
         {
@@ -1198,12 +1349,13 @@ App.FanAI = {
             color: '#2c3e50',
             replyDelay: { min: 3000, max: 6000 },
             keywords: {
-                '公演|舞台': ['今天的${trigger}表情管理很到位！', '舞步的节奏感进步了！', 'C 位稳如老狗！'],
-                '新歌|歌': ['这首 vocal line 难度挺大的，姐姐完成度很高', 'bridge 部分情感处理细腻', '音准稳！'],
-                '化妆|漂亮': ['今天的妆面和服装很搭', '造型师在线！', '姐姐的可塑性很强'],
-                '吃|饭': ['姐姐注意碳水摄入哦', '健身后记得补充蛋白质~'],
-                '累|辛苦': ['注意休息，下一场${trigger}需要体力', '保重身体是革命本钱'],
-                'default': ['姐姐最近的进步肉眼可见！', '这个状态很棒！', '路转粉了！', '姐姐值得更好的发展！', '建议多发些日常物料~']
+                '公演|舞台': ['今天的${trigger}表情管理很到位！', '舞步的节奏感进步了！', 'C 位稳如老狗！', '${trigger}的编排有创意！看得出用心了', '姐姐在${trigger}的呼吸控制进步明显', '${trigger}互动环节很自然！节奏感在线', '这场${trigger}整体完成度8.5/10！'],
+                '新歌|歌': ['这首 vocal line 难度挺大的，姐姐完成度很高', 'bridge 部分情感处理细腻', '音准稳！', '${trigger}的和声部分编排很精巧', '姐姐在高音区的共鸣越来越好了', '${trigger}的动态范围很有层次感', '这首歌适合姐姐的音域，选曲很聪明'],
+                '化妆|漂亮': ['今天的妆面和服装很搭', '造型师在线！', '姐姐的可塑性很强', '${trigger}的造型很有概念感！', '今天${trigger}的配色方案很高级', '服装剪裁凸显了姐姐的舞台优势'],
+                '吃|饭': ['姐姐注意碳水摄入哦', '健身后记得补充蛋白质~', '训练期${trigger}要注重营养搭配', '赛前${trigger}建议清淡高蛋白'],
+                '累|辛苦': ['注意休息，下一场${trigger}需要体力', '保重身体是革命本钱', '${trigger}期要科学安排恢复训练', '建议姐姐做一下拉伸放松'],
+                '训练|练习': ['${trigger}量建议循序渐进', '看到姐姐${trigger}成果了！肉眼可见的进步', '${trigger}视频分析：节奏感提升30%！'],
+                'default': ['姐姐最近的进步肉眼可见！', '这个状态很棒！', '路转粉了！', '姐姐值得更好的发展！', '建议多发些日常物料~', '从专业角度看，姐姐潜力很大', '数据说话：姐姐各项指标都在上升📈', '客观评价：姐姐是团体里进步最快的', '关注姐姐半年了，成长曲线很漂亮', '期待姐姐的下一个突破！', '今天的训练成果看得见！', '数据分析：姐姐舞台表现稳步提升']
             }
         },
         {
@@ -1212,13 +1364,13 @@ App.FanAI = {
             color: '#16a085',
             replyDelay: { min: 2500, max: 5500 },
             keywords: {
-                '吃|饭': ['孩子要好好${trigger}啊！', '不要老吃外卖！', '营养要均衡啊'],
-                '累|辛苦': ['孩子别太${trigger}了', '身体最重要', '要照顾好自己'],
-                '化妆|漂亮': ['今天打扮得真精神！', '好看好看！', '像妈妈年轻时一样美'],
-                '公演|舞台': ['孩子${trigger}得真好！', '妈妈为你骄傲！', '加油宝贝！'],
-                '生病|不舒服': ['吃药了吗？', '多喝热水！', '要不要去看医生'],
-                '晚安|早': ['早点睡！', '早上好孩子！', '记得吃早餐'],
-                'default': ['宝贝加油！', '阿姨永远支持你！', '注意身体啊孩子', '天冷了多穿衣服', '路上小心', '妈妈粉永远爱你']
+                '吃|饭': ['孩子要好好${trigger}啊！', '不要老吃外卖！', '营养要均衡啊', '阿姨今天做了红烧排骨！想${trigger}的话来阿姨家', '${trigger}要按时！不然胃要出问题的', '姐姐${trigger}了吗？别饿着自己啊孩子', '阿姨给你寄了点心！记得${trigger}哦🥧'],
+                '累|辛苦': ['孩子别太${trigger}了', '身体最重要', '要照顾好自己', '${trigger}了就歇歇！阿姨心疼啊', '孩子${trigger}的时候阿姨也睡不着...', '记得泡脚放松！阿姨的经验之诀', '${trigger}的时候别忘了深呼吸放松呀'],
+                '化妆|漂亮': ['今天打扮得真精神！', '好看好看！', '像妈妈年轻时一样美', '${trigger}得真好看！阿姨眼光没错', '姐姐今天这造型真利索！'],
+                '公演|舞台': ['孩子${trigger}得真好！', '妈妈为你骄傲！', '加油宝贝！', '阿姨在台下使劲鼓掌了！${trigger}太棒了', '${trigger}完记得补水和休息！', '孩子${trigger}时阿姨全程录像了！'],
+                '生病|不舒服': ['吃药了吗？', '多喝热水！', '要不要去看医生', '${trigger}了？阿姨马上给你煮姜茶！', '孩子${trigger}了阿姨也心疼...快去看医生', '记得按时吃药！阿姨每天提醒你'],
+                '晚安|早': ['早点睡！', '早上好孩子！', '记得吃早餐', '${trigger}！被子盖好！别着凉！', '孩子${trigger}！阿姨做了粥！', '${trigger}！天冷多穿一件！', '${trigger}！今天又是元气满满的一天！'],
+                'default': ['宝贝加油！', '阿姨永远支持你！', '注意身体啊孩子', '天冷了多穿衣服', '路上小心', '妈妈粉永远爱你', '孩子今天怎么样呀？', '阿姨又来看你了！放心！', '记得喝水啊！阿姨最唠叨这个', '孩子有啥困难跟阿姨说！', '阿姨给你带了水果🍎', '慢慢来！阿姨等你！', '孩子开心阿姨就开心！', '天气变了记得添衣！阿姨的叮嘱']
             }
         },
         {
@@ -1227,11 +1379,12 @@ App.FanAI = {
             color: '#8e44ad',
             replyDelay: { min: 1500, max: 3500 },
             keywords: {
-                '公演|舞台': ['${trigger}票我包了！', 'VIP 票来 10 张！', '送姐姐上热搜！'],
-                '新歌|歌': ['打榜冲第一！', '买它 1000 张！', '推荐给所有朋友！'],
-                '谢谢': ['客气啥！小意思！', '钱不是问题！', '为姐姐值得！'],
-                '吃|饭': ['请姐姐${trigger}！', '米其林安排！', '下午茶我请'],
-                'default': ['已打赏！', '姐姐收图！', '支持！', '有需要找我！', '为姐姐承包一切！', '送姐姐上 C 位！', '冲冲冲！']
+                '公演|舞台': ['${trigger}票我包了！', 'VIP 票来 10 张！', '送姐姐上热搜！', '${trigger}全场最好的位置！我订了！', '${trigger}赞助我来！费用不用担心', '${trigger}直播投了1000个星！冲！'],
+                '新歌|歌': ['打榜冲第一！', '买它 1000 张！', '推荐给所有朋友！', '${trigger}！我买了500张！打榜第一稳了！', '给姐姐的${trigger}投了10万星！冲冲冲！', '${trigger}上线我第一时间买100份！'],
+                '谢谢': ['客气啥！小意思！', '钱不是问题！', '为姐姐值得！', '${trigger}什么！姐姐开心就是我最大的回报！', '不用${trigger}！这种小事日常操作而已！'],
+                '吃|饭': ['请姐姐${trigger}！', '米其林安排！', '下午茶我请', '${trigger}！我安排了5星餐厅！姐姐放心来！', '给姐姐${trigger}的预算不设上限！', '私人厨师给姐姐${trigger}做好了！'],
+                '累|辛苦': ['姐姐${trigger}了？我安排度假！5星酒店！', '${trigger}？不存在的！我出钱让姐姐休息好！'],
+                'default': ['已打赏！', '姐姐收图！', '支持！', '有需要找我！', '为姐姐承包一切！', '送姐姐上 C 位！', '冲冲冲！', '刚刚又打赏了！姐姐值得！💎', '今天投了5万星！日常操作！', '姐姐有啥需要尽管说！不差钱！', '已安排！姐姐放心！', '我们大佬粉的实力！冲！', '姐姐的每场公演我都在VIP区！', '粉丝榜第一名稳了！', '已购周边100套！冲冲冲！']
             }
         },
         {
@@ -1240,11 +1393,12 @@ App.FanAI = {
             color: '#7f8c8d',
             replyDelay: { min: 5000, max: 12000 },
             keywords: {
-                '公演|舞台': ['👍', '支持${trigger}', '加油'],
-                '新歌|歌': ['好听', '${trigger}收藏了', '👍'],
-                '化妆|漂亮': ['好看', '👍', '赞'],
-                '早|晚安': ['${trigger}', '晚安', '🌙'],
-                'default': ['👍', '支持姐姐', '打卡', '围观', '默默支持', '在看', '+1', '加油']
+                '公演|舞台': ['👍', '支持${trigger}', '加油', '${trigger}看了', '${trigger}不错'],
+                '新歌|歌': ['好听', '${trigger}收藏了', '👍', '${trigger}买了', '已下载${trigger}'],
+                '化妆|漂亮': ['好看', '👍', '赞', '${trigger}'],
+                '早|晚安': ['${trigger}', '晚安', '🌙', '${trigger}了'],
+                '累|辛苦': ['休息', '加油'],
+                'default': ['👍', '支持姐姐', '打卡', '围观', '默默支持', '在看', '+1', '加油', '路过', '👀', '已关注', '默默打卡✅', '又来看姐姐了', '支持', '签到', '在', '知道了', '嗯', '好', '默默在看', '留个痕迹', '今日打卡']
             }
         }
     ],
@@ -2544,12 +2698,44 @@ App.Diary = {
     },
     async generateToday() {
         this.initIfNeeded();
+        // 🛡️ 安全检查：非授权域名或配额用尽时不调用AI
+        if (!App.Security.canCallAI()) {
+            // 本地生成简短日记
+            const teammates = App.getAllMembers().filter(m => !m.graduate && m.group === G.player.group && m.team === G.player.team);
+            for (const m of teammates) {
+                if (!G.diaryEntries[m.name]) G.diaryEntries[m.name] = [];
+                const todayEntries = G.diaryEntries[m.name].filter(e => e.day === G.game.day);
+                if (todayEntries.length > 0) continue;
+                const mood = App.MemberPersonality.getMemberMood(m.name);
+                const localDiaries = [
+                    `今天排练了一整天，累但充实！${mood.emoji}`,
+                    `和队友们一起吃了午饭，很开心~`,
+                    `今天的公演准备进行中，大家都很努力！`,
+                    `休息日也要保持练习状态呢~`,
+                    `看了粉丝的留言，感觉被温暖包围了${mood.emoji}`,
+                    `今天的舞蹈课学了新动作，有点难但很有趣！`,
+                    `和${G.player.name}一起训练，互相加油！`,
+                    `晚上回去要好好休息明天继续加油~`
+                ];
+                G.diaryEntries[m.name].push({ day:G.game.day, content: pick(localDiaries), mood:mood.emoji, time:new Date().toISOString() });
+                App.Save.autoSave();
+            }
+            return;
+        }
         const teammates = App.getAllMembers().filter(m => !m.graduate && m.group === G.player.group && m.team === G.player.team);
         const targets = teammates;
+        const inviteCode = App.Invite.getInviteCode(); // 🛡️ 传递inviteCode
         for (const m of targets) {
             if (!G.diaryEntries[m.name]) G.diaryEntries[m.name] = [];
             const todayEntries = G.diaryEntries[m.name].filter(e => e.day === G.game.day);
             if (todayEntries.length > 0) continue;
+            // 🛡️ 每个队友调用前都检查配额
+            if (!App.Security.canCallAI()) {
+                const mood = App.MemberPersonality.getMemberMood(m.name);
+                G.diaryEntries[m.name].push({ day:G.game.day, content: `今天也是元气满满的一天！${mood.emoji}`, mood:mood.emoji, time:new Date().toISOString() });
+                App.Save.autoSave();
+                continue;
+            }
             const pers = App.MemberPersonality.getFor(m.name);
             const aff = G.memberAffection?.[m.name] || 50;
             const mem = G.memberMemory?.[m.name];
@@ -2558,9 +2744,10 @@ App.Diary = {
                 const prompt = `【角色】你是${m.name}，${G.player.group} Team ${m.team}的女性偶像成员。你的性格类型是"${pers.name}"（${pers.speakStyle}）${pers.emoji}。你在${G.player.group}的Team ${m.team}，和玩家${G.player.name}是同一个队伍的队友。今天是你偶像生涯的第${G.game.day}天。你对玩家${G.player.name}的好感度是${aff}/100(${mood.label})。
 
 请用第一人称写一段50-80字的简短日记，记录今天的感受（可以是排练、和队友相处、或对${G.player.name}的真实想法）。保持你"${pers.speakStyle}"的说话语气。只输出日记内容，不要加任何说明或标记。`;
+                App.Security.recordCall(); // 🛡️ 记录AI调用
                 const resp = await fetch(`${App.Config.API_URL}/api/chat`, {
                     method:'POST', headers:{'Content-Type':'application/json'},
-                    body:JSON.stringify({ npcId:pers.id, message:prompt, playerName:G.player.name, context:{ memberName:m.name, playerName:G.player.name, affection:aff } })
+                    body:JSON.stringify({ npcId:pers.id, message:prompt, playerName:G.player.name, inviteCode: inviteCode, context:{ memberName:m.name, playerName:G.player.name, affection:aff } })
                 });
                 let text = '';
                 if (resp.ok) {
@@ -2606,11 +2793,18 @@ App.ChatLeak = {
         };
     },
     async generateContent(leak) {
+        // 🛡️ 安全检查：非授权域名或配额用尽时不调用AI
+        if (!App.Security.canCallAI()) {
+            leak.content = `${leak.members[0]}: 你听说了吗？\n${leak.members[1]}: 什么事？`;
+            return leak;
+        }
         try {
+            const inviteCode = App.Invite.getInviteCode(); // 🛡️ 传递inviteCode
             const prompt = `你正在模拟48系偶像团体中两个成员的私聊对话。${leak.members[0]}和${leak.members[1]}正在${leak.scene}，${leak.topic}。请生成一段简洁有趣的对话(4-6句)，要有真实感。每个成员的角色性格随机但合理。输出格式:\n${leak.members[0]}: ...\n${leak.members[1]}: ...`;
+            App.Security.recordCall(); // 🛡️ 记录AI调用
             const resp = await fetch(`${App.Config.API_URL}/api/chat`, {
                 method:'POST', headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({ npcId:'member', message:prompt, playerName:G.player.name })
+                body:JSON.stringify({ npcId:'member', message:prompt, playerName:G.player.name, inviteCode: inviteCode })
             });
             if (resp.ok) {
                 const data = await resp.json();
@@ -4791,6 +4985,11 @@ App.UI = {
         G.game.phase = 'morning';
         G.game.handshake_this_month = false;
 
+        // 手动推进时重置自动计时器，从当前时刻重新开始计算10分钟
+        if (App._dayTimerLastRealTime) {
+            App._dayTimerLastRealTime = Date.now();
+        }
+
         // 翻牌每日重置：清空当日已翻牌状态
         if (G.flipState) G.flipState = { day: G.game.day, replied: {} };
 
@@ -5093,7 +5292,8 @@ App.UI = {
                 <div style="font-size:13px;color:#666;line-height:1.6">
                     • 每30天会进行一次总选举<br>
                     • 每30天会有握手会活动<br>
-                    • 点击上方按钮可手动推进时间
+                    • 现实每10分钟自动推进1天<br>
+                    • 点击上方按钮可手动推进时间（计时器将重置）
                 </div>
             </div>
         </div>`;
@@ -6746,7 +6946,7 @@ App.UI = {
             </div>
         `}).join('');
         // AI 状态条
-        const aiBar = `<div style="background:linear-gradient(90deg,#e3f2fd,#f3e5f5);padding:8px 12px;font-size:11px;color:#555;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e0e0e0"><span>🤖 AI 粉丝已上线（${App.FanAI.personas.length} 个独立人设）</span><span style="color:#999">${G.pocketRoomAutoTriggered ? '✅ 已自动欢迎' : '⏳ 等待 AI 主动发消息'}</span></div>`;
+        const aiBar = `<div style="background:linear-gradient(90deg,#e8f5e9,#f1f8e9);padding:8px 12px;font-size:11px;color:#555;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e0e0e0"><span>💬 粉丝互动（${App.FanAI.personas.length} 个独立人设）</span><span style="color:#999">${G.pocketRoomAutoTriggered ? '✅ 已自动欢迎' : '⏳ 等待粉丝主动发消息'}</span></div>`;
 
         let h = `<div class="app-header"><span class="back-btn" onclick="App.UI.openApp('pocket')">←</span><span class="title">房间</span></div>
         ${aiBar}
@@ -9713,7 +9913,21 @@ function assignTeam(personality, group, quizScores) {
 
 // ============ 初始化 ============
 (function initApp() {
-    // URL 参数 reset=1：清除验证状态，强制显示验证码页面
+    // 版本号：修改此值会强制所有用户重新验证邀请码（保留游戏存档）
+    var APP_AUTH_VERSION = 2;
+
+    // 版本检查：版本号变化时清除邀请码验证状态，但保留游戏数据
+    try {
+        var storedAuthVersion = localStorage.getItem('_authVersion');
+        if (storedAuthVersion !== String(APP_AUTH_VERSION)) {
+            localStorage.removeItem('inviteCode');
+            localStorage.removeItem('inviteUserId');
+            localStorage.setItem('_authVersion', String(APP_AUTH_VERSION));
+            console.log('[Init] 认证版本更新 (' + storedAuthVersion + ' -> ' + APP_AUTH_VERSION + '): 已清除验证状态，游戏存档保留');
+        }
+    } catch(e) {}
+
+    // URL 参数 reset=1：手动清除验证状态
     try {
         const params = new URLSearchParams(window.location.search);
         if (params.get('reset') === '1') {
@@ -9786,27 +10000,32 @@ function assignTeam(personality, group, quizScores) {
     updateClock();
     setInterval(updateClock, 60000);
 
+    // 时间流速：现实每10分钟 = 游戏内1天
     let lastRealTime = Date.now();
+    App._dayTimerLastRealTime = lastRealTime; // 暴露给手动推进时重置
+    const DAY_INTERVAL_MS = 10 * 60 * 1000; // 10分钟
     setInterval(() => {
         if (!G.player.name) return;
         const now = Date.now();
-        const elapsedHours = (now - lastRealTime) / (1000 * 3600);
-        if (elapsedHours >= 1) {
-            const daysPassed = Math.floor(elapsedHours);
-            G.game.day += daysPassed;
-            G.game.phase = 'morning';
-            G.game.handshake_this_month = false;
-            
-            lastRealTime = now;
-            App.UI.updateTimeBar();
-            App.Save.autoSave();
-            App.UI.showNotification(`⏰ 时间流逝，已过${daysPassed}天`);
-            
-            if (G.game.day % 30 === 0) {
-                App.UI.showElectionModal();
+        const elapsed = now - App._dayTimerLastRealTime;
+        if (elapsed >= DAY_INTERVAL_MS) {
+            const daysPassed = Math.floor(elapsed / DAY_INTERVAL_MS);
+            if (daysPassed > 0) {
+                G.game.day += daysPassed;
+                G.game.phase = 'morning';
+                G.game.handshake_this_month = false;
+                
+                App._dayTimerLastRealTime = now;
+                App.UI.updateTimeBar();
+                App.Save.autoSave();
+                App.UI.showNotification(`⏰ 时间流逝，已过${daysPassed}天`);
+                
+                if (G.game.day % 30 === 0) {
+                    App.UI.showElectionModal();
+                }
             }
         }
-    }, 30000);
+    }, 60000);
 
     function triggerElection() {
         const votes = App.UI.calculateVotes();
