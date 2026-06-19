@@ -87,10 +87,6 @@ async def _serve_app_diag():
 async def _serve_48mgmt():
     return FileResponse("48mgmt.html", media_type="text/html")
 
-@app.get("/shop_card.jpg", include_in_schema=False)
-async def _serve_shop_card():
-    return FileResponse("shop_card.jpg", media_type="image/jpeg")
-
 # AI 客户端
 client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL) if API_KEY else None
 
