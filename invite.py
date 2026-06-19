@@ -18,7 +18,7 @@ INVITE_CODE_FILE = "invite_codes.json"
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "SMY980814")
 MAX_ADMIN_DEVICES = int(os.getenv("MAX_ADMIN_DEVICES", "20"))  # 管理员密码最多绑定设备数
 # 认证版本：修改此值会强制重置所有管理员设备记录
-AUTH_VERSION = 4
+AUTH_VERSION = 5
 
 # 邀请码格式前缀
 CODE_PREFIX = "PLAY48-"

@@ -9966,7 +9966,7 @@ function assignTeam(personality, group, quizScores) {
 // ============ 初始化 ============
 (function initApp() {
     // 版本号：修改此值会强制所有用户重新验证邀请码（保留游戏存档）
-    var APP_AUTH_VERSION = 4;
+    var APP_AUTH_VERSION = 5;
 
     // 版本检查：版本号变化时清除邀请码验证状态，但保留游戏数据
     try {
