@@ -449,10 +449,6 @@
             refreshAll();
         }
 
-        // 暴露到全局给 HTML onclick
-        window.doLogin = doLogin;
-        window.doLogout = doLogout;
-
         // ========== 后台功能 ==========
         const API_BASE = window.location.origin;
         // 密码从 sessionStorage 动态获取，或从用户输入中获取
@@ -461,7 +457,6 @@
         let _adminPassword = '';
 
         // 重写 doLogin 以在内存中保存密码用于 API 调用
-        const _originalDoLogin = doLogin;
         doLogin = async function() {
             const pwd = document.getElementById('passwordInput').value.trim();
             const btn = document.getElementById('loginBtn');
@@ -504,6 +499,10 @@
             document.getElementById('loginBtn').textContent = '验证进入';
             document.getElementById('passwordInput').focus();
         };
+
+        // 暴露到全局给 HTML onclick（必须在覆盖之后）
+        window.doLogin = doLogin;
+        window.doLogout = doLogout;
 
         // 密码 guard：每次 API 调用前检查
         function passwordParam() {
