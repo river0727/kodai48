@@ -724,6 +724,58 @@ App.Invite = {
     
     getInviteCode() {
         return this.inviteCode || localStorage.getItem('inviteCode');
+    },
+    
+    /** 强制弹出邀请码验证页面（不清除游戏数据） */
+    forceResetInvite() {
+        localStorage.removeItem('inviteCode');
+        localStorage.removeItem('inviteUserId');
+        this.inviteCode = null;
+        this.userId = null;
+        // 显示邀请码页面（覆盖在所有内容之上）
+        const inviteEl = document.getElementById('inviteScreen');
+        const lockEl = document.getElementById('lockScreen');
+        if (inviteEl) inviteEl.classList.add('active');
+        if (lockEl) lockEl.classList.remove('active');
+        // 清空输入框
+        const inputEl = document.getElementById('inviteInput');
+        if (inputEl) {
+            inputEl.value = '';
+            inputEl.disabled = false;
+            inputEl.style.opacity = '1';
+        }
+        // 显示提示
+        this._showError('检测到认证更新，请重新输入邀请码');
+        console.log('[Auth Poll] 检测到版本变更，强制弹出邀请码验证');
+    },
+    
+    /** 启动定时轮询：每30秒检查服务端认证版本 */
+    startVersionPolling() {
+        var self = this;
+        // 每30秒轮询一次
+        this._pollInterval = setInterval(function() {
+            try {
+                var storedVersion = localStorage.getItem('_authVersion');
+                // 获取服务端版本
+                fetch(self.API_URL + '/api/auth/version', {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' }
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var serverVersion = String(data.version);
+                    if (storedVersion !== serverVersion && serverVersion !== 'undefined') {
+                        // 版本不一致：强制弹出邀请码验证
+                        localStorage.setItem('_authVersion', serverVersion);
+                        self.forceResetInvite();
+                    }
+                })
+                .catch(function() {
+                    // 网络错误静默忽略，等下一轮轮询
+                });
+            } catch(e) {}
+        }, 30000);
+        console.log('[Auth Poll] 版本轮询已启动（每30秒）');
     }
 };
 
@@ -9914,7 +9966,7 @@ function assignTeam(personality, group, quizScores) {
 // ============ 初始化 ============
 (function initApp() {
     // 版本号：修改此值会强制所有用户重新验证邀请码（保留游戏存档）
-    var APP_AUTH_VERSION = 3;
+    var APP_AUTH_VERSION = 4;
 
     // 版本检查：版本号变化时清除邀请码验证状态，但保留游戏数据
     try {
@@ -9961,6 +10013,9 @@ function assignTeam(personality, group, quizScores) {
         if (inviteEl) inviteEl.classList.remove('active');
         if (lockEl) lockEl.classList.add('active');
     }
+
+    // 4. 启动认证版本轮询：即使玩家不刷新页面，也能检测到强制重验证
+    App.Invite.startVersionPolling();
 
     let keypadHTML = '';
     for (let i=1;i<=9;i++) keypadHTML += `<button class="key" onclick="App.UI.enterPassword('${i}')">${i}</button>`;

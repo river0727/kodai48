@@ -18,7 +18,7 @@ INVITE_CODE_FILE = "invite_codes.json"
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "SMY980814")
 MAX_ADMIN_DEVICES = int(os.getenv("MAX_ADMIN_DEVICES", "20"))  # 管理员密码最多绑定设备数
 # 认证版本：修改此值会强制重置所有管理员设备记录
-AUTH_VERSION = 2
+AUTH_VERSION = 4
 
 # 邀请码格式前缀
 CODE_PREFIX = "PLAY48-"
@@ -329,3 +329,8 @@ def get_all_codes(invite_data: Dict, limit: int = 100) -> list:
 def verify_admin(password: str) -> bool:
     """验证管理员密码"""
     return password == ADMIN_PASSWORD
+
+
+def get_auth_version() -> int:
+    """获取当前服务端认证版本号（公开接口，无需密码）"""
+    return AUTH_VERSION

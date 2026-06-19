@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from invite import (
     ADMIN_PASSWORD,
     get_all_codes,
+    get_auth_version,
     get_invite_stats,
     get_unused_codes,
     get_used_codes,
@@ -295,6 +296,21 @@ async def chat(data: ChatMessage, request: Request):
         logger.info("Fallback to local reply: %s", local_reply)
 
         return {"status": "success", "reply": local_reply}
+
+
+# ======================== 认证版本 API ========================
+
+@app.get("/api/auth/version")
+async def api_auth_version():
+    """获取当前服务端认证版本号（公开接口，无需认证）
+    客户端通过轮询此接口检测版本变化，变化时强制弹出邀请码验证
+    """
+    try:
+        version = get_auth_version()
+        return {"version": version}
+    except Exception as e:
+        logger.error("获取认证版本异常: %s", e)
+        raise HTTPException(status_code=500, detail="服务器内部错误")
 
 
 # ======================== 邀请码 API ========================
