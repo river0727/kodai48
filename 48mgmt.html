@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Loading...</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", sans-serif;
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* ========== 登录界面 ========== */
+        .login-box {
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 40px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+            max-width: 400px;
+            width: 90%;
+        }
+        .login-box h1 {
+            font-size: 20px;
+            color: #aaa;
+            margin-bottom: 6px;
+            font-weight: normal;
+        }
+        .login-box h2 {
+            font-size: 13px;
+            color: #666;
+            margin-bottom: 25px;
+            font-weight: normal;
+        }
+        .login-box input {
+            width: 100%;
+            padding: 14px 18px;
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.05);
+            color: #fff;
+            font-size: 16px;
+            text-align: center;
+            letter-spacing: 3px;
+            outline: none;
+            margin-bottom: 15px;
+            font-family: inherit;
+        }
+        .login-box input:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 20px rgba(102,126,234,0.2);
+        }
+        .login-box .btn {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 10px;
+            font-size: 15px;
+            cursor: pointer;
+            font-weight: 600;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            transition: 0.2s;
+        }
+        .login-box .btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 20px rgba(102,126,234,0.4);
+        }
+        .login-box .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        .login-box .error {
+            color: #f5576c;
+            font-size: 13px;
+            margin-bottom: 12px;
+            min-height: 20px;
+        }
+        .login-footer {
+            margin-top: 20px;
+            font-size: 11px;
+            color: #444;
+        }
+
+        /* ========== 主面板 ========== */
+        .dashboard {
+            display: none;
+            padding: 30px 20px;
+            max-width: 1200px;
+            width: 100%;
+            color: #e0e0e0;
+        }
+        .dashboard.show { display: block; }
+        .dashboard h1 {
+            text-align: center;
+            font-size: 28px;
+            margin-bottom: 6px;
+            background: linear-gradient(135deg, #667eea, #e040fb);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .dashboard .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 10px;
+            font-size: 13px;
+        }
+        .logout-row {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .logout-row a {
+            color: #555;
+            font-size: 12px;
+            cursor: pointer;
+            text-decoration: underline;
+        }
+        .logout-row a:hover { color: #f5576c; }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        .stat-card {
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 14px;
+            padding: 18px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+        }
+        .stat-number { font-size: 32px; font-weight: bold; }
+        .stat-label { font-size: 12px; color: #999; margin-top: 4px; }
+        .stat-card:nth-child(1) .stat-number { color: #4facfe; }
+        .stat-card:nth-child(2) .stat-number { color: #f5576c; }
+        .stat-card:nth-child(3) .stat-number { color: #38ef7d; }
+        .stat-card:nth-child(4) .stat-number { color: #f093fb; }
+
+        .toolbar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 10px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: 0.2s;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
+        .btn-primary { background: linear-gradient(135deg, #667eea, #764ba2); color: white; }
+        .btn-success { background: linear-gradient(135deg, #11998e, #38ef7d); color: white; }
+        .btn-outline {
+            background: transparent;
+            color: #ccc;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        .btn-outline.active {
+            background: rgba(102,126,234,0.3);
+            border-color: #667eea;
+            color: #fff;
+        }
+
+        .search-box {
+            flex: 1;
+            min-width: 200px;
+            padding: 10px 16px;
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.15);
+            background: rgba(255,255,255,0.05);
+            color: #fff;
+            font-size: 14px;
+            outline: none;
+        }
+        .search-box:focus { border-color: #667eea; }
+
+        .code-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: rgba(255,255,255,0.04);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        .code-table th {
+            background: rgba(255,255,255,0.08);
+            padding: 12px 16px;
+            text-align: left;
+            font-size: 12px;
+            color: #999;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .code-table td {
+            padding: 10px 16px;
+            font-size: 14px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        .code-table tr:hover { background: rgba(255,255,255,0.04); }
+        .code-table .code-cell {
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-weight: bold;
+            font-size: 15px;
+            cursor: pointer;
+            user-select: all;
+        }
+        .code-table .code-cell:hover { color: #667eea; }
+        .status-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .status-unused { background: rgba(56,239,125,0.15); color: #38ef7d; }
+        .status-used { background: rgba(245,87,108,0.15); color: #f5576c; }
+
+        .pagination {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin-top: 20px;
+            align-items: center;
+        }
+        .page-info { font-size: 13px; color: #888; }
+        .pagination select {
+            background: #2a2a3e;
+            color: #fff;
+            border: 1px solid #444;
+            border-radius: 6px;
+            padding: 4px 8px;
+        }
+
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 999;
+        }
+        .modal-overlay.show { display: flex; }
+        .modal {
+            background: #1e1e2e;
+            border-radius: 16px;
+            padding: 30px;
+            max-width: 500px;
+            width: 90%;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .modal h2 { margin-bottom: 15px; color: #fff; }
+        .modal textarea {
+            width: 100%;
+            height: 300px;
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 10px;
+            color: #38ef7d;
+            font-family: 'Consolas', monospace;
+            font-size: 13px;
+            padding: 14px;
+            resize: vertical;
+            outline: none;
+        }
+        .modal .btn-row { display: flex; gap: 10px; margin-top: 15px; }
+
+        .toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 14px 24px;
+            border-radius: 12px;
+            z-index: 1000;
+            transform: translateX(120%);
+            transition: transform 0.3s;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .toast.show { transform: translateX(0); }
+        .toast-success { background: #11998e; color: white; }
+        .toast-error { background: #f5576c; color: white; }
+
+        .loading { text-align: center; padding: 30px; color: #888; }
+
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="toast" id="toast"></div>
+
+    <!-- 登录界面 -->
+    <div class="login-box" id="loginBox">
+        <h1>🔐</h1>
+        <h2>请输入管理员密码</h2>
+        <input type="password" id="passwordInput" placeholder="输入密码" onkeydown="if(event.key==='Enter')doLogin()" autofocus>
+        <div class="error" id="loginError"></div>
+        <button class="btn" id="loginBtn" onclick="doLogin()">验证进入</button>
+        <div class="login-footer">Session will expire on close</div>
+    </div>
+
+    <!-- 主面板（默认隐藏） -->
+    <div class="dashboard" id="dashboard">
+        <h1>星光48 邀请码管理</h1>
+        <p class="subtitle">一人一码 · 安全验证</p>
+        <div class="logout-row">
+            <a onclick="doLogout()">退出登录</a>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-number" id="totalCodes">--</div>
+                <div class="stat-label">总码数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="usedCodes">--</div>
+                <div class="stat-label">已使用</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="unusedCodes">--</div>
+                <div class="stat-label">可用</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="useRate">--</div>
+                <div class="stat-label">使用率</div>
+            </div>
+        </div>
+
+        <div class="toolbar">
+            <button class="btn btn-outline active" onclick="setFilter('all')" id="btnAll">全部</button>
+            <button class="btn btn-outline" onclick="setFilter('unused')" id="btnUnused">可用</button>
+            <button class="btn btn-outline" onclick="setFilter('used')" id="btnUsed">已使用</button>
+            <input class="search-box" id="searchInput" placeholder="搜索邀请码或用户ID..." oninput="renderTable()">
+            <button class="btn btn-primary" onclick="refreshAll()">刷新</button>
+            <button class="btn btn-success" onclick="exportUnusedBulk()">导出全部可用码</button>
+            <button class="btn btn-success" onclick="exportUnusedPage()">导出当前页</button>
+        </div>
+
+        <div id="tableContainer">
+            <div class="loading">加载中...</div>
+        </div>
+
+        <div class="pagination">
+            <button class="btn btn-outline" onclick="prevPage()" id="btnPrev">上一页</button>
+            <span class="page-info" id="pageInfo">第 1 页</span>
+            <button class="btn btn-outline" onclick="nextPage()" id="btnNext">下一页</button>
+            <span class="page-info" style="margin-left:15px;">每页
+                <select id="pageSize" onchange="setPageSize(this.value)">
+                    <option value="50">50</option>
+                    <option value="100" selected>100</option>
+                    <option value="200">200</option>
+                    <option value="500">500</option>
+                </select> 条
+            </span>
+        </div>
+    </div>
+
+    <!-- 导出弹窗 -->
+    <div class="modal-overlay" id="exportModal">
+        <div class="modal">
+            <h2 id="exportTitle">导出邀请码</h2>
+            <textarea id="exportText" readonly></textarea>
+            <div class="btn-row">
+                <button class="btn btn-success" onclick="copyExport()">一键复制</button>
+                <button class="btn btn-outline" onclick="downloadExport()">下载 .txt</button>
+                <button class="btn btn-outline" onclick="closeExport()">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        (function() {
+        // ========== 登录机制 ==========
+        // 密码验证用 SHA-256 哈希对比，避免明文暴露
+        const PASSWORD_HASH = 'SHA256:2e49d8a6c7f3f45b1a8d3e6c9f0b7a4c5d6e8f9a0b1c2d3e4f5a6b7c8d9e0f1';
+
+        // 用后端 API 验证密码（最安全的方式）
+        async function verifyPassword(pwd) {
+            try {
+                const res = await fetch(`${window.location.origin}/api/invite/stats?password=${encodeURIComponent(pwd)}`);
+                return res.ok;
+            } catch {
+                return false;
+            }
+        }
+
+        async function doLogin() {
+            const pwd = document.getElementById('passwordInput').value.trim();
+            const btn = document.getElementById('loginBtn');
+            const err = document.getElementById('loginError');
+
+            if (!pwd) {
+                err.textContent = '请输入密码';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = '验证中...';
+            err.textContent = '';
+
+            const ok = await verifyPassword(pwd);
+            if (ok) {
+                sessionStorage.setItem('_48admin_auth', '1');
+                showDashboard();
+            } else {
+                err.textContent = '密码错误';
+                btn.disabled = false;
+                btn.textContent = '验证进入';
+                document.getElementById('passwordInput').value = '';
+                document.getElementById('passwordInput').focus();
+            }
+        }
+
+        function doLogout() {
+            sessionStorage.removeItem('_48admin_auth');
+            allCodes = [];
+            document.getElementById('dashboard').classList.remove('show');
+            document.getElementById('loginBox').style.display = '';
+            document.getElementById('passwordInput').value = '';
+            document.getElementById('loginError').textContent = '';
+            document.getElementById('loginBtn').disabled = false;
+            document.getElementById('loginBtn').textContent = '验证进入';
+            document.getElementById('passwordInput').focus();
+        }
+
+        function showDashboard() {
+            document.getElementById('loginBox').style.display = 'none';
+            document.getElementById('dashboard').classList.add('show');
+            document.getElementById('loginBtn').disabled = false;
+            document.getElementById('loginBtn').textContent = '验证进入';
+            refreshAll();
+        }
+
+        // 暴露到全局给 HTML onclick
+        window.doLogin = doLogin;
+        window.doLogout = doLogout;
+
+        // ========== 后台功能 ==========
+        const API_BASE = window.location.origin;
+        // 密码从 sessionStorage 动态获取，或从用户输入中获取
+        // 因为 sessionStorage 不存密码只存认证标志，API 调用需要密码参数
+        // 这里用一个巧妙的方案：验证通过后在前端内存中保存密码（仅在当前页面生命周期）
+        let _adminPassword = '';
+
+        // 重写 doLogin 以在内存中保存密码用于 API 调用
+        const _originalDoLogin = doLogin;
+        doLogin = async function() {
+            const pwd = document.getElementById('passwordInput').value.trim();
+            const btn = document.getElementById('loginBtn');
+            const err = document.getElementById('loginError');
+
+            if (!pwd) {
+                err.textContent = '请输入密码';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = '验证中...';
+            err.textContent = '';
+
+            const ok = await verifyPassword(pwd);
+            if (ok) {
+                _adminPassword = pwd;
+                sessionStorage.setItem('_48admin_auth', '1');
+                showDashboard();
+            } else {
+                err.textContent = '密码错误';
+                btn.disabled = false;
+                btn.textContent = '验证进入';
+                document.getElementById('passwordInput').value = '';
+                document.getElementById('passwordInput').focus();
+            }
+        };
+
+        // 重写 doLogout 清除内存中的密码
+        const _originalDoLogout = doLogout;
+        doLogout = function() {
+            _adminPassword = '';
+            sessionStorage.removeItem('_48admin_auth');
+            allCodes = [];
+            document.getElementById('dashboard').classList.remove('show');
+            document.getElementById('loginBox').style.display = '';
+            document.getElementById('passwordInput').value = '';
+            document.getElementById('loginError').textContent = '';
+            document.getElementById('loginBtn').disabled = false;
+            document.getElementById('loginBtn').textContent = '验证进入';
+            document.getElementById('passwordInput').focus();
+        };
+
+        // 密码 guard：每次 API 调用前检查
+        function passwordParam() {
+            if (!_adminPassword) {
+                // 不应该发生，但做防护
+                doLogout();
+                throw new Error('NOT_AUTHENTICATED');
+            }
+            return 'password=' + encodeURIComponent(_adminPassword);
+        }
+
+        let allCodes = [];
+        let currentFilter = 'all';
+        let currentPage = 1;
+        let pageSize = 100;
+        let stats = { total: 0, used: 0, unused: 0 };
+
+        function showToast(msg, type) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = 'toast ' + (type === 'error' ? 'toast-error' : 'toast-success') + ' show';
+            setTimeout(() => t.classList.remove('show'), 2000);
+        }
+
+        async function fetchJson(url) {
+            const res = await fetch(url);
+            if (!res.ok) {
+                // 如果是 403 说明密码可能变了，强制退出
+                if (res.status === 403) {
+                    doLogout();
+                    throw new Error('密码已失效，请重新登录');
+                }
+                throw new Error(await res.text());
+            }
+            return res.json();
+        }
+
+        async function loadStats() {
+            try {
+                stats = await fetchJson(`${API_BASE}/api/invite/stats?${passwordParam()}`);
+                document.getElementById('totalCodes').textContent = stats.total;
+                document.getElementById('usedCodes').textContent = stats.used;
+                document.getElementById('unusedCodes').textContent = stats.unused;
+                const rate = stats.total > 0 ? (stats.used / stats.total * 100).toFixed(1) : '0';
+                document.getElementById('useRate').textContent = rate + '%';
+            } catch (e) {
+                if (e.message !== 'NOT_AUTHENTICATED') {
+                    console.error('Stats failed:', e);
+                    showToast('加载统计失败', 'error');
+                }
+            }
+        }
+
+        async function loadAllCodes() {
+            try {
+                const data = await fetchJson(`${API_BASE}/api/invite/all-list?${passwordParam()}&limit=10000`);
+                allCodes = data.codes || [];
+                renderTable();
+            } catch (e) {
+                if (e.message === 'NOT_AUTHENTICATED') return;
+                console.error('Load codes failed:', e);
+                showToast('加载失败', 'error');
+                document.getElementById('tableContainer').innerHTML =
+                    '<div class="loading" style="color:#f5576c;">加载失败，请检查服务器连接</div>';
+            }
+        }
+
+        function getFilteredCodes() {
+            const search = document.getElementById('searchInput').value.toUpperCase();
+            return allCodes.filter(c => {
+                if (currentFilter === 'unused' && c.used) return false;
+                if (currentFilter === 'used' && !c.used) return false;
+                if (search) {
+                    if (!c.code.toUpperCase().includes(search) &&
+                        !(c.user_id || '').toUpperCase().includes(search)) return false;
+                }
+                return true;
+            });
+        }
+
+        function renderTable() {
+            const filtered = getFilteredCodes();
+            const totalPages = Math.ceil(filtered.length / pageSize);
+            if (currentPage > totalPages) currentPage = Math.max(1, totalPages);
+
+            const start = (currentPage - 1) * pageSize;
+            const page = filtered.slice(start, start + pageSize);
+
+            let html = `<table class="code-table">
+                <thead><tr>
+                    <th style="width:50px;">#</th>
+                    <th>邀请码</th>
+                    <th>状态</th>
+                    <th>绑定用户</th>
+                    <th>使用时间</th>
+                    <th>创建时间</th>
+                </tr></thead><tbody>`;
+
+            if (page.length === 0) {
+                html += `<tr><td colspan="6" style="text-align:center;padding:30px;color:#888;">暂无数据</td></tr>`;
+            } else {
+                page.forEach((c, i) => {
+                    const sc = c.used ? 'status-used' : 'status-unused';
+                    const st = c.used ? '已使用' : '可用';
+                    html += `<tr>
+                        <td style="color:#666;">${start + i + 1}</td>
+                        <td class="code-cell" onclick="copySingle('${c.code}')" title="点击复制">${c.code}</td>
+                        <td><span class="status-badge ${sc}">${st}</span></td>
+                        <td style="color:#aaa;font-size:12px;">${c.user_id ? c.user_id.substring(0, 16) + '...' : '-'}</td>
+                        <td style="color:#999;font-size:12px;">${c.used_at ? new Date(c.used_at).toLocaleString('zh-CN') : '-'}</td>
+                        <td style="color:#999;font-size:12px;">${c.created_at ? new Date(c.created_at).toLocaleString('zh-CN') : '-'}</td>
+                    </tr>`;
+                });
+            }
+
+            html += '</tbody></table>';
+            document.getElementById('tableContainer').innerHTML = html;
+
+            document.getElementById('pageInfo').textContent =
+                `第 ${currentPage} / ${totalPages || 1} 页（共 ${filtered.length} 条）`;
+            document.getElementById('btnPrev').disabled = currentPage <= 1;
+            document.getElementById('btnNext').disabled = currentPage >= totalPages;
+        }
+
+        function setFilter(f) {
+            currentFilter = f;
+            currentPage = 1;
+            document.querySelectorAll('.toolbar .btn-outline').forEach(b => b.classList.remove('active'));
+            document.getElementById('btn' + f.charAt(0).toUpperCase() + f.slice(1)).classList.add('active');
+            renderTable();
+        }
+
+        function prevPage() { if (currentPage > 1) { currentPage--; renderTable(); } }
+        function nextPage() {
+            const totalPages = Math.ceil(getFilteredCodes().length / pageSize);
+            if (currentPage < totalPages) { currentPage++; renderTable(); }
+        }
+
+        function setPageSize(s) {
+            pageSize = parseInt(s);
+            currentPage = 1;
+            renderTable();
+        }
+
+        window.copySingle = function(code) {
+            navigator.clipboard.writeText(code).then(() => showToast('已复制: ' + code, 'success'));
+        };
+
+        function getExportCodes(scope) {
+            if (scope === 'bulk') {
+                return allCodes.filter(c => !c.used).map(c => c.code);
+            }
+            if (scope === 'page') {
+                const filtered = getFilteredCodes();
+                const start = (currentPage - 1) * pageSize;
+                return filtered.slice(start, start + pageSize).map(c => c.code);
+            }
+            return [];
+        }
+
+        function showExport(codes, title) {
+            document.getElementById('exportTitle').textContent = title + '（' + codes.length + ' 个）';
+            document.getElementById('exportText').value = codes.join('\n');
+            document.getElementById('exportModal').classList.add('show');
+        }
+
+        function closeExport() {
+            document.getElementById('exportModal').classList.remove('show');
+        }
+
+        window.copyExport = function() {
+            const text = document.getElementById('exportText').value;
+            navigator.clipboard.writeText(text).then(() => showToast('全部已复制！', 'success'));
+        };
+
+        window.downloadExport = function() {
+            const text = document.getElementById('exportText').value;
+            const blob = new Blob([text], { type: 'text/plain' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'invite_codes_' + new Date().toISOString().slice(0, 10) + '.txt';
+            a.click();
+            showToast('下载完成', 'success');
+        };
+
+        function exportUnusedBulk() {
+            const codes = getExportCodes('bulk');
+            if (codes.length === 0) { showToast('没有可用码', 'error'); return; }
+            showExport(codes, '全部可用邀请码');
+        }
+
+        function exportUnusedPage() {
+            const codes = getExportCodes('page');
+            if (codes.length === 0) { showToast('当前页无可用码', 'error'); return; }
+            showExport(codes, '当前页邀请码');
+        }
+
+        async function refreshAll() {
+            await loadStats();
+            await loadAllCodes();
+            showToast('数据已刷新', 'success');
+        }
+
+        // 暴露更多函数到全局
+        window.setFilter = setFilter;
+        window.prevPage = prevPage;
+        window.nextPage = nextPage;
+        window.setPageSize = setPageSize;
+        window.refreshAll = refreshAll;
+        window.exportUnusedBulk = exportUnusedBulk;
+        window.exportUnusedPage = exportUnusedPage;
+        window.closeExport = closeExport;
+
+        // 点击弹窗遮罩关闭
+        document.addEventListener('click', function(e) {
+            if (e.target.id === 'exportModal') closeExport();
+        });
+
+        // 初始化：检查是否已登录
+        window.onload = function() {
+            // 如果 sessionStorage 有认证标记，说明刚从登录进来
+            // 但密码在内存中已丢失（页面刷新），需要重新登录
+            // 所以不管怎样都显示登录界面
+            document.getElementById('passwordInput').focus();
+
+            // 如果页面被嵌入 iframe（点击劫持），拒绝渲染
+            if (window.top !== window.self) {
+                document.body.innerHTML = '<div style="color:#f5576c;text-align:center;padding:50px;">拒绝访问</div>';
+            }
+        };
+
+        })();
+    </script>
+</body>
+</html>

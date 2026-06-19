@@ -82,6 +82,10 @@ async def _serve_style_css():
 async def _serve_app_diag():
     return FileResponse("app_diag.js", media_type="application/javascript")
 
+@app.get("/48mgmt.html", include_in_schema=False)
+async def _serve_48mgmt():
+    return FileResponse("48mgmt.html", media_type="text/html")
+
 # AI 客户端
 client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL) if API_KEY else None
 
@@ -130,11 +134,13 @@ class ChatMessage(BaseModel):
 
 class InviteValidateRequest(BaseModel):
     code: str
+    userId: str = ""
 
 
 class InviteUseRequest(BaseModel):
     code: str
     userId: str
+    deviceId: str = ""
 
 
 class CloudSaveRequest(BaseModel):
@@ -302,7 +308,7 @@ async def api_validate_invite(data: InviteValidateRequest, request: Request):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
 
     try:
-        result = validate_invite_code(invite_data, data.code)
+        result = validate_invite_code(invite_data, data.code, data.userId)
         return result
     except Exception as e:
         logger.error("邀请码验证异常: %s", e)
@@ -318,12 +324,12 @@ async def api_use_invite(data: InviteUseRequest, request: Request):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
 
     try:
-        success = use_invite_code(invite_data, data.code, data.userId)
-        if success:
-            logger.info("Invite code used: user=%s", data.userId)
-            return {"success": True, "message": "邀请码使用成功！"}
+        result = use_invite_code(invite_data, data.code, data.userId, data.deviceId)
+        if result.get("success"):
+            logger.info("Invite code used: user=%s device=%s", data.userId, data.deviceId)
+            return {"success": True, "message": result.get("message", "成功"), "relogin": result.get("relogin", False), "device_count": result.get("device_count")}
         else:
-            return {"success": False, "message": "邀请码无效或已被使用"}
+            return {"success": False, "message": result.get("message", "邀请码无效或已被使用")}
     except OSError as e:
         logger.critical("邀请码存储写入失败: %s", e)
         raise HTTPException(status_code=500, detail="邀请码系统存储异常，请联系管理员")
